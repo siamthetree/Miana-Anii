@@ -97,7 +97,9 @@ jobs:
       - name: Generate Xcode project
         run: |
           xcodegen generate
-          # Format is pinned via Project.yml (objectVersion: 56); just confirm it here.
+          # Newer xcodegen releases can emit objectVersion 77, which Xcode 15.4 can't open.
+          # Force a compatible project format for the macos-14 runner image.
+          perl -i -pe 's/objectVersion = \\d+;/objectVersion = 56;/' MinaAnii.xcodeproj/project.pbxproj
           grep -m1 'objectVersion' MinaAnii.xcodeproj/project.pbxproj
 
       - name: Resolve Swift packages
