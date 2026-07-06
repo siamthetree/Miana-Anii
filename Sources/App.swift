@@ -32,10 +32,112 @@ struct MinaAniiApp: App {
 }
 
 // ============================================================
-// Models.swift
+// Metadata Models & Service
 // ============================================================
 
-// MARK: - File kinds
+struct MediaMetadata: Codable, Hashable {
+    var tmdbID: Int
+    var title: String
+    var overview: String
+    var posterURL: URL?
+    var backdropURL: URL?
+    var releaseYear: String
+    var isTVShow: Bool
+    var season: Int?
+    var episode: Int?
+}
+
+struct TMDBResponse: Codable {
+    let results: [TMDBResult]
+}
+
+struct TMDBResult: Codable {
+    let id: Int
+    let title: String?
+    let name: String? // TV Shows use 'name' instead of 'title'
+    let overview: String?
+    let poster_path: String?
+    let backdrop_path: String?
+    let release_date: String?
+    let first_air_date: String?
+}
+
+final class MetadataService {
+    static let apiKey = "5bfac6efc6d9711a7c5751e211d12ac2"
+    static let baseURL = "https://api.themoviedb.org/3"
+    static let imageBaseURL = "https://image.tmdb.org/t/p/w500"
+    
+    static func fetchMetadata(for filename: String, cleanTitle: String) async -> MediaMetadata? {
+        let isTV = filename.localizedStandardContains("S0") || filename.localizedStandardContains("E0") || filename.localizedStandardContains("Season")
+        let searchType = isTV ? "tv" : "movie"
+        
+        // Extract season and episode if it's a TV show (Regex for S01E01 format)
+        var season: Int? = nil
+        var episode: Int? = nil
+        if isTV {
+            let pattern = "[sS](\\d{1,2})[eE](\\d{1,2})"
+            if let regex = try? NSRegularExpression(pattern: pattern),
+               let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)) {
+                
+                if let sRange = Range(match.range(at: 1), in: filename),
+                   let eRange = Range(match.range(at: 2), in: filename) {
+                    season = Int(filename[sRange])
+                    episode = Int(filename[eRange])
+                }
+            }
+        }
+        
+        // Build the search URL
+        var components = URLComponents(string: "\(baseURL)/search/\(searchType)")!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "query", value: cleanTitle),
+            URLQueryItem(name: "page", value: "1")
+        ]
+        
+        guard let url = components.url else { return nil }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let response = try JSONDecoder().decode(TMDBResponse.self, from: data)
+            
+            guard let firstResult = response.results.first else { return nil }
+            
+            let dateString = firstResult.release_date ?? firstResult.first_air_date ?? ""
+            let year = String(dateString.prefix(4))
+            
+            var posterURL: URL? = nil
+            if let path = firstResult.poster_path {
+                posterURL = URL(string: "\(imageBaseURL)\(path)")
+            }
+            
+            var backdropURL: URL? = nil
+            if let path = firstResult.backdrop_path {
+                backdropURL = URL(string: "\(imageBaseURL)\(path)")
+            }
+            
+            return MediaMetadata(
+                tmdbID: firstResult.id,
+                title: firstResult.title ?? firstResult.name ?? cleanTitle,
+                overview: firstResult.overview ?? "No description available.",
+                posterURL: posterURL,
+                backdropURL: backdropURL,
+                releaseYear: year,
+                isTVShow: isTV,
+                season: season,
+                episode: episode
+            )
+            
+        } catch {
+            print("TMDB Fetch Error: \(error.localizedDescription)")
+            return nil
+        }
+    }
+}
+
+// ============================================================
+// Models.swift
+// ============================================================
 
 enum MediaKinds {
     static let video: Set<String> = [
@@ -46,14 +148,11 @@ enum MediaKinds {
         "mp3", "m4a", "aac", "wav", "caf", "aif", "aiff", "flac", "ogg", "opus", "wma"
     ]
     static let subtitles: Set<String> = ["srt", "vtt", "ass", "ssa", "sub"]
-    /// Containers the built-in AVFoundation engine can play natively.
     static let native: Set<String> = [
         "mp4", "m4v", "mov", "3gp", "mp3", "m4a", "aac", "wav", "caf", "aif", "aiff", "flac"
     ]
     static var media: Set<String> { video.union(audio) }
 }
-
-// MARK: - Model
 
 struct MediaItem: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
@@ -63,6 +162,7 @@ struct MediaItem: Identifiable, Codable, Hashable {
     var duration: Double = 0
     var lastPosition: Double = 0
     var lastPlayed: Date? = nil
+    var metadata: MediaMetadata? = nil // TMDB Metadata attached here
 
     var progress: Double {
         guard duration > 0 else { return 0 }
@@ -70,15 +170,14 @@ struct MediaItem: Identifiable, Codable, Hashable {
     }
 
     var isWatched: Bool { duration > 0 && progress >= 0.95 }
-
     var fileExtension: String { (fileName as NSString).pathExtension.lowercased() }
-
     var isAudio: Bool { MediaKinds.audio.contains(fileExtension) }
-
     var isEngineSupported: Bool { MediaKinds.native.contains(fileExtension) }
 }
 
-// MARK: - Store
+// ============================================================
+// LibraryStore
+// ============================================================
 
 @MainActor
 final class LibraryStore: ObservableObject {
@@ -101,8 +200,6 @@ final class LibraryStore: ObservableObject {
         load()
     }
 
-    // MARK: Persistence
-
     private func load() {
         guard let data = try? Data(contentsOf: indexURL),
               let decoded = try? JSONDecoder().decode([MediaItem].self, from: data) else { return }
@@ -114,15 +211,8 @@ final class LibraryStore: ObservableObject {
         try? data.write(to: indexURL, options: .atomic)
     }
 
-    // MARK: Paths
-
-    func url(for item: MediaItem) -> URL {
-        mediaDir.appendingPathComponent(item.fileName)
-    }
-
-    func thumbURL(for item: MediaItem) -> URL {
-        thumbsDir.appendingPathComponent(item.id.uuidString + ".jpg")
-    }
+    func url(for item: MediaItem) -> URL { mediaDir.appendingPathComponent(item.fileName) }
+    func thumbURL(for item: MediaItem) -> URL { thumbsDir.appendingPathComponent(item.id.uuidString + ".jpg") }
 
     private func uniqueDestination(for fileName: String) -> URL {
         let base = (fileName as NSString).deletingPathExtension
@@ -137,12 +227,8 @@ final class LibraryStore: ObservableObject {
         return dest
     }
 
-    // MARK: Import
-
     func importFiles(_ urls: [URL]) async {
-        for url in urls {
-            await importFile(url)
-        }
+        for url in urls { await importFile(url) }
         save()
     }
 
@@ -152,7 +238,6 @@ final class LibraryStore: ObservableObject {
 
         let ext = src.pathExtension.lowercased()
 
-        // Subtitle files are stored alongside the media as sidecars.
         if MediaKinds.subtitles.contains(ext) {
             let dest = mediaDir.appendingPathComponent(src.lastPathComponent)
             try? fm.removeItem(at: dest)
@@ -169,24 +254,27 @@ final class LibraryStore: ObservableObject {
             try await Task.detached(priority: .userInitiated) {
                 try FileManager.default.copyItem(at: from, to: to)
             }.value
-        } catch {
-            return
-        }
+        } catch { return }
 
-        // Clean up share-sheet inbox copies.
-        if src.path.contains("/Inbox/") {
-            try? fm.removeItem(at: src)
-        }
-
+        if src.path.contains("/Inbox/") { try? fm.removeItem(at: src) }
         await ingest(fileURL: dest)
         save()
     }
 
     private func ingest(fileURL: URL) async {
+        let rawTitle = (fileURL.lastPathComponent as NSString).deletingPathExtension
+        let prettyTitle = Self.prettyTitle(from: rawTitle)
+        
         var item = MediaItem(
-            title: Self.prettyTitle(from: (fileURL.lastPathComponent as NSString).deletingPathExtension),
+            title: prettyTitle,
             fileName: fileURL.lastPathComponent
         )
+        
+        // Fetch Metadata from TMDB
+        if let meta = await MetadataService.fetchMetadata(for: fileURL.lastPathComponent, cleanTitle: prettyTitle) {
+            item.metadata = meta
+        }
+
         let asset = AVURLAsset(url: fileURL)
         if let d = try? await asset.load(.duration), d.seconds.isFinite, d.seconds > 0 {
             item.duration = d.seconds
@@ -198,12 +286,9 @@ final class LibraryStore: ObservableObject {
         items.insert(item, at: 0)
     }
 
-    /// Picks up files dropped into "On My iPad > Mina Anii" via the Files app,
-    /// and prunes entries whose underlying files were deleted externally.
     func rescan() async {
         var changed = false
 
-        // Move loose media from the Documents root into Media/.
         if let loose = try? fm.contentsOfDirectory(at: documentsURL, includingPropertiesForKeys: nil) {
             for f in loose {
                 let ext = f.pathExtension.lowercased()
@@ -218,7 +303,6 @@ final class LibraryStore: ObservableObject {
             }
         }
 
-        // Index anything in Media/ that isn't in the library yet.
         if let files = try? fm.contentsOfDirectory(at: mediaDir, includingPropertiesForKeys: nil) {
             for f in files {
                 let ext = f.pathExtension.lowercased()
@@ -229,23 +313,16 @@ final class LibraryStore: ObservableObject {
             }
         }
 
-        // Prune missing files.
         let before = items.count
         items.removeAll { !fm.fileExists(atPath: url(for: $0).path) }
 
-        if changed || items.count != before {
-            save()
-        }
+        if changed || items.count != before { save() }
     }
-
-    // MARK: Mutations
 
     func updateProgress(id: UUID, position: Double, duration: Double) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         items[i].lastPosition = max(0, position)
-        if duration > 0, duration.isFinite {
-            items[i].duration = duration
-        }
+        if duration > 0, duration.isFinite { items[i].duration = duration }
         items[i].lastPlayed = Date()
         save()
     }
@@ -308,27 +385,26 @@ final class LibraryStore: ObservableObject {
         return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
     }
 
-    // MARK: Helpers
-
     static func prettyTitle(from raw: String) -> String {
         var s = raw.replacingOccurrences(of: "_", with: " ")
-        if !s.contains(" ") {
-            s = s.replacingOccurrences(of: ".", with: " ")
-        }
+        if !s.contains(" ") { s = s.replacingOccurrences(of: ".", with: " ") }
         let lower = s.lowercased()
         let markers = ["1080p", "720p", "2160p", "480p", "4k", "x264", "x265", "h264", "h265",
                        "hevc", "web-dl", "webdl", "webrip", "bluray", "brrip", "bdrip",
-                       "hdrip", "hdtv", "dvdrip", "remux", "10bit", "yify", "rarbg"]
+                       "hdrip", "hdtv", "dvdrip", "remux", "10bit", "yify", "rarbg", "aac"]
         var cut = s.count
         for m in markers {
-            if let r = lower.range(of: m) {
-                cut = min(cut, lower.distance(from: lower.startIndex, to: r.lowerBound))
-            }
+            if let r = lower.range(of: m) { cut = min(cut, lower.distance(from: lower.startIndex, to: r.lowerBound)) }
         }
-        if cut < s.count {
-            s = String(s.prefix(cut))
-        }
+        if cut < s.count { s = String(s.prefix(cut)) }
         s = s.trimmingCharacters(in: CharacterSet(charactersIn: " -._[]()"))
+        
+        // Remove season/episode strings from title since we display them separately now
+        let pattern = "(?i)s\\d{1,2}e\\d{1,2}.*"
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            s = regex.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        
         return s.isEmpty ? raw : s
     }
 
@@ -348,8 +424,6 @@ final class LibraryStore: ObservableObject {
     }
 }
 
-// MARK: - Formatting
-
 func formatTime(_ t: Double) -> String {
     guard t.isFinite, t >= 0 else { return "0:00" }
     let total = Int(t.rounded())
@@ -360,7 +434,7 @@ func formatTime(_ t: Double) -> String {
 }
 
 // ============================================================
-// Subtitles.swift
+// Subtitles
 // ============================================================
 
 struct SubtitleCue {
@@ -370,24 +444,16 @@ struct SubtitleCue {
 }
 
 enum SRTParser {
-
-    /// Parses SRT (and simple WebVTT) text into cues.
     static func parse(_ raw: String) -> [SubtitleCue] {
         var cues: [SubtitleCue] = []
-        let normalized = raw
-            .replacingOccurrences(of: "\r\n", with: "\n")
-            .replacingOccurrences(of: "\r", with: "\n")
+        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
         let blocks = normalized.components(separatedBy: "\n\n")
 
         for block in blocks {
-            let lines = block
-                .split(separator: "\n", omittingEmptySubsequences: true)
-                .map(String.init)
+            let lines = block.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
             guard let timeIndex = lines.firstIndex(where: { $0.contains("-->") }) else { continue }
             let parts = lines[timeIndex].components(separatedBy: "-->")
-            guard parts.count == 2,
-                  let start = timestamp(parts[0]),
-                  let end = timestamp(parts[1]) else { continue }
+            guard parts.count == 2, let start = timestamp(parts[0]), let end = timestamp(parts[1]) else { continue }
 
             let textLines = lines[(timeIndex + 1)...]
             let joined = textLines.joined(separator: "\n")
@@ -401,46 +467,31 @@ enum SRTParser {
         return cues.sorted { $0.start < $1.start }
     }
 
-    /// Parses "HH:MM:SS,mmm" or "HH:MM:SS.mmm" (also tolerates VTT cue settings after the time).
     static func timestamp(_ raw: String) -> Double? {
         var t = raw.trimmingCharacters(in: .whitespaces)
-        if let space = t.firstIndex(of: " ") {
-            t = String(t[..<space])
-        }
+        if let space = t.firstIndex(of: " ") { t = String(t[..<space]) }
         t = t.replacingOccurrences(of: ",", with: ".")
         let comps = t.split(separator: ":")
         guard comps.count >= 2 else { return nil }
         let numbers = comps.compactMap { Double($0) }
         guard numbers.count == comps.count else { return nil }
-        if numbers.count == 3 {
-            return numbers[0] * 3600 + numbers[1] * 60 + numbers[2]
-        } else {
-            return numbers[0] * 60 + numbers[1]
-        }
+        return numbers.count == 3 ? numbers[0] * 3600 + numbers[1] * 60 + numbers[2] : numbers[0] * 60 + numbers[1]
     }
 
     static func cue(at time: Double, in cues: [SubtitleCue]) -> String? {
         for cue in cues {
-            if time >= cue.start && time <= cue.end {
-                return cue.text
-            }
-            if cue.start > time {
-                break
-            }
+            if time >= cue.start && time <= cue.end { return cue.text }
+            if cue.start > time { break }
         }
         return nil
     }
 }
 
 // ============================================================
-// PlayerLayer.swift
+// Player Layers
 // ============================================================
 
-/// Keeps a weak reference to the live AVPlayerLayer so the view model
-/// can drive video gravity and Picture in Picture.
-final class PlayerLayerHolder {
-    weak var playerLayer: AVPlayerLayer?
-}
+final class PlayerLayerHolder { weak var playerLayer: AVPlayerLayer? }
 
 final class PlayerContainerView: UIView {
     override static var layerClass: AnyClass { AVPlayerLayer.self }
@@ -487,15 +538,12 @@ struct RoutePickerView: UIViewRepresentable {
         view.prioritizesVideoDevices = true
         return view
     }
-
     func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
 }
 
 // ============================================================
-// PlayerView.swift
+// PlayerVM & PlayerScreen
 // ============================================================
-
-// MARK: - View model
 
 @MainActor
 final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
@@ -541,8 +589,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         super.init()
     }
 
-    // MARK: Lifecycle
-
     func start() {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .moviePlayback)
@@ -550,9 +596,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
         let url = store.url(for: media)
         let defaults = UserDefaults.standard
-        if defaults.object(forKey: "defaultRate") != nil {
-            rate = defaults.double(forKey: "defaultRate")
-        }
+        if defaults.object(forKey: "defaultRate") != nil { rate = defaults.double(forKey: "defaultRate") }
         if rate <= 0 { rate = 1 }
 
         let autoResume = (defaults.object(forKey: "autoResume") as? Bool) ?? true
@@ -568,40 +612,23 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] status in
                     guard let self else { return }
-                    if status == .readyToPlay, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 {
-                        self.duration = d
-                    }
+                    if status == .readyToPlay, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
                 }
 
-            endObserver = NotificationCenter.default.addObserver(
-                forName: .AVPlayerItemDidPlayToEndTime,
-                object: item,
-                queue: .main
-            ) { [weak self] _ in
+            endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
                 guard let self else { return }
                 self.isPlaying = false
                 self.showControls = true
-                if self.duration > 0 {
-                    self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration)
-                }
+                if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
             }
 
             loadSelectionGroups(for: item)
 
-            timeObserver = player.addPeriodicTimeObserver(
-                forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
-                queue: .main
-            ) { [weak self] time in
+            timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in
                 guard let self, !self.isScrubbing else { return }
                 self.current = time.seconds
-                if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 {
-                    self.duration = d
-                }
-                if self.subtitlesOn, self.hasExternalCues {
-                    self.cueText = SRTParser.cue(at: time.seconds, in: self.cues)
-                } else {
-                    self.cueText = nil
-                }
+                if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
+                self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: time.seconds, in: self.cues) : nil
                 self.periodicSave()
             }
             
@@ -612,13 +639,9 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             
         } else {
             vlcPlayer.delegate = self
-            let vlcMedia = VLCMedia(url: url)
-            vlcPlayer.media = vlcMedia
+            vlcPlayer.media = VLCMedia(url: url)
             vlcPlayer.audio?.volume = Int32(volumeLevel * 100) 
-            
-            if shouldResume {
-                self.pendingVLCSeek = media.lastPosition
-            }
+            if shouldResume { self.pendingVLCSeek = media.lastPosition }
         }
 
         loadSidecarSubtitles(for: url)
@@ -629,14 +652,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func stop() {
         saveNow()
         statusCancellable = nil
-        if let observer = timeObserver {
-            player.removeTimeObserver(observer)
-            timeObserver = nil
-        }
-        if let end = endObserver {
-            NotificationCenter.default.removeObserver(end)
-            endObserver = nil
-        }
+        if let observer = timeObserver { player.removeTimeObserver(observer); timeObserver = nil }
+        if let end = endObserver { NotificationCenter.default.removeObserver(end); endObserver = nil }
         hideTask?.cancel()
         flashTask?.cancel()
         
@@ -650,17 +667,13 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
-
-    // MARK: VLC Delegate Methods
     
     nonisolated func mediaPlayerStateChanged(_ aNotification: Notification!) {
         Task { @MainActor in
             switch self.vlcPlayer.state {
             case .playing:
                 self.isPlaying = true
-                if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 {
-                    self.duration = dur / 1000.0
-                }
+                if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }
                 if let target = self.pendingVLCSeek {
                     self.vlcPlayer.time = VLCTime(int: Int32(target * 1000))
                     self.current = target
@@ -671,9 +684,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             case .ended:
                 self.isPlaying = false
                 self.showControls = true
-                if self.duration > 0 {
-                    self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration)
-                }
+                if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
             case .error:
                 self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
             default: break
@@ -686,26 +697,14 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             guard !self.isScrubbing else { return }
             let ms = self.vlcPlayer.time.value?.doubleValue ?? 0
             self.current = ms / 1000.0
-            
-            if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 {
-                self.duration = dur / 1000.0
-            }
-            
-            if self.subtitlesOn, self.hasExternalCues {
-                self.cueText = SRTParser.cue(at: self.current, in: self.cues)
-            } else {
-                self.cueText = nil
-            }
+            if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }
+            self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: self.current, in: self.cues) : nil
             self.periodicSave()
         }
     }
 
-    // MARK: Playback controls
-
     func play() {
-        if media.isEngineSupported {
-            player.playImmediately(atRate: Float(rate))
-        } else {
+        if media.isEngineSupported { player.playImmediately(atRate: Float(rate)) } else {
             vlcPlayer.play()
             if rate != 1.0 { vlcPlayer.rate = Float(rate) }
         }
@@ -726,11 +725,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func seek(to target: Double) {
         let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target)
         if media.isEngineSupported {
-            player.seek(
-                to: CMTime(seconds: clamped, preferredTimescale: 600),
-                toleranceBefore: .zero,
-                toleranceAfter: .zero
-            )
+            player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
         } else {
             vlcPlayer.time = VLCTime(int: Int32(clamped * 1000))
         }
@@ -754,15 +749,9 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     func setVolume(_ value: Double) {
         volumeLevel = min(max(value, 0), 1)
-        if media.isEngineSupported {
-            player.volume = Float(volumeLevel)
-        } else {
-            vlcPlayer.audio?.volume = Int32(volumeLevel * 100)
-        }
+        if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }
         flash("Volume \(Int(volumeLevel * 100))%")
     }
-
-    // MARK: Controls visibility & OSD
 
     func toggleControls() {
         showControls.toggle()
@@ -774,9 +763,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         guard isPlaying else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.isPlaying, !self.isScrubbing else { return }
-            withAnimation(.easeOut(duration: 0.25)) {
-                self.showControls = false
-            }
+            withAnimation(.easeOut(duration: 0.25)) { self.showControls = false }
         }
         hideTask = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work)
@@ -785,14 +772,10 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func flash(_ text: String) {
         flashText = text
         flashTask?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            self?.flashText = nil
-        }
+        let work = DispatchWorkItem { [weak self] in self?.flashText = nil }
         flashTask = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
     }
-
-    // MARK: Subtitles
     
     private func loadSidecarSubtitles(for mediaURL: URL) {
         let srt = mediaURL.deletingPathExtension().appendingPathExtension("srt")
@@ -806,10 +789,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         guard let data = try? Data(contentsOf: url) else { return }
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
         let parsed = SRTParser.parse(text)
-        guard !parsed.isEmpty else {
-            flash("Couldn't read subtitles")
-            return
-        }
+        guard !parsed.isEmpty else { flash("Couldn't read subtitles"); return }
         cues = parsed
         hasExternalCues = true
         subtitlesOn = true
@@ -820,20 +800,14 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
     }
 
-    // MARK: Embedded tracks
-
     private func loadSelectionGroups(for item: AVPlayerItem) {
         let asset = item.asset
         Task { [weak self] in
             let characteristics = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []
             var audio: AVMediaSelectionGroup?
             var legible: AVMediaSelectionGroup?
-            if characteristics.contains(.audible) {
-                audio = try? await asset.loadMediaSelectionGroup(for: .audible)
-            }
-            if characteristics.contains(.legible) {
-                legible = try? await asset.loadMediaSelectionGroup(for: .legible)
-            }
+            if characteristics.contains(.audible) { audio = try? await asset.loadMediaSelectionGroup(for: .audible) }
+            if characteristics.contains(.legible) { legible = try? await asset.loadMediaSelectionGroup(for: .legible) }
             guard let self else { return }
             self.audioGroup = audio
             self.legibleGroup = legible
@@ -851,36 +825,17 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func selectLegible(_ option: AVMediaSelectionOption?) {
         guard let group = legibleGroup else { return }
         player.currentItem?.select(option, in: group)
-        if let option {
-            flash(option.displayName)
-        }
+        if let option { flash(option.displayName) }
     }
-
-    // MARK: Picture in Picture
 
     func togglePiP() {
-        guard media.isEngineSupported else {
-            flash("PiP unavailable for this format")
-            return
-        }
-        
-        if pip == nil,
-           AVPictureInPictureController.isPictureInPictureSupported(),
-           let layer = layerHolder.playerLayer {
+        guard media.isEngineSupported else { flash("PiP unavailable for this format"); return }
+        if pip == nil, AVPictureInPictureController.isPictureInPictureSupported(), let layer = layerHolder.playerLayer {
             pip = AVPictureInPictureController(playerLayer: layer)
         }
-        guard let pip else {
-            flash("PiP unavailable")
-            return
-        }
-        if pip.isPictureInPictureActive {
-            pip.stopPictureInPicture()
-        } else {
-            pip.startPictureInPicture()
-        }
+        guard let pip else { flash("PiP unavailable"); return }
+        if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() }
     }
-
-    // MARK: Progress saving
 
     private func periodicSave() {
         guard Date().timeIntervalSince(lastSave) > 4 else { return }
@@ -894,19 +849,14 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 }
 
-// MARK: - Player screen
-
 struct PlayerScreen: View {
-
     @Environment(\.dismiss) private var dismiss
     @StateObject private var vm: PlayerVM
-
     @State private var scrubValue: Double = 0
     @State private var showSubImporter = false
     @State private var dragMode: DragMode = .none
     @State private var dragStartValue: Double = 0
     @State private var seekTarget: Double = 0
-
     private enum DragMode { case none, seek, volume, brightness }
 
     init(item: MediaItem, store: LibraryStore) {
@@ -915,11 +865,7 @@ struct PlayerScreen: View {
 
     private var subtitleTypes: [UTType] {
         var types: [UTType] = [.plainText, .text]
-        for ext in ["srt", "vtt"] {
-            if let t = UTType(filenameExtension: ext) {
-                types.append(t)
-            }
-        }
+        for ext in ["srt", "vtt"] { if let t = UTType(filenameExtension: ext) { types.append(t) } }
         return types
     }
 
@@ -929,300 +875,151 @@ struct PlayerScreen: View {
                 Color.black.ignoresSafeArea()
 
                 if vm.media.isEngineSupported {
-                    PlayerLayerView(
-                        player: vm.player,
-                        holder: vm.layerHolder,
-                        gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect
-                    )
-                    .ignoresSafeArea()
+                    PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect)
+                        .ignoresSafeArea()
                 } else {
                     VLCPlayerLayerView(player: vm.vlcPlayer)
                         .ignoresSafeArea()
                 }
 
                 subtitleOverlay
-
-                if let flash = vm.flashText {
-                    OSDBadge(text: flash)
-                }
-
-                if vm.showControls {
-                    controls
-                        .transition(.opacity)
-                }
+                if let flash = vm.flashText { OSDBadge(text: flash) }
+                if vm.showControls { controls.transition(.opacity) }
             }
             .contentShape(Rectangle())
             .onTapGesture(count: 2, coordinateSpace: .local) { point in
-                if point.x < geo.size.width / 2 {
-                    vm.skip(-10)
-                } else {
-                    vm.skip(10)
-                }
+                if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) }
             }
             .onTapGesture {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    vm.toggleControls()
-                }
+                withAnimation(.easeInOut(duration: 0.2)) { vm.toggleControls() }
             }
             .gesture(panGesture(geo: geo))
         }
         .statusBarHidden(true)
         .persistentSystemOverlays(.hidden)
-        .onAppear {
-            vm.start()
-            UIApplication.shared.isIdleTimerDisabled = true
-        }
-        .onDisappear {
-            vm.stop()
-            UIApplication.shared.isIdleTimerDisabled = false
-        }
-        .alert("Playback Error", isPresented: Binding(
-            get: { vm.errorMessage != nil },
-            set: { if !$0 { vm.errorMessage = nil } }
-        )) {
+        .onAppear { vm.start(); UIApplication.shared.isIdleTimerDisabled = true }
+        .onDisappear { vm.stop(); UIApplication.shared.isIdleTimerDisabled = false }
+        .alert("Playback Error", isPresented: Binding(get: { vm.errorMessage != nil }, set: { if !$0 { vm.errorMessage = nil } })) {
             Button("OK") { dismiss() }
-        } message: {
-            Text(vm.errorMessage ?? "")
-        }
-        .fileImporter(
-            isPresented: $showSubImporter,
-            allowedContentTypes: subtitleTypes,
-            allowsMultipleSelection: false
-        ) { result in
-            if case .success(let urls) = result, let url = urls.first {
-                vm.loadSubtitleFile(url)
-            }
+        } message: { Text(vm.errorMessage ?? "") }
+        .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) }
         }
         .preferredColorScheme(.dark)
     }
-
-    // MARK: Overlays
 
     private var subtitleOverlay: some View {
         VStack {
             Spacer()
             if vm.subtitlesOn, let cue = vm.cueText {
-                Text(cue)
-                    .font(.system(size: 22, weight: .semibold))
-                    .multilineTextAlignment(.center)
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
-                    .padding(.horizontal, 24)
+                Text(cue).font(.system(size: 22, weight: .semibold)).multilineTextAlignment(.center)
+                    .foregroundStyle(.white).padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 24)
             }
         }
-        .padding(.bottom, vm.showControls ? 140 : 44)
-        .animation(.easeInOut(duration: 0.2), value: vm.showControls)
-        .allowsHitTesting(false)
+        .padding(.bottom, vm.showControls ? 140 : 44).animation(.easeInOut(duration: 0.2), value: vm.showControls).allowsHitTesting(false)
     }
 
     private var controls: some View {
         VStack(spacing: 0) {
-            topBar
-            Spacer()
-            centerButtons
-            Spacer()
-            bottomBar
+            topBar; Spacer(); centerButtons; Spacer(); bottomBar
         }
         .background(
             VStack(spacing: 0) {
-                LinearGradient(colors: [.black.opacity(0.65), .clear], startPoint: .top, endPoint: .bottom)
-                    .frame(height: 130)
-                Spacer()
-                LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .top, endPoint: .bottom)
-                    .frame(height: 190)
-            }
-            .ignoresSafeArea()
-            .allowsHitTesting(false)
+                LinearGradient(colors: [.black.opacity(0.65), .clear], startPoint: .top, endPoint: .bottom).frame(height: 130); Spacer()
+                LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .top, endPoint: .bottom).frame(height: 190)
+            }.ignoresSafeArea().allowsHitTesting(false)
         )
     }
 
     private var topBar: some View {
         HStack(spacing: 18) {
-            Button { dismiss() } label: {
-                Image(systemName: "xmark")
-                    .font(.title3.weight(.semibold))
-                    .frame(width: 40, height: 40)
-            }
-            Text(vm.media.title)
-                .font(.headline)
-                .lineLimit(1)
+            Button { dismiss() } label: { Image(systemName: "xmark").font(.title3.weight(.semibold)).frame(width: 40, height: 40) }
+            Text(vm.media.title).font(.headline).lineLimit(1)
             Spacer()
-            RoutePickerView()
-                .frame(width: 40, height: 40)
-            Button { vm.togglePiP() } label: {
-                Image(systemName: "pip.enter")
-                    .font(.title3)
-                    .frame(width: 40, height: 40)
-            }
+            RoutePickerView().frame(width: 40, height: 40)
+            Button { vm.togglePiP() } label: { Image(systemName: "pip.enter").font(.title3).frame(width: 40, height: 40) }
             trackMenu
         }
-        .foregroundStyle(.white)
-        .padding(.horizontal, 16)
-        .padding(.top, 6)
+        .foregroundStyle(.white).padding(.horizontal, 16).padding(.top, 6)
     }
 
     private var trackMenu: some View {
         Menu {
             if !vm.audioOptions.isEmpty {
-                Section("Audio") {
-                    ForEach(vm.audioOptions, id: \.self) { option in
-                        Button(option.displayName) { vm.selectAudio(option) }
-                    }
-                }
+                Section("Audio") { ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } }
             }
             Section("Subtitles") {
-                Button("Off") {
-                    vm.selectLegible(nil)
-                    vm.subtitlesOn = false
-                }
-                ForEach(vm.legibleOptions, id: \.self) { option in
-                    Button(option.displayName) {
-                        vm.selectLegible(option)
-                        vm.subtitlesOn = true
-                    }
-                }
+                Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
+                ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
                 Button("Load .srt file…") { showSubImporter = true }
-                if vm.hasExternalCues {
-                    Toggle("External subtitles", isOn: $vm.subtitlesOn)
-                }
+                if vm.hasExternalCues { Toggle("External subtitles", isOn: $vm.subtitlesOn) }
             }
-        } label: {
-            Image(systemName: "captions.bubble")
-                .font(.title3)
-                .frame(width: 40, height: 40)
-        }
+        } label: { Image(systemName: "captions.bubble").font(.title3).frame(width: 40, height: 40) }
     }
 
     private var centerButtons: some View {
         HStack(spacing: 58) {
-            Button { vm.skip(-10) } label: {
-                Image(systemName: "gobackward.10")
-                    .font(.system(size: 34))
-            }
-            Button { vm.togglePlay() } label: {
-                Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill")
-                    .font(.system(size: 56))
-                    .frame(width: 84, height: 84)
-            }
-            Button { vm.skip(10) } label: {
-                Image(systemName: "goforward.10")
-                    .font(.system(size: 34))
-            }
-        }
-        .foregroundStyle(.white)
+            Button { vm.skip(-10) } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
+            Button { vm.togglePlay() } label: { Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84) }
+            Button { vm.skip(10) } label: { Image(systemName: "goforward.10").font(.system(size: 34)) }
+        }.foregroundStyle(.white)
     }
 
     private var bottomBar: some View {
         VStack(spacing: 10) {
             HStack(spacing: 12) {
-                Text(formatTime(vm.isScrubbing ? scrubValue : vm.current))
-                    .monospacedDigit()
-                Slider(
-                    value: Binding(
-                        get: { vm.isScrubbing ? scrubValue : vm.current },
-                        set: { scrubValue = $0 }
-                    ),
-                    in: 0...max(vm.duration, 1),
-                    onEditingChanged: { editing in
-                        if editing {
-                            scrubValue = vm.current
-                            vm.isScrubbing = true
-                        } else {
-                            vm.isScrubbing = false
-                            vm.seek(to: scrubValue)
-                        }
-                    }
-                 )
-                .tint(.purple)
-                Text(formatTime(vm.duration))
-                    .monospacedDigit()
-            }
-            .font(.footnote)
-            .foregroundStyle(.white)
+                Text(formatTime(vm.isScrubbing ? scrubValue : vm.current)).monospacedDigit()
+                Slider(value: Binding(get: { vm.isScrubbing ? scrubValue : vm.current }, set: { scrubValue = $0 }), in: 0...max(vm.duration, 1),
+                       onEditingChanged: { editing in
+                           if editing { scrubValue = vm.current; vm.isScrubbing = true } else { vm.isScrubbing = false; vm.seek(to: scrubValue) }
+                       }).tint(.purple)
+                Text(formatTime(vm.duration)).monospacedDigit()
+            }.font(.footnote).foregroundStyle(.white)
 
             HStack(spacing: 26) {
                 Menu {
-                    ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in
-                        Button(String(format: "%.2gx", r)) { vm.setRate(r) }
-                     }
-                } label: {
-                    Label(String(format: "%.2gx", vm.rate), systemImage: "speedometer")
-                }
-                Button {
-                    vm.fillScreen.toggle()
-                } label: {
-                    Image(systemName: vm.fillScreen
-                          ? "arrow.down.right.and.arrow.up.left"
-                          : "arrow.up.left.and.arrow.down.right")
-                }
+                    ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Button(String(format: "%.2gx", r)) { vm.setRate(r) } }
+                } label: { Label(String(format: "%.2gx", vm.rate), systemImage: "speedometer") }
+                Button { vm.fillScreen.toggle() } label: { Image(systemName: vm.fillScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }
                 Spacer()
-            }
-            .font(.subheadline)
-            .foregroundStyle(.white)
-         }
-        .padding(.horizontal, 16)
-        .padding(.bottom, 14)
+            }.font(.subheadline).foregroundStyle(.white)
+         }.padding(.horizontal, 16).padding(.bottom, 14)
     }
-
-    // MARK: Gestures
 
     private func panGesture(geo: GeometryProxy) -> some Gesture {
         DragGesture(minimumDistance: 15)
             .onChanged { value in
                 if dragMode == .none {
                     if abs(value.translation.width) > abs(value.translation.height) {
-                        dragMode = .seek
-                        dragStartValue = vm.current
-                        seekTarget = vm.current
+                        dragMode = .seek; dragStartValue = vm.current; seekTarget = vm.current
                     } else if value.startLocation.x < geo.size.width / 2 {
-                        dragMode = .brightness
-                        dragStartValue = Double(UIScreen.main.brightness)
-                    } else {
-                        dragMode = .volume
-                        dragStartValue = vm.volumeLevel
-                    }
+                        dragMode = .brightness; dragStartValue = Double(UIScreen.main.brightness)
+                    } else { dragMode = .volume; dragStartValue = vm.volumeLevel }
                 }
                 switch dragMode {
                 case .seek:
                     let span = max(120, vm.duration * 0.3)
                     let delta = Double(value.translation.width / geo.size.width) * span
                     seekTarget = min(max(dragStartValue + delta, 0), max(vm.duration - 1, 0))
-                    let sign = delta >= 0 ? "+" : "-"
-                    vm.flash("\(formatTime(seekTarget))  (\(sign)\(formatTime(abs(delta))))")
-                case .volume:
-                    let delta = -Double(value.translation.height / 300)
-                    vm.setVolume(dragStartValue + delta)
+                    vm.flash("\(formatTime(seekTarget))  (\(delta >= 0 ? "+" : "-")\(formatTime(abs(delta))))")
+                case .volume: vm.setVolume(dragStartValue - Double(value.translation.height / 300))
                 case .brightness:
-                    let delta = -Double(value.translation.height / 300)
-                    let level = min(max(dragStartValue + delta, 0), 1)
+                    let level = min(max(dragStartValue - Double(value.translation.height / 300), 0), 1)
                     UIScreen.main.brightness = CGFloat(level)
                     vm.flash("Brightness \(Int(level * 100))%")
-                case .none:
-                    break
+                case .none: break
                 }
             }
-            .onEnded { _ in
-                if dragMode == .seek {
-                    vm.seek(to: seekTarget)
-                }
-                dragMode = .none
-            }
+            .onEnded { _ in if dragMode == .seek { vm.seek(to: seekTarget) }; dragMode = .none }
     }
 }
-
-// MARK: - OSD badge
 
 struct OSDBadge: View {
     let text: String
     var body: some View {
-        Text(text)
-            .font(.headline.monospacedDigit())
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
-            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12))
-            .foregroundStyle(.white)
+        Text(text).font(.headline.monospacedDigit()).padding(.horizontal, 16).padding(.vertical, 10)
+            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white)
     }
 }
 
@@ -1231,17 +1028,13 @@ struct OSDBadge: View {
 // ============================================================
 
 enum LibrarySort: String, CaseIterable, Identifiable {
-    case recent = "Recently Added"
-    case title = "Title"
-    case lastPlayed = "Last Played"
+    case recent = "Recently Added", title = "Title", lastPlayed = "Last Played"
     var id: String { rawValue }
 }
 
 struct LibraryView: View {
-
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.scenePhase) private var scenePhase
-
     @State private var showImporter = false
     @State private var showSettings = false
     @State private var searchText = ""
@@ -1251,227 +1044,106 @@ struct LibraryView: View {
     @State private var renameText = ""
 
     private static let importTypes: [UTType] = {
-        var types: [UTType] = [.movie, .video, .audiovisualContent, .audio,
-                               .mpeg4Movie, .quickTimeMovie, .avi, .mpeg, .mpeg2Video]
+        var types: [UTType] = [.movie, .video, .audiovisualContent, .audio, .mpeg4Movie, .quickTimeMovie, .avi, .mpeg, .mpeg2Video]
         for ext in ["mkv", "webm", "ts", "m2ts", "flv", "wmv", "srt", "vtt", "flac", "ogg", "opus"] {
-            if let t = UTType(filenameExtension: ext) {
-                types.append(t)
-            }
+            if let t = UTType(filenameExtension: ext) { types.append(t) }
         }
         return types
     }()
 
     var body: some View {
         NavigationStack {
-            Group {
-                if store.items.isEmpty {
-                    emptyState
-                } else {
-                    libraryList
-                }
-            }
+            Group { if store.items.isEmpty { emptyState } else { libraryList } }
             .background(Color(white: 0.06).ignoresSafeArea())
             .navigationTitle("Mina Anii")
             .searchable(text: $searchText, prompt: "Search your library")
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     sortMenu
-                    Button { showImporter = true } label: {
-                        Image(systemName: "plus")
-                    }
-                    Button { showSettings = true } label: {
-                        Image(systemName: "gearshape")
-                    }
+                    Button { showImporter = true } label: { Image(systemName: "plus") }
+                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
             }
         }
-        .fileImporter(
-            isPresented: $showImporter,
-            allowedContentTypes: Self.importTypes,
-            allowsMultipleSelection: true
-        ) { result in
-            if case .success(let urls) = result {
-                Task { await store.importFiles(urls) }
-            }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { result in
+            if case .success(let urls) = result { Task { await store.importFiles(urls) } }
         }
-        .fullScreenCover(item: $playing) { item in
-            PlayerScreen(item: item, store: store)
-        }
-        .sheet(isPresented: $showSettings) {
-            SettingsView().environmentObject(store)
-        }
-        .alert("Rename", isPresented: Binding(
-            get: { renaming != nil },
-            set: { if !$0 { renaming = nil } }
-        )) {
+        .fullScreenCover(item: $playing) { item in PlayerScreen(item: item, store: store) }
+        .sheet(isPresented: $showSettings) { SettingsView().environmentObject(store) }
+        .alert("Rename", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Title", text: $renameText)
-            Button("Save") {
-                if let item = renaming {
-                    store.rename(item, to: renameText)
-                }
-                renaming = nil
-            }
+            Button("Save") { if let item = renaming { store.rename(item, to: renameText) }; renaming = nil }
             Button("Cancel", role: .cancel) { renaming = nil }
         }
         .task { await store.rescan() }
-        .onChange(of: scenePhase) { phase in
-            if phase == .active {
-                Task { await store.rescan() }
-            }
-        }
+        .onChange(of: scenePhase) { phase in if phase == .active { Task { await store.rescan() } } }
     }
-
-    // MARK: Sections
 
     private var libraryList: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 26) {
-                if searchText.isEmpty && !continueItems.isEmpty {
-                    sectionHeader("Continue Watching")
-                    continueRow
-                }
+                if searchText.isEmpty && !continueItems.isEmpty { sectionHeader("Continue Watching"); continueRow }
                 sectionHeader(searchText.isEmpty ? "Library" : "Results")
                 grid
-            }
-            .padding(.horizontal)
-            .padding(.top, 6)
-            .padding(.bottom, 32)
+            }.padding(.horizontal).padding(.top, 6).padding(.bottom, 32)
         }
     }
 
-    private func sectionHeader(_ text: String) -> some View {
-        Text(text)
-            .font(.title3.weight(.semibold))
-            .foregroundStyle(.white)
-    }
+    private func sectionHeader(_ text: String) -> some View { Text(text).font(.title3.weight(.semibold)).foregroundStyle(.white) }
 
     private var continueRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 14) {
                 ForEach(continueItems) { item in
-                    Button { playing = item } label: {
-                        ContinueCard(item: item, thumbURL: store.thumbURL(for: item))
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu { contextButtons(for: item) }
+                    Button { playing = item } label: { ContinueCard(item: item, thumbURL: store.thumbURL(for: item)) }
+                    .buttonStyle(.plain).contextMenu { contextButtons(for: item) }
                 }
             }
         }
     }
 
     private var grid: some View {
-        LazyVGrid(
-            columns: [GridItem(.adaptive(minimum: 168), spacing: 16)],
-            alignment: .leading,
-            spacing: 22
-        ) {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 168), spacing: 16)], alignment: .leading, spacing: 22) {
             ForEach(filteredItems) { item in
-                Button { playing = item } label: {
-                    MediaCard(item: item, thumbURL: store.thumbURL(for: item))
-                }
-                .buttonStyle(.plain)
-                .contextMenu { contextButtons(for: item) }
+                Button { playing = item } label: { MediaCard(item: item, thumbURL: store.thumbURL(for: item)) }
+                .buttonStyle(.plain).contextMenu { contextButtons(for: item) }
             }
         }
     }
 
     @ViewBuilder
     private func contextButtons(for item: MediaItem) -> some View {
-        Button {
-            playing = item
-        } label: {
-            Label("Play", systemImage: "play.fill")
-        }
-        Button {
-            store.resetProgress(item)
-            playing = item
-        } label: {
-            Label("Play from Beginning", systemImage: "gobackward")
-        }
-        Button {
-            renameText = item.title
-            renaming = item
-        } label: {
-            Label("Rename", systemImage: "pencil")
-        }
-        if item.isWatched {
-            Button {
-                store.resetProgress(item)
-            } label: {
-                Label("Mark as Unwatched", systemImage: "eye.slash")
-            }
-        } else if item.duration > 0 {
-            Button {
-                store.markWatched(item)
-            } label: {
-                Label("Mark as Watched", systemImage: "eye")
-            }
-        }
-        Button(role: .destructive) {
-            store.delete(item)
-        } label: {
-            Label("Delete", systemImage: "trash")
-        }
+        Button { playing = item } label: { Label("Play", systemImage: "play.fill") }
+        Button { store.resetProgress(item); playing = item } label: { Label("Play from Beginning", systemImage: "gobackward") }
+        Button { renameText = item.title; renaming = item } label: { Label("Rename", systemImage: "pencil") }
+        if item.isWatched { Button { store.resetProgress(item) } label: { Label("Mark as Unwatched", systemImage: "eye.slash") } }
+        else if item.duration > 0 { Button { store.markWatched(item) } label: { Label("Mark as Watched", systemImage: "eye") } }
+        Button(role: .destructive) { store.delete(item) } label: { Label("Delete", systemImage: "trash") }
     }
 
     private var sortMenu: some View {
-        Menu {
-            Picker("Sort", selection: $sort) {
-                ForEach(LibrarySort.allCases) { s in
-                    Text(s.rawValue).tag(s)
-                }
-            }
-        } label: {
-            Image(systemName: "arrow.up.arrow.down")
-        }
+        Menu { Picker("Sort", selection: $sort) { ForEach(LibrarySort.allCases) { s in Text(s.rawValue).tag(s) } } }
+        label: { Image(systemName: "arrow.up.arrow.down") }
     }
 
     private var emptyState: some View {
         VStack(spacing: 18) {
-            Image(systemName: "film.stack")
-                .font(.system(size: 64))
-                .foregroundStyle(.purple)
-            Text("Your library is empty")
-                .font(.title2.weight(.semibold))
+            Image(systemName: "film.stack").font(.system(size: 64)).foregroundStyle(.purple)
+            Text("Your library is empty").font(.title2.weight(.semibold))
             Text("Import videos with the + button, share files to Mina Anii from any app, or drop them into On My iPad › Mina Anii using the Files app.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 420)
-            Button {
-                showImporter = true
-            } label: {
-                Label("Import Media", systemImage: "plus")
-                    .padding(.horizontal, 8)
-            }
-            .buttonStyle(.borderedProminent)
-        }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
+            Button { showImporter = true } label: { Label("Import Media", systemImage: "plus").padding(.horizontal, 8) }.buttonStyle(.borderedProminent)
+        }.padding().frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    // MARK: Data
-
-    private var continueItems: [MediaItem] {
-        store.items
-            .filter { $0.lastPosition > 20 && $0.duration > 0 && !$0.isWatched }
-            .sorted { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
-    }
-
+    private var continueItems: [MediaItem] { store.items.filter { $0.lastPosition > 20 && $0.duration > 0 && !$0.isWatched }.sorted { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) } }
     private var filteredItems: [MediaItem] {
         var result = store.items
-        if !searchText.isEmpty {
-            result = result.filter {
-                $0.title.localizedCaseInsensitiveContains(searchText) || $0.fileName.localizedCaseInsensitiveContains(searchText)
-            }
-        }
+        if !searchText.isEmpty { result = result.filter { $0.title.localizedCaseInsensitiveContains(searchText) || $0.fileName.localizedCaseInsensitiveContains(searchText) } }
         switch sort {
-        case .recent:
-            result.sort { $0.dateAdded > $1.dateAdded }
-        case .title:
-            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
-        case .lastPlayed:
-            result.sort { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
+        case .recent: result.sort { $0.dateAdded > $1.dateAdded }
+        case .title: result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+        case .lastPlayed: result.sort { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
         }
         return result
     }
@@ -1486,61 +1158,55 @@ struct MediaCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             ZStack(alignment: .bottomLeading) {
-                Color.clear
-                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
-                    .overlay(ThumbImage(url: thumbURL, isAudio: item.isAudio))
+                Color.clear.aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .overlay(ThumbImage(url: thumbURL, isAudio: item.isAudio, metadata: item.metadata))
                     .clipped()
 
                 if item.progress > 0.01 && !item.isWatched {
-                    GeometryReader { geo in
-                        Rectangle()
-                            .fill(Color.purple)
-                            .frame(width: geo.size.width * item.progress, height: 4)
-                            .frame(maxHeight: .infinity, alignment: .bottom)
-                    }
+                    GeometryReader { geo in Rectangle().fill(Color.purple).frame(width: geo.size.width * item.progress, height: 4).frame(maxHeight: .infinity, alignment: .bottom) }
                 }
             }
             .overlay(alignment: .topTrailing) {
                 if item.duration > 0 {
-                    Text(formatTime(item.duration))
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(.black.opacity(0.65), in: Capsule())
-                        .padding(6)
+                    Text(formatTime(item.duration)).font(.caption2.weight(.semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 6).padding(.vertical, 3).background(.black.opacity(0.65), in: Capsule()).padding(6)
                 }
             }
             .overlay(alignment: .topLeading) {
                 if !item.isEngineSupported {
-                    Text(item.fileExtension.uppercased())
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(.orange.opacity(0.9), in: Capsule())
-                        .padding(6)
+                    Text(item.fileExtension.uppercased()).font(.caption2.weight(.bold)).foregroundStyle(.black)
+                        .padding(.horizontal, 6).padding(.vertical, 3).background(.orange.opacity(0.9), in: Capsule()).padding(6)
                 }
             }
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
-            Text(item.title)
+            Text(item.metadata?.title ?? item.title)
                 .font(.subheadline.weight(.medium))
-                .lineLimit(2)
-                .multilineTextAlignment(.leading)
+                .lineLimit(1)
                 .foregroundStyle(.white)
 
-            Text(caption)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if let isTV = item.metadata?.isTVShow, isTV, let s = item.metadata?.season, let e = item.metadata?.episode {
+                Text("Season \(s) • Episode \(e)")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.purple)
+            }
+
+            if let overview = item.metadata?.overview, !overview.isEmpty {
+                Text(overview)
+                    .font(.caption2)
+                    .lineLimit(2)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text(caption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
     private var caption: String {
         if item.isWatched { return "Watched" }
-        if item.progress > 0.01, item.duration > 0 {
-            return "\(formatTime(max(item.duration - item.lastPosition, 0))) left"
-        }
+        if item.progress > 0.01, item.duration > 0 { return "\(formatTime(max(item.duration - item.lastPosition, 0))) left" }
         return item.fileExtension.uppercased()
     }
 }
@@ -1552,25 +1218,16 @@ struct ContinueCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             ZStack(alignment: .bottomLeading) {
-                Color.clear
-                    .frame(width: 256, height: 144)
-                    .overlay(ThumbImage(url: thumbURL, isAudio: item.isAudio))
+                Color.clear.frame(width: 256, height: 144)
+                    .overlay(ThumbImage(url: thumbURL, isAudio: item.isAudio, metadata: item.metadata))
                     .clipped()
-                    .overlay(
-                        Image(systemName: "play.circle.fill")
-                            .font(.system(size: 42))
-                            .foregroundStyle(.white.opacity(0.92))
-                    )
-                Rectangle()
-                    .fill(Color.white.opacity(0.25))
-                    .frame(height: 4)
-                Rectangle()
-                    .fill(Color.purple)
-                    .frame(width: 256 * item.progress, height: 4)
+                    .overlay(Image(systemName: "play.circle.fill").font(.system(size: 42)).foregroundStyle(.white.opacity(0.92)))
+                Rectangle().fill(Color.white.opacity(0.25)).frame(height: 4)
+                Rectangle().fill(Color.purple).frame(width: 256 * item.progress, height: 4)
             }
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
-            Text(item.title)
+            Text(item.metadata?.title ?? item.title)
                 .font(.subheadline.weight(.medium))
                 .lineLimit(1)
                 .foregroundStyle(.white)
@@ -1578,48 +1235,48 @@ struct ContinueCard: View {
             Text("\(formatTime(max(item.duration - item.lastPosition, 0))) left")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-        }
-        .frame(width: 256)
+        }.frame(width: 256)
     }
 }
 
 struct ThumbImage: View {
     let url: URL
     var isAudio: Bool = false
+    var metadata: MediaMetadata? = nil
     @State private var image: UIImage?
 
     var body: some View {
         GeometryReader { geo in
             ZStack {
-                Rectangle()
-                    .fill(LinearGradient(
-                        colors: [Color(white: 0.18), Color(white: 0.10)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    ))
-                if let image {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFill()
+                Rectangle().fill(LinearGradient(colors: [Color(white: 0.18), Color(white: 0.10)], startPoint: .top, endPoint: .bottom))
+                
+                if let posterURL = metadata?.posterURL {
+                    AsyncImage(url: posterURL) { phase in
+                        if let img = phase.image {
+                            img.resizable().scaledToFill()
+                        } else {
+                            ProgressView()
+                        }
+                    }
+                } else if let image {
+                    Image(uiImage: image).resizable().scaledToFill()
                 } else {
-                    Image(systemName: isAudio ? "music.note" : "film")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.secondary)
+                    Image(systemName: isAudio ? "music.note" : "film").font(.system(size: 30)).foregroundStyle(.secondary)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
         }
         .task(id: url) {
-            image = await Self.load(url)
+            if metadata?.posterURL == nil {
+                image = await Self.load(url)
+            }
         }
     }
 
     static func load(_ url: URL) async -> UIImage? {
         let path = url.path
-        return await Task.detached(priority: .utility) {
-            UIImage(contentsOfFile: path)
-        }.value
+        return await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
     }
 }
 
@@ -1628,13 +1285,10 @@ struct ThumbImage: View {
 // ============================================================
 
 struct SettingsView: View {
-
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.dismiss) private var dismiss
-
     @AppStorage("autoResume") private var autoResume = true
     @AppStorage("defaultRate") private var defaultRate = 1.0
-
     @State private var storageText = "Calculating…"
     @State private var confirmWipe = false
 
@@ -1643,35 +1297,18 @@ struct SettingsView: View {
             Form {
                 Section("Playback") {
                     Toggle("Resume where I left off", isOn: $autoResume)
-                    Picker("Default speed", selection: $defaultRate) {
-                        ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in
-                            Text(String(format: "%.2gx", r)).tag(r)
-                        }
-                    }
+                    Picker("Default speed", selection: $defaultRate) { ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Text(String(format: "%.2gx", r)).tag(r) } }
                 }
-
                 Section("Library") {
                     LabeledContent("Storage used", value: storageText)
-                    Button("Rescan for new files") {
-                        Task {
-                            await store.rescan()
-                            storageText = store.storageString()
-                        }
-                    }
-                    Button("Clear watch history") {
-                        store.clearProgress()
-                    }
-                    Button("Delete all media", role: .destructive) {
-                        confirmWipe = true
-                    }
+                    Button("Rescan for new files") { Task { await store.rescan(); storageText = store.storageString() } }
+                    Button("Clear watch history") { store.clearProgress() }
+                    Button("Delete all media", role: .destructive) { confirmWipe = true }
                 }
-
                 Section("Adding media") {
                     Text("Use the + button in the library, share any video to Mina Anii from another app, or drop files into On My iPad › Mina Anii with the Files app — they're picked up automatically.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .font(.footnote).foregroundStyle(.secondary)
                 }
-
                 Section("About") {
                     LabeledContent("App", value: "Mina Anii")
                     LabeledContent("Developer", value: "Polao")
@@ -1680,24 +1317,11 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { dismiss() }
-                }
+            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { dismiss() } } }
+            .confirmationDialog("Delete all imported media? This can't be undone.", isPresented: $confirmWipe, titleVisibility: .visible) {
+                Button("Delete Everything", role: .destructive) { store.deleteAll(); storageText = store.storageString() }
             }
-            .confirmationDialog(
-                "Delete all imported media? This can't be undone.",
-                isPresented: $confirmWipe,
-                titleVisibility: .visible
-            ) {
-                Button("Delete Everything", role: .destructive) {
-                    store.deleteAll()
-                    storageText = store.storageString()
-                }
-            }
-            .task {
-                storageText = store.storageString()
-            }
+            .task { storageText = store.storageString() }
         }
     }
 }
