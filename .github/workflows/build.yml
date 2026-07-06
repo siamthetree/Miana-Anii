@@ -71,10 +71,14 @@ jobs:
           PYEOF
 
       - name: Install XcodeGen
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+          HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
         run: brew install xcodegen
         
       - name: Inject Secrets.plist
         run: |
+          mkdir -p Sources
           cat > Sources/Secrets.plist << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
