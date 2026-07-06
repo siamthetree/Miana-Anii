@@ -4,6 +4,12 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
+
+packages:
+  MobileVLCKit:
+    url: https://github.com/mjisagal/MobileVLCKit-SPM.git
+    from: 3.3.17
+
 targets:
   MinaAnii:
     type: application
@@ -11,6 +17,8 @@ targets:
     sources:
       - path: Sources
       - path: Assets.xcassets
+    dependencies:
+      - package: MobileVLCKit
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.polao.minaanii
