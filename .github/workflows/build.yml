@@ -69,10 +69,11 @@ jobs:
           open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(png)
           print('icon written:', len(png), 'bytes')
           PYEOF
+
       - name: Install XcodeGen
         run: brew install xcodegen
         
-        - name: Inject Secrets.plist
+      - name: Inject Secrets.plist
         run: |
           cat > Sources/Secrets.plist << 'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
