@@ -32,7 +32,149 @@ struct MinaAniiApp: App {
 }
 
 // ============================================================
-// Metadata Models & Service
+// Trakt Models & Service
+// ============================================================
+
+struct TraktDeviceCodeResponse: Codable {
+    let device_code: String
+    let user_code: String
+    let verification_url: String
+    let expires_in: Int
+    let interval: Int
+}
+
+struct TraktTokenResponse: Codable {
+    let access_token: String
+}
+
+@MainActor
+final class TraktService: ObservableObject {
+    static let shared = TraktService()
+    
+    private var clientID: String {
+        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
+              let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
+              let key = dict["TraktClientID"] as? String else { return "" }
+        return key
+    }
+    
+    private var clientSecret: String {
+        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
+              let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
+              let key = dict["TraktClientSecret"] as? String else { return "" }
+        return key
+    }
+    
+    @AppStorage("traktAccessToken") var accessToken: String = ""
+    
+    @Published var isAuthenticating = false
+    @Published var authUserCode: String?
+    @Published var authVerificationURL: String?
+    
+    var isAuthenticated: Bool { !accessToken.isEmpty }
+    private var authTask: Task<Void, Never>?
+    
+    func startDeviceAuthentication() async {
+        guard !clientID.isEmpty else {
+            print("Trakt Error: Missing Client ID in Secrets.plist")
+            return
+        }
+        
+        isAuthenticating = true
+        guard let url = URL(string: "https://api.trakt.tv/oauth/device/code") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body: [String: String] = ["client_id": clientID]
+        request.httpBody = try? JSONEncoder().encode(body)
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let response = try JSONDecoder().decode(TraktDeviceCodeResponse.self, from: data)
+            self.authUserCode = response.user_code
+            self.authVerificationURL = response.verification_url
+            pollForToken(deviceCode: response.device_code, interval: response.interval, expiresAt: Date().addingTimeInterval(TimeInterval(response.expires_in)))
+        } catch {
+            print("Trakt Device Code Error: \(error)")
+            isAuthenticating = false
+        }
+    }
+    
+    private func pollForToken(deviceCode: String, interval: Int, expiresAt: Date) {
+        authTask?.cancel()
+        authTask = Task {
+            while Date() < expiresAt {
+                if Task.isCancelled { break }
+                try? await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000_000)
+                
+                guard let url = URL(string: "https://api.trakt.tv/oauth/device/token") else { continue }
+                var request = URLRequest(url: url)
+                request.httpMethod = "POST"
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                
+                let body: [String: String] = ["code": deviceCode, "client_id": clientID, "client_secret": clientSecret]
+                request.httpBody = try? JSONEncoder().encode(body)
+                
+                if let (data, response) = try? await URLSession.shared.data(for: request),
+                   let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                    if let tokenData = try? JSONDecoder().decode(TraktTokenResponse.self, from: data) {
+                        self.accessToken = tokenData.access_token
+                        self.isAuthenticating = false
+                        self.authUserCode = nil
+                        break
+                    }
+                }
+            }
+            self.isAuthenticating = false
+        }
+    }
+    
+    func logout() {
+        authTask?.cancel()
+        accessToken = ""
+        isAuthenticating = false
+    }
+    
+    enum ScrobbleAction: String { case start = "start", pause = "pause", stop = "stop" }
+    
+    func scrobble(item: MediaItem, progress: Double, action: ScrobbleAction) {
+        guard isAuthenticated, let metadata = item.metadata, metadata.tmdbID > 0 else { return }
+        
+        let url = URL(string: "https://api.trakt.tv/scrobble/\(action.rawValue)")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("2", forHTTPHeaderField: "trakt-api-version")
+        request.setValue(clientID, forHTTPHeaderField: "trakt-api-key")
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        
+        var payload: [String: Any] = ["progress": progress * 100, "app_version": "1.0", "app_date": "2024-01-01"]
+        
+        if metadata.isTVShow {
+            payload["episode"] = ["season": metadata.season ?? 1, "number": metadata.episode ?? 1]
+            payload["show"] = ["ids": ["tmdb": metadata.tmdbID]]
+        } else {
+            payload["movie"] = ["title": metadata.title, "year": Int(metadata.releaseYear) ?? 0, "ids": ["tmdb": metadata.tmdbID]]
+        }
+        
+        request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        
+        Task.detached {
+            do {
+                let (_, response) = try await URLSession.shared.data(for: request)
+                if let httpResponse = response as? HTTPURLResponse {
+                    print("Trakt Scrobble (\(action.rawValue)) Status: \(httpResponse.statusCode)")
+                }
+            } catch {
+                print("Trakt Scrobble Error: \(error)")
+            }
+        }
+    }
+}
+
+// ============================================================
+// TMDB Metadata Models & Service
 // ============================================================
 
 struct MediaMetadata: Codable, Hashable {
@@ -45,22 +187,31 @@ struct MediaMetadata: Codable, Hashable {
     var isTVShow: Bool
     var season: Int?
     var episode: Int?
+    var rating: Double?
+    var genres: [String] = []
+    var cast: [String] = []
 }
 
-struct TMDBResponse: Codable {
-    let results: [TMDBResult]
-}
-
+struct TMDBResponse: Codable { let results: [TMDBResult] }
 struct TMDBResult: Codable {
     let id: Int
     let title: String?
-    let name: String? // TV Shows use 'name' instead of 'title'
+    let name: String?
     let overview: String?
     let poster_path: String?
     let backdrop_path: String?
     let release_date: String?
     let first_air_date: String?
 }
+
+struct TMDBDetailResponse: Codable {
+    let vote_average: Double?
+    let genres: [TMDBGenre]?
+    let credits: TMDBCredits?
+}
+struct TMDBGenre: Codable { let name: String }
+struct TMDBCredits: Codable { let cast: [TMDBCast]? }
+struct TMDBCast: Codable { let name: String }
 
 final class MetadataService {
     static var apiKey: String {
@@ -69,56 +220,61 @@ final class MetadataService {
               let key = dict["TMDBAPIKey"] as? String else { return "" }
         return key
     }
+    
     static let baseURL = "https://api.themoviedb.org/3"
-    static let imageBaseURL = "https://image.tmdb.org/t/p/w500"
+    static let imageBaseURL = "https://image.tmdb.org/t/p/w780"
     
     static func fetchMetadata(for filename: String, cleanTitle: String) async -> MediaMetadata? {
         let isTV = filename.localizedStandardContains("S0") || filename.localizedStandardContains("E0") || filename.localizedStandardContains("Season")
         let searchType = isTV ? "tv" : "movie"
         
-        // Extract season and episode if it's a TV show (Regex for S01E01 format)
         var season: Int? = nil
         var episode: Int? = nil
         if isTV {
             let pattern = "[sS](\\d{1,2})[eE](\\d{1,2})"
             if let regex = try? NSRegularExpression(pattern: pattern),
                let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)) {
-                
-                if let sRange = Range(match.range(at: 1), in: filename),
-                   let eRange = Range(match.range(at: 2), in: filename) {
+                if let sRange = Range(match.range(at: 1), in: filename), let eRange = Range(match.range(at: 2), in: filename) {
                     season = Int(filename[sRange])
                     episode = Int(filename[eRange])
                 }
             }
         }
         
-        // Build the search URL
         var components = URLComponents(string: "\(baseURL)/search/\(searchType)")!
         components.queryItems = [
             URLQueryItem(name: "api_key", value: apiKey),
             URLQueryItem(name: "query", value: cleanTitle),
             URLQueryItem(name: "page", value: "1")
         ]
-        
         guard let url = components.url else { return nil }
         
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             let response = try JSONDecoder().decode(TMDBResponse.self, from: data)
-            
             guard let firstResult = response.results.first else { return nil }
             
             let dateString = firstResult.release_date ?? firstResult.first_air_date ?? ""
             let year = String(dateString.prefix(4))
             
             var posterURL: URL? = nil
-            if let path = firstResult.poster_path {
-                posterURL = URL(string: "\(imageBaseURL)\(path)")
-            }
+            if let path = firstResult.poster_path { posterURL = URL(string: "\(imageBaseURL)\(path)") }
             
             var backdropURL: URL? = nil
-            if let path = firstResult.backdrop_path {
-                backdropURL = URL(string: "\(imageBaseURL)\(path)")
+            if let path = firstResult.backdrop_path { backdropURL = URL(string: "\(imageBaseURL)\(path)") }
+            
+            var rating: Double? = nil
+            var genres: [String] = []
+            var cast: [String] = []
+            
+            let detailsURLStr = "\(baseURL)/\(searchType)/\(firstResult.id)?api_key=\(apiKey)&append_to_response=credits"
+            if let dUrl = URL(string: detailsURLStr),
+               let (dData, _) = try? await URLSession.shared.data(from: dUrl),
+               let details = try? JSONDecoder().decode(TMDBDetailResponse.self, from: dData) {
+                
+                rating = details.vote_average
+                genres = details.genres?.prefix(3).map { $0.name } ?? []
+                cast = details.credits?.cast?.prefix(10).map { $0.name } ?? []
             }
             
             return MediaMetadata(
@@ -130,9 +286,11 @@ final class MetadataService {
                 releaseYear: year,
                 isTVShow: isTV,
                 season: season,
-                episode: episode
+                episode: episode,
+                rating: rating,
+                genres: genres,
+                cast: cast
             )
-            
         } catch {
             print("TMDB Fetch Error: \(error.localizedDescription)")
             return nil
@@ -141,7 +299,7 @@ final class MetadataService {
 }
 
 // ============================================================
-// Models.swift
+// Local Models
 // ============================================================
 
 enum MediaKinds {
@@ -149,13 +307,9 @@ enum MediaKinds {
         "mp4", "m4v", "mov", "3gp", "mkv", "avi", "webm", "ts", "m2ts",
         "mts", "flv", "wmv", "mpg", "mpeg", "vob", "ogv"
     ]
-    static let audio: Set<String> = [
-        "mp3", "m4a", "aac", "wav", "caf", "aif", "aiff", "flac", "ogg", "opus", "wma"
-    ]
+    static let audio: Set<String> = ["mp3", "m4a", "aac", "wav", "caf", "aif", "aiff", "flac", "ogg", "opus", "wma"]
     static let subtitles: Set<String> = ["srt", "vtt", "ass", "ssa", "sub"]
-    static let native: Set<String> = [
-        "mp4", "m4v", "mov", "3gp", "mp3", "m4a", "aac", "wav", "caf", "aif", "aiff", "flac"
-    ]
+    static let native: Set<String> = ["mp4", "m4v", "mov", "3gp", "mp3", "m4a", "aac", "wav", "caf", "aif", "aiff", "flac"]
     static var media: Set<String> { video.union(audio) }
 }
 
@@ -167,7 +321,7 @@ struct MediaItem: Identifiable, Codable, Hashable {
     var duration: Double = 0
     var lastPosition: Double = 0
     var lastPlayed: Date? = nil
-    var metadata: MediaMetadata? = nil // TMDB Metadata attached here
+    var metadata: MediaMetadata? = nil
 
     var progress: Double {
         guard duration > 0 else { return 0 }
@@ -186,9 +340,7 @@ struct MediaItem: Identifiable, Codable, Hashable {
 
 @MainActor
 final class LibraryStore: ObservableObject {
-
     @Published private(set) var items: [MediaItem] = []
-
     private let fm = FileManager.default
     let documentsURL: URL
     let mediaDir: URL
@@ -242,7 +394,6 @@ final class LibraryStore: ObservableObject {
         defer { if secured { src.stopAccessingSecurityScopedResource() } }
 
         let ext = src.pathExtension.lowercased()
-
         if MediaKinds.subtitles.contains(ext) {
             let dest = mediaDir.appendingPathComponent(src.lastPathComponent)
             try? fm.removeItem(at: dest)
@@ -254,11 +405,8 @@ final class LibraryStore: ObservableObject {
 
         let dest = uniqueDestination(for: src.lastPathComponent)
         do {
-            let from = src
-            let to = dest
-            try await Task.detached(priority: .userInitiated) {
-                try FileManager.default.copyItem(at: from, to: to)
-            }.value
+            let from = src; let to = dest
+            try await Task.detached(priority: .userInitiated) { try FileManager.default.copyItem(at: from, to: to) }.value
         } catch { return }
 
         if src.path.contains("/Inbox/") { try? fm.removeItem(at: src) }
@@ -270,20 +418,14 @@ final class LibraryStore: ObservableObject {
         let rawTitle = (fileURL.lastPathComponent as NSString).deletingPathExtension
         let prettyTitle = Self.prettyTitle(from: rawTitle)
         
-        var item = MediaItem(
-            title: prettyTitle,
-            fileName: fileURL.lastPathComponent
-        )
+        var item = MediaItem(title: prettyTitle, fileName: fileURL.lastPathComponent)
         
-        // Fetch Metadata from TMDB
         if let meta = await MetadataService.fetchMetadata(for: fileURL.lastPathComponent, cleanTitle: prettyTitle) {
             item.metadata = meta
         }
 
         let asset = AVURLAsset(url: fileURL)
-        if let d = try? await asset.load(.duration), d.seconds.isFinite, d.seconds > 0 {
-            item.duration = d.seconds
-        }
+        if let d = try? await asset.load(.duration), d.seconds.isFinite, d.seconds > 0 { item.duration = d.seconds }
         if !item.isAudio {
             let seconds = item.duration > 0 ? max(1.0, item.duration * 0.12) : 3.0
             await Self.writeThumbnail(assetURL: fileURL, at: seconds, to: thumbURL(for: item))
@@ -293,7 +435,6 @@ final class LibraryStore: ObservableObject {
 
     func rescan() async {
         var changed = false
-
         if let loose = try? fm.contentsOfDirectory(at: documentsURL, includingPropertiesForKeys: nil) {
             for f in loose {
                 let ext = f.pathExtension.lowercased()
@@ -317,10 +458,8 @@ final class LibraryStore: ObservableObject {
                 changed = true
             }
         }
-
         let before = items.count
         items.removeAll { !fm.fileExists(atPath: url(for: $0).path) }
-
         if changed || items.count != before { save() }
     }
 
@@ -362,18 +501,12 @@ final class LibraryStore: ObservableObject {
     }
 
     func clearProgress() {
-        for i in items.indices {
-            items[i].lastPosition = 0
-            items[i].lastPlayed = nil
-        }
+        for i in items.indices { items[i].lastPosition = 0; items[i].lastPlayed = nil }
         save()
     }
 
     func deleteAll() {
-        for item in items {
-            try? fm.removeItem(at: url(for: item))
-            try? fm.removeItem(at: thumbURL(for: item))
-        }
+        for item in items { try? fm.removeItem(at: url(for: item)); try? fm.removeItem(at: thumbURL(for: item)) }
         items.removeAll()
         save()
     }
@@ -382,9 +515,7 @@ final class LibraryStore: ObservableObject {
         var total: Int64 = 0
         if let enumerator = fm.enumerator(at: mediaDir, includingPropertiesForKeys: [.fileSizeKey]) {
             for case let f as URL in enumerator {
-                if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize {
-                    total += Int64(size)
-                }
+                if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += Int64(size) }
             }
         }
         return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
@@ -394,9 +525,7 @@ final class LibraryStore: ObservableObject {
         var s = raw.replacingOccurrences(of: "_", with: " ")
         if !s.contains(" ") { s = s.replacingOccurrences(of: ".", with: " ") }
         let lower = s.lowercased()
-        let markers = ["1080p", "720p", "2160p", "480p", "4k", "x264", "x265", "h264", "h265",
-                       "hevc", "web-dl", "webdl", "webrip", "bluray", "brrip", "bdrip",
-                       "hdrip", "hdtv", "dvdrip", "remux", "10bit", "yify", "rarbg", "aac"]
+        let markers = ["1080p", "720p", "2160p", "480p", "4k", "x264", "x265", "h264", "h265", "hevc", "web-dl", "webdl", "webrip", "bluray", "brrip", "bdrip", "hdrip", "hdtv", "dvdrip", "remux", "10bit", "yify", "rarbg", "aac"]
         var cut = s.count
         for m in markers {
             if let r = lower.range(of: m) { cut = min(cut, lower.distance(from: lower.startIndex, to: r.lowerBound)) }
@@ -404,12 +533,10 @@ final class LibraryStore: ObservableObject {
         if cut < s.count { s = String(s.prefix(cut)) }
         s = s.trimmingCharacters(in: CharacterSet(charactersIn: " -._[]()"))
         
-        // Remove season/episode strings from title since we display them separately now
         let pattern = "(?i)s\\d{1,2}e\\d{1,2}.*"
         if let regex = try? NSRegularExpression(pattern: pattern) {
             s = regex.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        
         return s.isEmpty ? raw : s
     }
 
@@ -442,27 +569,19 @@ func formatTime(_ t: Double) -> String {
 // Subtitles
 // ============================================================
 
-struct SubtitleCue {
-    let start: Double
-    let end: Double
-    let text: String
-}
+struct SubtitleCue { let start: Double; let end: Double; let text: String }
 
 enum SRTParser {
     static func parse(_ raw: String) -> [SubtitleCue] {
         var cues: [SubtitleCue] = []
-        let normalized = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-        let blocks = normalized.components(separatedBy: "\n\n")
+        let blocks = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n\n")
 
         for block in blocks {
             let lines = block.split(separator: "\n", omittingEmptySubsequences: true).map(String.init)
             guard let timeIndex = lines.firstIndex(where: { $0.contains("-->") }) else { continue }
             let parts = lines[timeIndex].components(separatedBy: "-->")
             guard parts.count == 2, let start = timestamp(parts[0]), let end = timestamp(parts[1]) else { continue }
-
-            let textLines = lines[(timeIndex + 1)...]
-            let joined = textLines.joined(separator: "\n")
-            let clean = joined
+            let clean = lines[(timeIndex + 1)...].joined(separator: "\n")
                 .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
                 .replacingOccurrences(of: "{\\\\[^}]*}", with: "", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -504,44 +623,24 @@ final class PlayerContainerView: UIView {
 }
 
 struct PlayerLayerView: UIViewRepresentable {
-    let player: AVPlayer
-    let holder: PlayerLayerHolder
-    let gravity: AVLayerVideoGravity
-
+    let player: AVPlayer; let holder: PlayerLayerHolder; let gravity: AVLayerVideoGravity
     func makeUIView(context: Context) -> PlayerContainerView {
         let view = PlayerContainerView()
-        view.backgroundColor = .black
-        view.playerLayer.player = player
-        view.playerLayer.videoGravity = gravity
-        holder.playerLayer = view.playerLayer
-        return view
+        view.backgroundColor = .black; view.playerLayer.player = player; view.playerLayer.videoGravity = gravity
+        holder.playerLayer = view.playerLayer; return view
     }
-
-    func updateUIView(_ uiView: PlayerContainerView, context: Context) {
-        uiView.playerLayer.videoGravity = gravity
-    }
+    func updateUIView(_ uiView: PlayerContainerView, context: Context) { uiView.playerLayer.videoGravity = gravity }
 }
 
 struct VLCPlayerLayerView: UIViewRepresentable {
     let player: VLCMediaPlayer
-
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView()
-        view.backgroundColor = .black
-        player.drawable = view
-        return view
-    }
-
+    func makeUIView(context: Context) -> UIView { let view = UIView(); view.backgroundColor = .black; player.drawable = view; return view }
     func updateUIView(_ uiView: UIView, context: Context) {}
 }
 
 struct RoutePickerView: UIViewRepresentable {
     func makeUIView(context: Context) -> AVRoutePickerView {
-        let view = AVRoutePickerView()
-        view.tintColor = .white
-        view.activeTintColor = .systemPurple
-        view.prioritizesVideoDevices = true
-        return view
+        let view = AVRoutePickerView(); view.tintColor = .white; view.activeTintColor = .systemPurple; view.prioritizesVideoDevices = true; return view
     }
     func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
 }
@@ -552,7 +651,6 @@ struct RoutePickerView: UIViewRepresentable {
 
 @MainActor
 final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
-
     let store: LibraryStore
     let media: MediaItem
     let player = AVPlayer()
@@ -585,19 +683,13 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var hideTask: DispatchWorkItem?
     private var flashTask: DispatchWorkItem?
     private var pip: AVPictureInPictureController?
-    
     private var pendingVLCSeek: Double?
 
-    init(media: MediaItem, store: LibraryStore) {
-        self.media = media
-        self.store = store
-        super.init()
-    }
+    init(media: MediaItem, store: LibraryStore) { self.media = media; self.store = store; super.init() }
 
     func start() {
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback)
-        try? session.setActive(true)
+        try? session.setCategory(.playback, mode: .moviePlayback); try? session.setActive(true)
 
         let url = store.url(for: media)
         let defaults = UserDefaults.standard
@@ -609,26 +701,20 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
         if media.isEngineSupported {
             let item = AVPlayerItem(url: url)
-            player.replaceCurrentItem(with: item)
-            player.allowsExternalPlayback = true
-            player.volume = Float(volumeLevel)
+            player.replaceCurrentItem(with: item); player.allowsExternalPlayback = true; player.volume = Float(volumeLevel)
 
-            statusCancellable = item.publisher(for: \.status)
-                .receive(on: DispatchQueue.main)
-                .sink { [weak self] status in
-                    guard let self else { return }
-                    if status == .readyToPlay, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
-                }
+            statusCancellable = item.publisher(for: \.status).receive(on: DispatchQueue.main).sink { [weak self] status in
+                guard let self else { return }
+                if status == .readyToPlay, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
+            }
 
             endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
                 guard let self else { return }
-                self.isPlaying = false
-                self.showControls = true
+                self.isPlaying = false; self.showControls = true
                 if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
             }
 
             loadSelectionGroups(for: item)
-
             timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in
                 guard let self, !self.isScrubbing else { return }
                 self.current = time.seconds
@@ -636,39 +722,31 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: time.seconds, in: self.cues) : nil
                 self.periodicSave()
             }
-            
-            if shouldResume {
-                player.seek(to: CMTime(seconds: media.lastPosition, preferredTimescale: 600))
-                current = media.lastPosition
-            }
-            
+            if shouldResume { player.seek(to: CMTime(seconds: media.lastPosition, preferredTimescale: 600)); current = media.lastPosition }
         } else {
-            vlcPlayer.delegate = self
-            vlcPlayer.media = VLCMedia(url: url)
-            vlcPlayer.audio?.volume = Int32(volumeLevel * 100) 
+            vlcPlayer.delegate = self; vlcPlayer.media = VLCMedia(url: url); vlcPlayer.audio?.volume = Int32(volumeLevel * 100)
             if shouldResume { self.pendingVLCSeek = media.lastPosition }
         }
 
         loadSidecarSubtitles(for: url)
         play()
         scheduleAutoHide()
+        
+        TraktService.shared.scrobble(item: media, progress: media.progress, action: .start)
     }
 
     func stop() {
         saveNow()
+        let prog = duration > 0 ? (current / duration) : 0
+        TraktService.shared.scrobble(item: media, progress: prog, action: .stop)
+        
         statusCancellable = nil
         if let observer = timeObserver { player.removeTimeObserver(observer); timeObserver = nil }
         if let end = endObserver { NotificationCenter.default.removeObserver(end); endObserver = nil }
-        hideTask?.cancel()
-        flashTask?.cancel()
+        hideTask?.cancel(); flashTask?.cancel()
         
-        if media.isEngineSupported {
-            player.pause()
-            player.replaceCurrentItem(with: nil)
-        } else {
-            vlcPlayer.stop()
-            vlcPlayer.delegate = nil
-        }
+        if media.isEngineSupported { player.pause(); player.replaceCurrentItem(with: nil) } 
+        else { vlcPlayer.stop(); vlcPlayer.delegate = nil }
         
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
@@ -679,19 +757,12 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             case .playing:
                 self.isPlaying = true
                 if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }
-                if let target = self.pendingVLCSeek {
-                    self.vlcPlayer.time = VLCTime(int: Int32(target * 1000))
-                    self.current = target
-                    self.pendingVLCSeek = nil
-                }
-            case .paused:
-                self.isPlaying = false
+                if let target = self.pendingVLCSeek { self.vlcPlayer.time = VLCTime(int: Int32(target * 1000)); self.current = target; self.pendingVLCSeek = nil }
+            case .paused: self.isPlaying = false
             case .ended:
-                self.isPlaying = false
-                self.showControls = true
+                self.isPlaying = false; self.showControls = true
                 if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
-            case .error:
-                self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
+            case .error: self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
             default: break
             }
         }
@@ -709,46 +780,35 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func play() {
-        if media.isEngineSupported { player.playImmediately(atRate: Float(rate)) } else {
-            vlcPlayer.play()
-            if rate != 1.0 { vlcPlayer.rate = Float(rate) }
-        }
+        if media.isEngineSupported { player.playImmediately(atRate: Float(rate)) } 
+        else { vlcPlayer.play(); if rate != 1.0 { vlcPlayer.rate = Float(rate) } }
         isPlaying = true
+        let prog = duration > 0 ? (current / duration) : 0
+        TraktService.shared.scrobble(item: media, progress: prog, action: .start)
     }
 
     func pause() {
         if media.isEngineSupported { player.pause() } else { vlcPlayer.pause() }
         isPlaying = false
         saveNow()
+        let prog = duration > 0 ? (current / duration) : 0
+        TraktService.shared.scrobble(item: media, progress: prog, action: .pause)
     }
 
-    func togglePlay() {
-        if isPlaying { pause() } else { play() }
-        scheduleAutoHide()
-    }
+    func togglePlay() { if isPlaying { pause() } else { play() }; scheduleAutoHide() }
 
     func seek(to target: Double) {
         let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target)
-        if media.isEngineSupported {
-            player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
-        } else {
-            vlcPlayer.time = VLCTime(int: Int32(clamped * 1000))
-        }
-        current = clamped
-        scheduleAutoHide()
+        if media.isEngineSupported { player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) } 
+        else { vlcPlayer.time = VLCTime(int: Int32(clamped * 1000)) }
+        current = clamped; scheduleAutoHide()
     }
 
-    func skip(_ seconds: Double) {
-        seek(to: current + seconds)
-        flash(seconds >= 0 ? "+\(Int(seconds))s" : "\(Int(seconds))s")
-    }
+    func skip(_ seconds: Double) { seek(to: current + seconds); flash(seconds >= 0 ? "+\(Int(seconds))s" : "\(Int(seconds))s") }
 
     func setRate(_ newRate: Double) {
-        rate = newRate
-        UserDefaults.standard.set(newRate, forKey: "defaultRate")
-        if isPlaying {
-            if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) }
-        }
+        rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate")
+        if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }
         flash(String(format: "%.2gx", newRate))
     }
 
@@ -758,28 +818,19 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         flash("Volume \(Int(volumeLevel * 100))%")
     }
 
-    func toggleControls() {
-        showControls.toggle()
-        if showControls { scheduleAutoHide() }
-    }
+    func toggleControls() { showControls.toggle(); if showControls { scheduleAutoHide() } }
 
     func scheduleAutoHide() {
         hideTask?.cancel()
         guard isPlaying else { return }
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, self.isPlaying, !self.isScrubbing else { return }
-            withAnimation(.easeOut(duration: 0.25)) { self.showControls = false }
-        }
-        hideTask = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work)
+        let work = DispatchWorkItem { [weak self] in guard let self, self.isPlaying, !self.isScrubbing else { return }; withAnimation(.easeOut(duration: 0.25)) { self.showControls = false } }
+        hideTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work)
     }
 
     func flash(_ text: String) {
-        flashText = text
-        flashTask?.cancel()
+        flashText = text; flashTask?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.flashText = nil }
-        flashTask = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
+        flashTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work)
     }
     
     private func loadSidecarSubtitles(for mediaURL: URL) {
@@ -789,69 +840,39 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func loadSubtitleFile(_ url: URL, copySidecar: Bool = true) {
-        let secured = url.startAccessingSecurityScopedResource()
-        defer { if secured { url.stopAccessingSecurityScopedResource() } }
+        let secured = url.startAccessingSecurityScopedResource(); defer { if secured { url.stopAccessingSecurityScopedResource() } }
         guard let data = try? Data(contentsOf: url) else { return }
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
         let parsed = SRTParser.parse(text)
         guard !parsed.isEmpty else { flash("Couldn't read subtitles"); return }
-        cues = parsed
-        hasExternalCues = true
-        subtitlesOn = true
-        flash("Subtitles loaded")
-        if copySidecar {
-            let dest = store.url(for: media).deletingPathExtension().appendingPathExtension("srt")
-            try? data.write(to: dest, options: .atomic)
-        }
+        cues = parsed; hasExternalCues = true; subtitlesOn = true; flash("Subtitles loaded")
+        if copySidecar { let dest = store.url(for: media).deletingPathExtension().appendingPathExtension("srt"); try? data.write(to: dest, options: .atomic) }
     }
 
     private func loadSelectionGroups(for item: AVPlayerItem) {
         let asset = item.asset
         Task { [weak self] in
-            let characteristics = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []
-            var audio: AVMediaSelectionGroup?
-            var legible: AVMediaSelectionGroup?
-            if characteristics.contains(.audible) { audio = try? await asset.loadMediaSelectionGroup(for: .audible) }
-            if characteristics.contains(.legible) { legible = try? await asset.loadMediaSelectionGroup(for: .legible) }
+            let chars = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []
+            let audio = chars.contains(.audible) ? try? await asset.loadMediaSelectionGroup(for: .audible) : nil
+            let legible = chars.contains(.legible) ? try? await asset.loadMediaSelectionGroup(for: .legible) : nil
             guard let self else { return }
-            self.audioGroup = audio
-            self.legibleGroup = legible
-            self.audioOptions = audio?.options ?? []
-            self.legibleOptions = legible?.options ?? []
+            self.audioGroup = audio; self.legibleGroup = legible
+            self.audioOptions = audio?.options ?? []; self.legibleOptions = legible?.options ?? []
         }
     }
 
-    func selectAudio(_ option: AVMediaSelectionOption) {
-        guard let group = audioGroup else { return }
-        player.currentItem?.select(option, in: group)
-        flash(option.displayName)
-    }
-
-    func selectLegible(_ option: AVMediaSelectionOption?) {
-        guard let group = legibleGroup else { return }
-        player.currentItem?.select(option, in: group)
-        if let option { flash(option.displayName) }
-    }
+    func selectAudio(_ option: AVMediaSelectionOption) { guard let group = audioGroup else { return }; player.currentItem?.select(option, in: group); flash(option.displayName) }
+    func selectLegible(_ option: AVMediaSelectionOption?) { guard let group = legibleGroup else { return }; player.currentItem?.select(option, in: group); if let option { flash(option.displayName) } }
 
     func togglePiP() {
         guard media.isEngineSupported else { flash("PiP unavailable for this format"); return }
-        if pip == nil, AVPictureInPictureController.isPictureInPictureSupported(), let layer = layerHolder.playerLayer {
-            pip = AVPictureInPictureController(playerLayer: layer)
-        }
+        if pip == nil, AVPictureInPictureController.isPictureInPictureSupported(), let layer = layerHolder.playerLayer { pip = AVPictureInPictureController(playerLayer: layer) }
         guard let pip else { flash("PiP unavailable"); return }
         if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() }
     }
 
-    private func periodicSave() {
-        guard Date().timeIntervalSince(lastSave) > 4 else { return }
-        saveNow()
-    }
-
-    private func saveNow() {
-        guard current > 0 || duration > 0 else { return }
-        lastSave = Date()
-        store.updateProgress(id: media.id, position: current, duration: duration)
-    }
+    private func periodicSave() { guard Date().timeIntervalSince(lastSave) > 4 else { return }; saveNow() }
+    private func saveNow() { guard current > 0 || duration > 0 else { return }; lastSave = Date(); store.updateProgress(id: media.id, position: current, duration: duration) }
 }
 
 struct PlayerScreen: View {
@@ -864,9 +885,7 @@ struct PlayerScreen: View {
     @State private var seekTarget: Double = 0
     private enum DragMode { case none, seek, volume, brightness }
 
-    init(item: MediaItem, store: LibraryStore) {
-        _vm = StateObject(wrappedValue: PlayerVM(media: item, store: store))
-    }
+    init(item: MediaItem, store: LibraryStore) { _vm = StateObject(wrappedValue: PlayerVM(media: item, store: store)) }
 
     private var subtitleTypes: [UTType] {
         var types: [UTType] = [.plainText, .text]
@@ -878,38 +897,22 @@ struct PlayerScreen: View {
         GeometryReader { geo in
             ZStack {
                 Color.black.ignoresSafeArea()
-
-                if vm.media.isEngineSupported {
-                    PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect)
-                        .ignoresSafeArea()
-                } else {
-                    VLCPlayerLayerView(player: vm.vlcPlayer)
-                        .ignoresSafeArea()
-                }
-
+                if vm.media.isEngineSupported { PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect).ignoresSafeArea() } 
+                else { VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() }
                 subtitleOverlay
                 if let flash = vm.flashText { OSDBadge(text: flash) }
                 if vm.showControls { controls.transition(.opacity) }
             }
             .contentShape(Rectangle())
-            .onTapGesture(count: 2, coordinateSpace: .local) { point in
-                if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) }
-            }
-            .onTapGesture {
-                withAnimation(.easeInOut(duration: 0.2)) { vm.toggleControls() }
-            }
+            .onTapGesture(count: 2, coordinateSpace: .local) { point in if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) } }
+            .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { vm.toggleControls() } }
             .gesture(panGesture(geo: geo))
         }
-        .statusBarHidden(true)
-        .persistentSystemOverlays(.hidden)
+        .statusBarHidden(true).persistentSystemOverlays(.hidden)
         .onAppear { vm.start(); UIApplication.shared.isIdleTimerDisabled = true }
         .onDisappear { vm.stop(); UIApplication.shared.isIdleTimerDisabled = false }
-        .alert("Playback Error", isPresented: Binding(get: { vm.errorMessage != nil }, set: { if !$0 { vm.errorMessage = nil } })) {
-            Button("OK") { dismiss() }
-        } message: { Text(vm.errorMessage ?? "") }
-        .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in
-            if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) }
-        }
+        .alert("Playback Error", isPresented: Binding(get: { vm.errorMessage != nil }, set: { if !$0 { vm.errorMessage = nil } })) { Button("OK") { dismiss() } } message: { Text(vm.errorMessage ?? "") }
+        .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) } }
         .preferredColorScheme(.dark)
     }
 
@@ -917,18 +920,13 @@ struct PlayerScreen: View {
         VStack {
             Spacer()
             if vm.subtitlesOn, let cue = vm.cueText {
-                Text(cue).font(.system(size: 22, weight: .semibold)).multilineTextAlignment(.center)
-                    .foregroundStyle(.white).padding(.horizontal, 14).padding(.vertical, 8)
-                    .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 24)
+                Text(cue).font(.system(size: 22, weight: .semibold)).multilineTextAlignment(.center).foregroundStyle(.white).padding(.horizontal, 14).padding(.vertical, 8).background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 24)
             }
-        }
-        .padding(.bottom, vm.showControls ? 140 : 44).animation(.easeInOut(duration: 0.2), value: vm.showControls).allowsHitTesting(false)
+        }.padding(.bottom, vm.showControls ? 140 : 44).animation(.easeInOut(duration: 0.2), value: vm.showControls).allowsHitTesting(false)
     }
 
     private var controls: some View {
-        VStack(spacing: 0) {
-            topBar; Spacer(); centerButtons; Spacer(); bottomBar
-        }
+        VStack(spacing: 0) { topBar; Spacer(); centerButtons; Spacer(); bottomBar }
         .background(
             VStack(spacing: 0) {
                 LinearGradient(colors: [.black.opacity(0.65), .clear], startPoint: .top, endPoint: .bottom).frame(height: 130); Spacer()
@@ -945,15 +943,12 @@ struct PlayerScreen: View {
             RoutePickerView().frame(width: 40, height: 40)
             Button { vm.togglePiP() } label: { Image(systemName: "pip.enter").font(.title3).frame(width: 40, height: 40) }
             trackMenu
-        }
-        .foregroundStyle(.white).padding(.horizontal, 16).padding(.top, 6)
+        }.foregroundStyle(.white).padding(.horizontal, 16).padding(.top, 6)
     }
 
     private var trackMenu: some View {
         Menu {
-            if !vm.audioOptions.isEmpty {
-                Section("Audio") { ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } }
-            }
+            if !vm.audioOptions.isEmpty { Section("Audio") { ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } } }
             Section("Subtitles") {
                 Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
                 ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
@@ -976,16 +971,12 @@ struct PlayerScreen: View {
             HStack(spacing: 12) {
                 Text(formatTime(vm.isScrubbing ? scrubValue : vm.current)).monospacedDigit()
                 Slider(value: Binding(get: { vm.isScrubbing ? scrubValue : vm.current }, set: { scrubValue = $0 }), in: 0...max(vm.duration, 1),
-                       onEditingChanged: { editing in
-                           if editing { scrubValue = vm.current; vm.isScrubbing = true } else { vm.isScrubbing = false; vm.seek(to: scrubValue) }
-                       }).tint(.purple)
+                       onEditingChanged: { e in if e { scrubValue = vm.current; vm.isScrubbing = true } else { vm.isScrubbing = false; vm.seek(to: scrubValue) } }).tint(.purple)
                 Text(formatTime(vm.duration)).monospacedDigit()
             }.font(.footnote).foregroundStyle(.white)
 
             HStack(spacing: 26) {
-                Menu {
-                    ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Button(String(format: "%.2gx", r)) { vm.setRate(r) } }
-                } label: { Label(String(format: "%.2gx", vm.rate), systemImage: "speedometer") }
+                Menu { ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Button(String(format: "%.2gx", r)) { vm.setRate(r) } } } label: { Label(String(format: "%.2gx", vm.rate), systemImage: "speedometer") }
                 Button { vm.fillScreen.toggle() } label: { Image(systemName: vm.fillScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }
                 Spacer()
             }.font(.subheadline).foregroundStyle(.white)
@@ -996,11 +987,9 @@ struct PlayerScreen: View {
         DragGesture(minimumDistance: 15)
             .onChanged { value in
                 if dragMode == .none {
-                    if abs(value.translation.width) > abs(value.translation.height) {
-                        dragMode = .seek; dragStartValue = vm.current; seekTarget = vm.current
-                    } else if value.startLocation.x < geo.size.width / 2 {
-                        dragMode = .brightness; dragStartValue = Double(UIScreen.main.brightness)
-                    } else { dragMode = .volume; dragStartValue = vm.volumeLevel }
+                    if abs(value.translation.width) > abs(value.translation.height) { dragMode = .seek; dragStartValue = vm.current; seekTarget = vm.current } 
+                    else if value.startLocation.x < geo.size.width / 2 { dragMode = .brightness; dragStartValue = Double(UIScreen.main.brightness) } 
+                    else { dragMode = .volume; dragStartValue = vm.volumeLevel }
                 }
                 switch dragMode {
                 case .seek:
@@ -1011,8 +1000,7 @@ struct PlayerScreen: View {
                 case .volume: vm.setVolume(dragStartValue - Double(value.translation.height / 300))
                 case .brightness:
                     let level = min(max(dragStartValue - Double(value.translation.height / 300), 0), 1)
-                    UIScreen.main.brightness = CGFloat(level)
-                    vm.flash("Brightness \(Int(level * 100))%")
+                    UIScreen.main.brightness = CGFloat(level); vm.flash("Brightness \(Int(level * 100))%")
                 case .none: break
                 }
             }
@@ -1022,20 +1010,14 @@ struct PlayerScreen: View {
 
 struct OSDBadge: View {
     let text: String
-    var body: some View {
-        Text(text).font(.headline.monospacedDigit()).padding(.horizontal, 16).padding(.vertical, 10)
-            .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white)
-    }
+    var body: some View { Text(text).font(.headline.monospacedDigit()).padding(.horizontal, 16).padding(.vertical, 10).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white) }
 }
 
 // ============================================================
 // LibraryView.swift
 // ============================================================
 
-enum LibrarySort: String, CaseIterable, Identifiable {
-    case recent = "Recently Added", title = "Title", lastPlayed = "Last Played"
-    var id: String { rawValue }
-}
+enum LibrarySort: String, CaseIterable, Identifiable { case recent = "Recently Added", title = "Title", lastPlayed = "Last Played"; var id: String { rawValue } }
 
 struct LibraryView: View {
     @EnvironmentObject private var store: LibraryStore
@@ -1044,15 +1026,16 @@ struct LibraryView: View {
     @State private var showSettings = false
     @State private var searchText = ""
     @State private var sort: LibrarySort = .recent
+    
     @State private var playing: MediaItem?
+    @State private var detailedItem: MediaItem? // Sheet state
+    
     @State private var renaming: MediaItem?
     @State private var renameText = ""
 
     private static let importTypes: [UTType] = {
         var types: [UTType] = [.movie, .video, .audiovisualContent, .audio, .mpeg4Movie, .quickTimeMovie, .avi, .mpeg, .mpeg2Video]
-        for ext in ["mkv", "webm", "ts", "m2ts", "flv", "wmv", "srt", "vtt", "flac", "ogg", "opus"] {
-            if let t = UTType(filenameExtension: ext) { types.append(t) }
-        }
+        for ext in ["mkv", "webm", "ts", "m2ts", "flv", "wmv", "srt", "vtt", "flac", "ogg", "opus"] { if let t = UTType(filenameExtension: ext) { types.append(t) } }
         return types
     }()
 
@@ -1064,21 +1047,16 @@ struct LibraryView: View {
             .searchable(text: $searchText, prompt: "Search your library")
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    sortMenu
-                    Button { showImporter = true } label: { Image(systemName: "plus") }
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    sortMenu; Button { showImporter = true } label: { Image(systemName: "plus") }; Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
             }
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { result in
-            if case .success(let urls) = result { Task { await store.importFiles(urls) } }
-        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { r in if case .success(let urls) = r { Task { await store.importFiles(urls) } } }
         .fullScreenCover(item: $playing) { item in PlayerScreen(item: item, store: store) }
+        .sheet(item: $detailedItem) { item in MediaDetailView(item: item, playingItem: $playing) }
         .sheet(isPresented: $showSettings) { SettingsView().environmentObject(store) }
         .alert("Rename", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
-            TextField("Title", text: $renameText)
-            Button("Save") { if let item = renaming { store.rename(item, to: renameText) }; renaming = nil }
-            Button("Cancel", role: .cancel) { renaming = nil }
+            TextField("Title", text: $renameText); Button("Save") { if let item = renaming { store.rename(item, to: renameText) }; renaming = nil }; Button("Cancel", role: .cancel) { renaming = nil }
         }
         .task { await store.rescan() }
         .onChange(of: scenePhase) { phase in if phase == .active { Task { await store.rescan() } } }
@@ -1100,7 +1078,7 @@ struct LibraryView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 14) {
                 ForEach(continueItems) { item in
-                    Button { playing = item } label: { ContinueCard(item: item, thumbURL: store.thumbURL(for: item)) }
+                    Button { detailedItem = item } label: { ContinueCard(item: item, thumbURL: store.thumbURL(for: item)) }
                     .buttonStyle(.plain).contextMenu { contextButtons(for: item) }
                 }
             }
@@ -1110,7 +1088,7 @@ struct LibraryView: View {
     private var grid: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 168), spacing: 16)], alignment: .leading, spacing: 22) {
             ForEach(filteredItems) { item in
-                Button { playing = item } label: { MediaCard(item: item, thumbURL: store.thumbURL(for: item)) }
+                Button { detailedItem = item } label: { MediaCard(item: item, thumbURL: store.thumbURL(for: item)) }
                 .buttonStyle(.plain).contextMenu { contextButtons(for: item) }
             }
         }
@@ -1126,17 +1104,13 @@ struct LibraryView: View {
         Button(role: .destructive) { store.delete(item) } label: { Label("Delete", systemImage: "trash") }
     }
 
-    private var sortMenu: some View {
-        Menu { Picker("Sort", selection: $sort) { ForEach(LibrarySort.allCases) { s in Text(s.rawValue).tag(s) } } }
-        label: { Image(systemName: "arrow.up.arrow.down") }
-    }
+    private var sortMenu: some View { Menu { Picker("Sort", selection: $sort) { ForEach(LibrarySort.allCases) { s in Text(s.rawValue).tag(s) } } } label: { Image(systemName: "arrow.up.arrow.down") } }
 
     private var emptyState: some View {
         VStack(spacing: 18) {
             Image(systemName: "film.stack").font(.system(size: 64)).foregroundStyle(.purple)
             Text("Your library is empty").font(.title2.weight(.semibold))
-            Text("Import videos with the + button, share files to Mina Anii from any app, or drop them into On My iPad › Mina Anii using the Files app.")
-                .font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
+            Text("Import videos with the + button, share files to Mina Anii from any app, or drop them into On My iPad › Mina Anii using the Files app.").font(.subheadline).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
             Button { showImporter = true } label: { Label("Import Media", systemImage: "plus").padding(.horizontal, 8) }.buttonStyle(.borderedProminent)
         }.padding().frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -1163,49 +1137,27 @@ struct MediaCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             ZStack(alignment: .bottomLeading) {
-                Color.clear.aspectRatio(16.0 / 9.0, contentMode: .fit)
-                    .overlay(ThumbImage(url: thumbURL, isAudio: item.isAudio, metadata: item.metadata))
-                    .clipped()
-
+                Color.clear.aspectRatio(16.0 / 9.0, contentMode: .fit).overlay(ThumbImage(url: thumbURL, isAudio: item.isAudio, metadata: item.metadata)).clipped()
                 if item.progress > 0.01 && !item.isWatched {
                     GeometryReader { geo in Rectangle().fill(Color.purple).frame(width: geo.size.width * item.progress, height: 4).frame(maxHeight: .infinity, alignment: .bottom) }
                 }
             }
             .overlay(alignment: .topTrailing) {
-                if item.duration > 0 {
-                    Text(formatTime(item.duration)).font(.caption2.weight(.semibold)).foregroundStyle(.white)
-                        .padding(.horizontal, 6).padding(.vertical, 3).background(.black.opacity(0.65), in: Capsule()).padding(6)
-                }
+                if item.duration > 0 { Text(formatTime(item.duration)).font(.caption2.weight(.semibold)).foregroundStyle(.white).padding(.horizontal, 6).padding(.vertical, 3).background(.black.opacity(0.65), in: Capsule()).padding(6) }
             }
             .overlay(alignment: .topLeading) {
-                if !item.isEngineSupported {
-                    Text(item.fileExtension.uppercased()).font(.caption2.weight(.bold)).foregroundStyle(.black)
-                        .padding(.horizontal, 6).padding(.vertical, 3).background(.orange.opacity(0.9), in: Capsule()).padding(6)
-                }
+                if !item.isEngineSupported { Text(item.fileExtension.uppercased()).font(.caption2.weight(.bold)).foregroundStyle(.black).padding(.horizontal, 6).padding(.vertical, 3).background(.orange.opacity(0.9), in: Capsule()).padding(6) }
             }
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
-            Text(item.metadata?.title ?? item.title)
-                .font(.subheadline.weight(.medium))
-                .lineLimit(1)
-                .foregroundStyle(.white)
+            Text(item.metadata?.title ?? item.title).font(.subheadline.weight(.medium)).lineLimit(1).foregroundStyle(.white)
 
             if let isTV = item.metadata?.isTVShow, isTV, let s = item.metadata?.season, let e = item.metadata?.episode {
-                Text("Season \(s) • Episode \(e)")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(.purple)
+                Text("Season \(s) • Episode \(e)").font(.caption2.weight(.bold)).foregroundStyle(.purple)
             }
 
-            if let overview = item.metadata?.overview, !overview.isEmpty {
-                Text(overview)
-                    .font(.caption2)
-                    .lineLimit(2)
-                    .foregroundStyle(.secondary)
-            } else {
-                Text(caption)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            if let overview = item.metadata?.overview, !overview.isEmpty { Text(overview).font(.caption2).lineLimit(2).foregroundStyle(.secondary) } 
+            else { Text(caption).font(.caption).foregroundStyle(.secondary) }
         }
     }
 
@@ -1223,23 +1175,14 @@ struct ContinueCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             ZStack(alignment: .bottomLeading) {
-                Color.clear.frame(width: 256, height: 144)
-                    .overlay(ThumbImage(url: thumbURL, isAudio: item.isAudio, metadata: item.metadata))
-                    .clipped()
+                Color.clear.frame(width: 256, height: 144).overlay(ThumbImage(url: thumbURL, isAudio: item.isAudio, metadata: item.metadata)).clipped()
                     .overlay(Image(systemName: "play.circle.fill").font(.system(size: 42)).foregroundStyle(.white.opacity(0.92)))
                 Rectangle().fill(Color.white.opacity(0.25)).frame(height: 4)
                 Rectangle().fill(Color.purple).frame(width: 256 * item.progress, height: 4)
-            }
-            .clipShape(RoundedRectangle(cornerRadius: 10))
+            }.clipShape(RoundedRectangle(cornerRadius: 10))
 
-            Text(item.metadata?.title ?? item.title)
-                .font(.subheadline.weight(.medium))
-                .lineLimit(1)
-                .foregroundStyle(.white)
-
-            Text("\(formatTime(max(item.duration - item.lastPosition, 0))) left")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text(item.metadata?.title ?? item.title).font(.subheadline.weight(.medium)).lineLimit(1).foregroundStyle(.white)
+            Text("\(formatTime(max(item.duration - item.lastPosition, 0))) left").font(.caption).foregroundStyle(.secondary)
         }.frame(width: 256)
     }
 }
@@ -1257,11 +1200,7 @@ struct ThumbImage: View {
                 
                 if let posterURL = metadata?.posterURL {
                     AsyncImage(url: posterURL) { phase in
-                        if let img = phase.image {
-                            img.resizable().scaledToFill()
-                        } else {
-                            ProgressView()
-                        }
+                        if let img = phase.image { img.resizable().scaledToFill() } else { ProgressView() }
                     }
                 } else if let image {
                     Image(uiImage: image).resizable().scaledToFill()
@@ -1272,16 +1211,106 @@ struct ThumbImage: View {
             .frame(width: geo.size.width, height: geo.size.height)
             .clipped()
         }
-        .task(id: url) {
-            if metadata?.posterURL == nil {
-                image = await Self.load(url)
-            }
-        }
+        .task(id: url) { if metadata?.posterURL == nil { image = await Self.load(url) } }
     }
 
     static func load(_ url: URL) async -> UIImage? {
-        let path = url.path
-        return await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
+        let path = url.path; return await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
+    }
+}
+
+// ============================================================
+// MediaDetailView.swift
+// ============================================================
+
+struct MediaDetailView: View {
+    let item: MediaItem
+    @Environment(\.dismiss) private var dismiss
+    @Binding var playingItem: MediaItem?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                
+                ZStack(alignment: .bottomLeading) {
+                    if let backdrop = item.metadata?.backdropURL {
+                        AsyncImage(url: backdrop) { phase in
+                            if let img = phase.image { img.resizable().scaledToFill() }
+                            else { Color(white: 0.12) }
+                        }
+                        .frame(height: 380).clipped().overlay(LinearGradient(colors: [.clear, Color(white: 0.06)], startPoint: .center, endPoint: .bottom))
+                    } else {
+                        Color(white: 0.12).frame(height: 380).overlay(LinearGradient(colors: [.clear, Color(white: 0.06)], startPoint: .center, endPoint: .bottom))
+                    }
+                    
+                    HStack(alignment: .bottom, spacing: 20) {
+                        if let poster = item.metadata?.posterURL {
+                            AsyncImage(url: poster) { phase in
+                                if let img = phase.image { img.resizable().scaledToFit() } else { Color(white: 0.2) }
+                            }
+                            .frame(width: 140, height: 210).clipShape(RoundedRectangle(cornerRadius: 12)).shadow(color: .black.opacity(0.5), radius: 10, y: 5)
+                        }
+                        
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(item.metadata?.title ?? item.title).font(.system(size: 34, weight: .bold)).foregroundStyle(.white)
+                            
+                            if let isTV = item.metadata?.isTVShow, isTV, let s = item.metadata?.season, let e = item.metadata?.episode {
+                                Text("Season \(s) • Episode \(e)").font(.headline).foregroundStyle(.purple)
+                            }
+                            
+                            HStack(spacing: 14) {
+                                if let year = item.metadata?.releaseYear, !year.isEmpty { Text(year) }
+                                if let rating = item.metadata?.rating, rating > 0 { Label(String(format: "%.1f", rating), systemImage: "star.fill").foregroundStyle(.yellow) }
+                                Text(formatTime(item.duration))
+                                Text(item.fileExtension.uppercased()).font(.caption.weight(.bold)).padding(.horizontal, 6).padding(.vertical, 2).background(Color.white.opacity(0.2), in: RoundedRectangle(cornerRadius: 4))
+                            }.font(.subheadline.weight(.medium)).foregroundStyle(.white.opacity(0.8))
+                            
+                            if let genres = item.metadata?.genres, !genres.isEmpty {
+                                Text(genres.joined(separator: " • ")).font(.caption).foregroundStyle(.white.opacity(0.6))
+                            }
+                        }.padding(.bottom, 10)
+                    }.padding(.horizontal, 24).offset(y: 40)
+                }
+                
+                VStack(alignment: .leading, spacing: 30) {
+                    HStack(spacing: 16) {
+                        Button {
+                            dismiss()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { playingItem = item }
+                        } label: {
+                            let isResuming = item.progress > 0.01 && !item.isWatched
+                            Label(isResuming ? "Resume" : "Play", systemImage: "play.fill")
+                                .font(.title3.weight(.bold)).frame(maxWidth: .infinity).padding(.vertical, 14)
+                                .background(Color.purple).foregroundStyle(.white).clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                    }.padding(.top, 60)
+                    
+                    if let overview = item.metadata?.overview, !overview.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Synopsis").font(.title3.weight(.bold)).foregroundStyle(.white)
+                            Text(overview).font(.body).lineSpacing(4).foregroundStyle(.white.opacity(0.8))
+                        }
+                    }
+                    
+                    if let cast = item.metadata?.cast, !cast.isEmpty {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Cast").font(.title3.weight(.bold)).foregroundStyle(.white)
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                HStack(spacing: 10) {
+                                    ForEach(cast, id: \.self) { actor in
+                                        Text(actor).font(.subheadline).foregroundStyle(.white).padding(.horizontal, 16).padding(.vertical, 10).background(Color.white.opacity(0.1)).clipShape(Capsule())
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }.padding(.horizontal, 24).padding(.bottom, 40)
+            }
+        }
+        .background(Color(white: 0.06).ignoresSafeArea())
+        .overlay(alignment: .topTrailing) {
+            Button { dismiss() } label: { Image(systemName: "xmark.circle.fill").font(.system(size: 32)).foregroundStyle(.white.opacity(0.6), .black.opacity(0.4)) }.padding()
+        }
     }
 }
 
@@ -1292,8 +1321,6 @@ struct ThumbImage: View {
 struct SettingsView: View {
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.dismiss) private var dismiss
-    
-    // NEW: Inject Trakt Service
     @StateObject private var trakt = TraktService.shared
     
     @AppStorage("autoResume") private var autoResume = true
@@ -1309,37 +1336,20 @@ struct SettingsView: View {
                     Picker("Default speed", selection: $defaultRate) { ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Text(String(format: "%.2gx", r)).tag(r) } }
                 }
                 
-                // NEW: Trakt Integration Section
                 Section("Trakt.tv") {
                     if trakt.isAuthenticated {
                         LabeledContent("Status", value: "Connected")
-                        Button("Disconnect Trakt", role: .destructive) {
-                            trakt.logout()
-                        }
+                        Button("Disconnect Trakt", role: .destructive) { trakt.logout() }
                     } else if trakt.isAuthenticating {
                         VStack(alignment: .center, spacing: 12) {
                             ProgressView()
-                            Text("Go to \(trakt.authVerificationURL ?? "trakt.tv/activate") on your phone")
-                                .font(.subheadline)
-                                .multilineTextAlignment(.center)
-                            if let code = trakt.authUserCode {
-                                Text(code)
-                                    .font(.largeTitle.monospaced().bold())
-                            }
-                            Text("Waiting for approval...")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        
-                        Button("Cancel") {
-                            trakt.logout()
-                        }
+                            Text("Go to \(trakt.authVerificationURL ?? "trakt.tv/activate") on your phone").font(.subheadline).multilineTextAlignment(.center)
+                            if let code = trakt.authUserCode { Text(code).font(.largeTitle.monospaced().bold()) }
+                            Text("Waiting for approval...").font(.caption).foregroundStyle(.secondary)
+                        }.frame(maxWidth: .infinity).padding(.vertical, 8)
+                        Button("Cancel") { trakt.logout() }
                     } else {
-                        Button("Connect to Trakt") {
-                            Task { await trakt.startDeviceAuthentication() }
-                        }
+                        Button("Connect to Trakt") { Task { await trakt.startDeviceAuthentication() } }
                     }
                 }
                 
@@ -1349,6 +1359,12 @@ struct SettingsView: View {
                     Button("Clear watch history") { store.clearProgress() }
                     Button("Delete all media", role: .destructive) { confirmWipe = true }
                 }
+                
+                Section("Adding media") {
+                    Text("Use the + button in the library, share any video to Mina Anii from another app, or drop files into On My iPad › Mina Anii with the Files app — they're picked up automatically.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                
                 Section("About") {
                     LabeledContent("App", value: "Mina Anii")
                     LabeledContent("Developer", value: "Polao")
