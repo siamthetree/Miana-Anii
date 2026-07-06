@@ -1,3 +1,22 @@
+//
+//  App.swift - Mina Anii (fixed)
+//
+//  IMPORTANT: This file now contains the ONLY copy of TraktService.
+//  Delete Sources/TraktService.swift from the project, otherwise the build
+//  fails with "Invalid redeclaration of 'TraktService'".
+//
+//  Changes in this version:
+//   1. (Build-breaker) TraktService/models exist here once; the duplicate file must be removed.
+//   2. Trakt tokens now stored in the Keychain instead of UserDefaults (plaintext).
+//   3. Refresh-token support added: the session refreshes instead of silently expiring (~3 months).
+//   4. Device-flow polling now honours the spec (authorization_pending / slow_down / denied / expired).
+//   5. Removed the duplicate "start" scrobble fired every time a video opened.
+//   6. TV-vs-movie detection rewritten around the SxxExx regex (handles S10+, no false positives).
+//
+//  Separately (not code): rotate the leaked TMDB key + Trakt client ID/secret, and keep
+//  Secrets.plist out of git (it is already in .gitignore; remove it from history / re-cache it).
+//
+
 import Foundation
 import SwiftUI
 import AVFoundation
@@ -6,6 +25,7 @@ import Combine
 import UIKit
 import UniformTypeIdentifiers
 import MobileVLCKit
+import Security
 
 // ============================================================
 // MinaAniiApp.swift
@@ -21,6 +41,7 @@ struct MinaAniiApp: App {
                 .environmentObject(store)
                 .preferredColorScheme(.dark)
                 .tint(.purple)
+                .task { await TraktService.shared.refreshIfNeeded() }
                 .onOpenURL { url in
                     Task {
                         await store.importFile(url)
@@ -35,6 +56,44 @@ struct MinaAniiApp: App {
 // Trakt Models & Service
 // ============================================================
 
+// Minimal Keychain wrapper so OAuth tokens are never stored in plaintext (UserDefaults).
+enum Keychain {
+    @discardableResult
+    static func set(_ value: String, for key: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key
+        ]
+        SecItemDelete(query as CFDictionary)
+        var attributes = query
+        attributes[kSecValueData as String] = Data(value.utf8)
+        attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        return SecItemAdd(attributes as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func get(_ key: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var result: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data,
+              let string = String(data: data, encoding: .utf8) else { return nil }
+        return string
+    }
+
+    static func delete(_ key: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
+
 struct TraktDeviceCodeResponse: Codable {
     let device_code: String
     let user_code: String
@@ -43,14 +102,25 @@ struct TraktDeviceCodeResponse: Codable {
     let interval: Int
 }
 
+// Trakt device-token responses also include refresh_token / expires_in / created_at,
+// which we keep so the session can be refreshed instead of silently expiring (~3 months).
 struct TraktTokenResponse: Codable {
     let access_token: String
+    let refresh_token: String?
+    let expires_in: Int?
+    let created_at: Int?
 }
 
 @MainActor
 final class TraktService: ObservableObject {
     static let shared = TraktService()
-    
+
+    private enum Key {
+        static let access = "trakt.accessToken"
+        static let refresh = "trakt.refreshToken"
+        static let expiry = "trakt.expiresAt"
+    }
+
     private var clientID: String {
         guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
               let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
@@ -64,16 +134,41 @@ final class TraktService: ObservableObject {
               let key = dict["TraktClientSecret"] as? String else { return "" }
         return key
     }
-    
-    @AppStorage("traktAccessToken") var accessToken: String = ""
-    
+
+    @Published private(set) var accessToken: String
+    private var refreshToken: String?
+    private var expiresAt: Date?
+
     @Published var isAuthenticating = false
     @Published var authUserCode: String?
     @Published var authVerificationURL: String?
-    
+
     var isAuthenticated: Bool { !accessToken.isEmpty }
     private var authTask: Task<Void, Never>?
-    
+
+    private init() {
+        accessToken = Keychain.get(Key.access) ?? ""
+        refreshToken = Keychain.get(Key.refresh)
+        if let raw = Keychain.get(Key.expiry), let ts = Double(raw) {
+            expiresAt = Date(timeIntervalSince1970: ts)
+        }
+    }
+
+    private func persistTokens(_ token: TraktTokenResponse) {
+        accessToken = token.access_token
+        Keychain.set(token.access_token, for: Key.access)
+        if let refresh = token.refresh_token {
+            refreshToken = refresh
+            Keychain.set(refresh, for: Key.refresh)
+        }
+        if let expiresIn = token.expires_in {
+            let base = token.created_at.map(Double.init) ?? Date().timeIntervalSince1970
+            let expiry = base + Double(expiresIn)
+            expiresAt = Date(timeIntervalSince1970: expiry)
+            Keychain.set(String(expiry), for: Key.expiry)
+        }
+    }
+
     func startDeviceAuthentication() async {
         guard !clientID.isEmpty else {
             print("Trakt Error: Missing Client ID in Secrets.plist")
@@ -104,9 +199,10 @@ final class TraktService: ObservableObject {
     private func pollForToken(deviceCode: String, interval: Int, expiresAt: Date) {
         authTask?.cancel()
         authTask = Task {
+            var delay = interval
             while Date() < expiresAt {
                 if Task.isCancelled { break }
-                try? await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
                 
                 guard let url = URL(string: "https://api.trakt.tv/oauth/device/token") else { continue }
                 var request = URLRequest(url: url)
@@ -116,23 +212,71 @@ final class TraktService: ObservableObject {
                 let body: [String: String] = ["code": deviceCode, "client_id": clientID, "client_secret": clientSecret]
                 request.httpBody = try? JSONEncoder().encode(body)
                 
-                if let (data, response) = try? await URLSession.shared.data(for: request),
-                   let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                guard let (data, response) = try? await URLSession.shared.data(for: request),
+                      let httpResponse = response as? HTTPURLResponse else { continue }
+
+                switch httpResponse.statusCode {
+                case 200:
                     if let tokenData = try? JSONDecoder().decode(TraktTokenResponse.self, from: data) {
-                        self.accessToken = tokenData.access_token
+                        self.persistTokens(tokenData)
                         self.isAuthenticating = false
                         self.authUserCode = nil
-                        break
+                        return
                     }
+                case 400:
+                    // authorization_pending: keep polling at the normal interval.
+                    continue
+                case 429:
+                    // slow_down: back off as required by the device-flow spec.
+                    delay += 1
+                    continue
+                default:
+                    // expired_token (410), access_denied (403), etc. Stop cleanly.
+                    self.isAuthenticating = false
+                    self.authUserCode = nil
+                    return
                 }
             }
             self.isAuthenticating = false
         }
     }
-    
+
+    // Proactively refresh the access token before it lapses so the user stays signed in.
+    func refreshIfNeeded() async {
+        guard !accessToken.isEmpty, let refreshToken, let expiresAt else { return }
+        guard Date() > expiresAt.addingTimeInterval(-7 * 24 * 3600) else { return }
+        guard let url = URL(string: "https://api.trakt.tv/oauth/token") else { return }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        let body: [String: String] = [
+            "refresh_token": refreshToken,
+            "client_id": clientID,
+            "client_secret": clientSecret,
+            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "grant_type": "refresh_token"
+        ]
+        request.httpBody = try? JSONEncoder().encode(body)
+
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse else { return }
+        if http.statusCode == 200, let token = try? JSONDecoder().decode(TraktTokenResponse.self, from: data) {
+            persistTokens(token)
+        } else if http.statusCode == 401 {
+            // Refresh token no longer valid; clear the stale session.
+            logout()
+        }
+    }
+
     func logout() {
         authTask?.cancel()
         accessToken = ""
+        refreshToken = nil
+        expiresAt = nil
+        Keychain.delete(Key.access)
+        Keychain.delete(Key.refresh)
+        Keychain.delete(Key.expiry)
         isAuthenticating = false
     }
     
@@ -225,21 +369,22 @@ final class MetadataService {
     static let imageBaseURL = "https://image.tmdb.org/t/p/w780"
     
     static func fetchMetadata(for filename: String, cleanTitle: String) async -> MediaMetadata? {
-        let isTV = filename.localizedStandardContains("S0") || filename.localizedStandardContains("E0") || filename.localizedStandardContains("Season")
-        let searchType = isTV ? "tv" : "movie"
-        
+        // Derive season/episode from a proper SxxExx pattern first (handles S10E01, etc.),
+        // then decide TV vs movie from that, which avoids false positives like a movie named "S0mething".
         var season: Int? = nil
         var episode: Int? = nil
-        if isTV {
-            let pattern = "[sS](\\d{1,2})[eE](\\d{1,2})"
-            if let regex = try? NSRegularExpression(pattern: pattern),
-               let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)) {
-                if let sRange = Range(match.range(at: 1), in: filename), let eRange = Range(match.range(at: 2), in: filename) {
-                    season = Int(filename[sRange])
-                    episode = Int(filename[eRange])
-                }
-            }
+        let episodePattern = "[sS](\\d{1,2})[eE](\\d{1,2})"
+        if let regex = try? NSRegularExpression(pattern: episodePattern),
+           let match = regex.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)),
+           let sRange = Range(match.range(at: 1), in: filename),
+           let eRange = Range(match.range(at: 2), in: filename) {
+            season = Int(filename[sRange])
+            episode = Int(filename[eRange])
         }
+
+        let hasSeasonKeyword = filename.range(of: "season\\s*\\d", options: [.regularExpression, .caseInsensitive]) != nil
+        let isTV = season != nil || hasSeasonKeyword
+        let searchType = isTV ? "tv" : "movie"
         
         var components = URLComponents(string: "\(baseURL)/search/\(searchType)")!
         components.queryItems = [
@@ -729,10 +874,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
 
         loadSidecarSubtitles(for: url)
-        play()
+        play()   // play() already emits the Trakt "start" scrobble; no duplicate call here.
         scheduleAutoHide()
-        
-        TraktService.shared.scrobble(item: media, progress: media.progress, action: .start)
     }
 
     func stop() {
@@ -1361,7 +1504,7 @@ struct SettingsView: View {
                 }
                 
                 Section("Adding media") {
-                    Text("Use the + button in the library, share any video to Mina Anii from another app, or drop files into On My iPad › Mina Anii with the Files app — they're picked up automatically.")
+                    Text("Use the + button in the library, share any video to Mina Anii from another app, or drop files into On My iPad › Mina Anii with the Files app, and they're picked up automatically.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
                 
