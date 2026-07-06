@@ -1,20 +1,36 @@
-//
-//  App.swift - Mina Anii (fixed)
-//
-//  IMPORTANT: This file now contains the ONLY copy of TraktService.
-//  Delete Sources/TraktService.swift from the project, otherwise the build
-//  fails with "Invalid redeclaration of 'TraktService'".
-//
-//  Changes in this version:
-//   1. (Build-breaker) TraktService/models exist here once; the duplicate file must be removed.
-//   2. Trakt tokens now stored in the Keychain instead of UserDefaults (plaintext).
-//   3. Refresh-token support added: the session refreshes instead of silently expiring (~3 months).
-//   4. Device-flow polling now honours the spec (authorization_pending / slow_down / denied / expired).
-//   5. Removed the duplicate "start" scrobble fired every time a video opened.
-//   6. TV-vs-movie detection rewritten around the SxxExx regex (handles S10+, no false positives).
-//
-//  Separately (not code): rotate the leaked TMDB key + Trakt client ID/secret, and keep
-//  Secrets.plist out of git (it is already in .gitignore; remove it from history / re-cache it).
+// ============================================================
+// MinaAniiApp.swift
+// ============================================================
+
+@main
+struct MinaAniiApp: App {
+    @StateObject private var store = LibraryStore()
+
+    var body: some Scene {
+        WindowGroup {
+            LibraryView()
+                .environmentObject(store)
+                .preferredColorScheme(.dark)
+                .tint(.purple)
+                .onOpenURL { url in
+                    // 1. Check if the link is a Trakt login redirect
+                    if url.scheme == "minaanii" {
+                        Task { 
+                            await TraktService.shared.handleAuthRedirect(url: url) 
+                        }
+                    } 
+                    // 2. Otherwise, treat it as a media file being imported
+                    else {
+                        Task {
+                            await store.importFile(url)
+                            store.save()
+                        }
+                    }
+                }
+        }
+    }
+}
+
 //
 
 import Foundation
@@ -94,15 +110,7 @@ enum Keychain {
     }
 }
 
-struct TraktDeviceCodeResponse: Codable {
-    let device_code: String
-    let user_code: String
-    let verification_url: String
-    let expires_in: Int
-    let interval: Int
-}
-
-// Trakt device-token responses also include refresh_token / expires_in / created_at,
+// Trakt token responses include refresh_token / expires_in / created_at,
 // which we keep so the session can be refreshed instead of silently expiring (~3 months).
 struct TraktTokenResponse: Codable {
     let access_token: String
@@ -120,6 +128,8 @@ final class TraktService: ObservableObject {
         static let refresh = "trakt.refreshToken"
         static let expiry = "trakt.expiresAt"
     }
+
+    private let redirectURI = "minaanii://oauth/trakt"
 
     private var clientID: String {
         guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
@@ -140,11 +150,15 @@ final class TraktService: ObservableObject {
     private var expiresAt: Date?
 
     @Published var isAuthenticating = false
-    @Published var authUserCode: String?
-    @Published var authVerificationURL: String?
 
     var isAuthenticated: Bool { !accessToken.isEmpty }
-    private var authTask: Task<Void, Never>?
+    
+    // Generates the URL that the user taps to open Safari and sign in
+    var authorizationURL: URL? {
+        guard !clientID.isEmpty else { return nil }
+        let urlString = "https://trakt.tv/oauth/authorize?response_type=code&client_id=\(clientID)&redirect_uri=\(redirectURI)"
+        return URL(string: urlString)
+    }
 
     private init() {
         accessToken = Keychain.get(Key.access) ?? ""
@@ -169,76 +183,45 @@ final class TraktService: ObservableObject {
         }
     }
 
-    func startDeviceAuthentication() async {
-        guard !clientID.isEmpty else {
-            print("Trakt Error: Missing Client ID in Secrets.plist")
+    // Handles the deep link when the user taps "Allow" and returns to the app
+    func handleAuthRedirect(url: URL) async {
+        guard url.scheme == "minaanii", url.host == "oauth", url.path == "/trakt" else { return }
+        
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let code = components.queryItems?.first(where: { $0.name == "code" })?.value else {
+            isAuthenticating = false
             return
         }
         
         isAuthenticating = true
-        guard let url = URL(string: "https://api.trakt.tv/oauth/device/code") else { return }
-        var request = URLRequest(url: url)
+        guard let tokenURL = URL(string: "https://api.trakt.tv/oauth/token") else { return }
+        var request = URLRequest(url: tokenURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
-        let body: [String: String] = ["client_id": clientID]
+        let body: [String: String] = [
+            "code": code,
+            "client_id": clientID,
+            "client_secret": clientSecret,
+            "redirect_uri": redirectURI,
+            "grant_type": "authorization_code"
+        ]
         request.httpBody = try? JSONEncoder().encode(body)
         
         do {
-            let (data, _) = try await URLSession.shared.data(for: request)
-            let response = try JSONDecoder().decode(TraktDeviceCodeResponse.self, from: data)
-            self.authUserCode = response.user_code
-            self.authVerificationURL = response.verification_url
-            pollForToken(deviceCode: response.device_code, interval: response.interval, expiresAt: Date().addingTimeInterval(TimeInterval(response.expires_in)))
-        } catch {
-            print("Trakt Device Code Error: \(error)")
-            isAuthenticating = false
-        }
-    }
-    
-    private func pollForToken(deviceCode: String, interval: Int, expiresAt: Date) {
-        authTask?.cancel()
-        authTask = Task {
-            var delay = interval
-            while Date() < expiresAt {
-                if Task.isCancelled { break }
-                try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
-                
-                guard let url = URL(string: "https://api.trakt.tv/oauth/device/token") else { continue }
-                var request = URLRequest(url: url)
-                request.httpMethod = "POST"
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                
-                let body: [String: String] = ["code": deviceCode, "client_id": clientID, "client_secret": clientSecret]
-                request.httpBody = try? JSONEncoder().encode(body)
-                
-                guard let (data, response) = try? await URLSession.shared.data(for: request),
-                      let httpResponse = response as? HTTPURLResponse else { continue }
-
-                switch httpResponse.statusCode {
-                case 200:
-                    if let tokenData = try? JSONDecoder().decode(TraktTokenResponse.self, from: data) {
-                        self.persistTokens(tokenData)
-                        self.isAuthenticating = false
-                        self.authUserCode = nil
-                        return
-                    }
-                case 400:
-                    // authorization_pending: keep polling at the normal interval.
-                    continue
-                case 429:
-                    // slow_down: back off as required by the device-flow spec.
-                    delay += 1
-                    continue
-                default:
-                    // expired_token (410), access_denied (403), etc. Stop cleanly.
-                    self.isAuthenticating = false
-                    self.authUserCode = nil
-                    return
+            let (data, response) = try await URLSession.shared.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 {
+                if let tokenData = try? JSONDecoder().decode(TraktTokenResponse.self, from: data) {
+                    persistTokens(tokenData)
                 }
+            } else {
+                print("Trakt Error: Failed to exchange token. Status code: \((response as? HTTPURLResponse)?.statusCode ?? 0)")
             }
-            self.isAuthenticating = false
+        } catch {
+            print("Trakt Token Exchange Error: \(error)")
         }
+        
+        isAuthenticating = false
     }
 
     // Proactively refresh the access token before it lapses so the user stays signed in.
@@ -254,7 +237,7 @@ final class TraktService: ObservableObject {
             "refresh_token": refreshToken,
             "client_id": clientID,
             "client_secret": clientSecret,
-            "redirect_uri": "urn:ietf:wg:oauth:2.0:oob",
+            "redirect_uri": redirectURI, // Updated to match the OAuth flow URI
             "grant_type": "refresh_token"
         ]
         request.httpBody = try? JSONEncoder().encode(body)
@@ -270,7 +253,6 @@ final class TraktService: ObservableObject {
     }
 
     func logout() {
-        authTask?.cancel()
         accessToken = ""
         refreshToken = nil
         expiresAt = nil
@@ -1481,21 +1463,16 @@ struct SettingsView: View {
                 }
                 
                 Section("Trakt.tv") {
-                    if trakt.isAuthenticated {
-                        LabeledContent("Status", value: "Connected")
-                        Button("Disconnect Trakt", role: .destructive) { trakt.logout() }
-                    } else if trakt.isAuthenticating {
-                        VStack(alignment: .center, spacing: 12) {
-                            ProgressView()
-                            Text("Go to \(trakt.authVerificationURL ?? "trakt.tv/activate") on your phone").font(.subheadline).multilineTextAlignment(.center)
-                            if let code = trakt.authUserCode { Text(code).font(.largeTitle.monospaced().bold()) }
-                            Text("Waiting for approval...").font(.caption).foregroundStyle(.secondary)
-                        }.frame(maxWidth: .infinity).padding(.vertical, 8)
-                        Button("Cancel") { trakt.logout() }
-                    } else {
-                        Button("Connect to Trakt") { Task { await trakt.startDeviceAuthentication() } }
-                    }
-                }
+    if trakt.isAuthenticated {
+        LabeledContent("Status", value: "Connected")
+        Button("Disconnect Trakt", role: .destructive) { trakt.logout() }
+    } else {
+        if let authURL = trakt.authorizationURL {
+            Link("Connect to Trakt", destination: authURL)
+        }
+    }
+}
+
                 
                 Section("Library") {
                     LabeledContent("Storage used", value: storageText)
