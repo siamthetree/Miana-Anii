@@ -7,8 +7,8 @@ options:
 
 packages:
   MobileVLCKit:
-    url: https://code.videolan.org/videolan/VLCKit.git
-    from: 3.3.17
+    url: https://github.com/showbie/MobileVLCKit-SPM.git
+    from: 3.7.3
 
 targets:
   MinaAnii:
