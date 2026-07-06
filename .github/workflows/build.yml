@@ -19,10 +19,9 @@ jobs:
           find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/stefansp/MobileVLCKit-SPM.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
           echo "Patch complete."
 
-         - name: Generate app icon and asset catalog
+      - name: Generate app icon and asset catalog
         run: |
           mkdir -p Assets.xcassets/AppIcon.appiconset
-          # Create a more complete AppIcon configuration
           cat > Assets.xcassets/AppIcon.appiconset/Contents.json << 'JSON'
           {
             "images" : [
@@ -40,10 +39,7 @@ jobs:
             }
           }
           JSON
-          # Generate a simple 1024x1024 white icon so actool doesn't fail
-          python3 -c "from PIL import Image; img = Image.new('RGB', (1024, 1024), color = 'white'); img.save('Assets.xcassets/AppIcon.appiconset/AppIcon.png')" \
-          || python3 -c "import zlib, struct; W=H=1024; open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + struct.pack('>I', 13) + b'IHDR' + struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0) + struct.pack('>I', 0) + b'IDAT' + zlib.compress(b'\x00' * (W * H * 3 + H)) + struct.pack('>I', 0) + b'IEND' + struct.pack('>I', 0))"
-
+          python3 -c "import zlib, struct; W=H=1024; open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + struct.pack('>I', 13) + b'IHDR' + struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0) + struct.pack('>I', 0) + b'IDAT' + zlib.compress(b'\x00' * (W * H * 3 + H)) + struct.pack('>I', 0) + b'IEND' + struct.pack('>I', 0))"
 
       - name: Install XcodeGen
         env:
@@ -78,7 +74,6 @@ jobs:
             -e 's/objectVersion = [0-9][0-9]*;/objectVersion = 56;/' \
             -e 's/preferredProjectObjectVersion = [0-9][0-9]*;/preferredProjectObjectVersion = 56;/' \
             MinaAnii.xcodeproj/project.pbxproj
-          grep -m1 'objectVersion' MinaAnii.xcodeproj/project.pbxproj
 
       - name: Build (unsigned, Release)
         run: |
@@ -91,26 +86,14 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build \
-          || xcodebuild \
-            -project MinaAnii.xcodeproj \
-            -target MinaAnii \
-            -configuration Release \
-            -sdk iphoneos \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
             build
 
       - name: Package IPA
         run: |
           APP_PATH=$(find build -type d -name "MinaAnii.app" | head -n 1)
-          echo "Found app at: $APP_PATH"
-          test -n "$APP_PATH"
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           zip -qry MinaAnii.ipa Payload
-          ls -la MinaAnii.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
