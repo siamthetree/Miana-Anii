@@ -69,7 +69,6 @@ jobs:
           open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(png)
           print('icon written:', len(png), 'bytes')
           PYEOF
-
       - name: Install XcodeGen
         run: brew install xcodegen
         
