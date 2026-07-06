@@ -19,65 +19,31 @@ jobs:
           find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/stefansp/MobileVLCKit-SPM.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
           echo "Patch complete."
 
-      - name: Generate app icon and asset catalog
+         - name: Generate app icon and asset catalog
         run: |
           mkdir -p Assets.xcassets/AppIcon.appiconset
-          cat > Assets.xcassets/Contents.json << 'JSON1'
-          {
-            "info" : {
-              "author" : "xcode",
-              "version" : 1
-            }
-          }
-          JSON1
-          cat > Assets.xcassets/AppIcon.appiconset/Contents.json << 'JSON2'
+          # Create a more complete AppIcon configuration
+          cat > Assets.xcassets/AppIcon.appiconset/Contents.json << 'JSON'
           {
             "images" : [
               {
-                "filename" : "AppIcon.png",
                 "idiom" : "universal",
                 "platform" : "ios",
-                "size" : "1024x1024"
+                "size" : "1024x1024",
+                "filename" : "AppIcon.png",
+                "scale" : "1x"
               }
             ],
             "info" : {
-              "author" : "xcode",
-              "version" : 1
+              "version" : 1,
+              "author" : "xcode"
             }
           }
-          JSON2
-          python3 << 'PYEOF'
-          import zlib, struct
-          W = H = 1024
-          ax, ay = 402, 330
-          bx, by = 402, 694
-          cx, cy = 718, 512
-          top = (124, 58, 237)
-          bottom = (46, 16, 101)
-          rows = bytearray()
-          for y in range(H):
-              t = y / (H - 1)
-              rr = int(top[0] + (bottom[0] - top[0]) * t)
-              gg = int(top[1] + (bottom[1] - top[1]) * t)
-              bb = int(top[2] + (bottom[2] - top[2]) * t)
-              rows.append(0)
-              for x in range(W):
-                  d1 = (x - ax) * (by - ay) - (y - ay) * (bx - ax)
-                  d2 = (x - bx) * (cy - by) - (y - by) * (cx - bx)
-                  d3 = (x - cx) * (ay - cy) - (y - cy) * (ax - cx)
-                  has_neg = d1 < 0 or d2 < 0 or d3 < 0
-                  has_pos = d1 > 0 or d2 > 0 or d3 > 0
-                  if not (has_neg and has_pos):
-                      rows += b'\xff\xff\xff'
-                  else:
-                      rows += bytes((rr, gg, bb))
-          def chunk(tag, data):
-              return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
-          ihdr = struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0)
-          png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(bytes(rows), 9)) + chunk(b'IEND', b'')
-          open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(png)
-          print('icon written:', len(png), 'bytes')
-          PYEOF
+          JSON
+          # Generate a simple 1024x1024 white icon so actool doesn't fail
+          python3 -c "from PIL import Image; img = Image.new('RGB', (1024, 1024), color = 'white'); img.save('Assets.xcassets/AppIcon.appiconset/AppIcon.png')" \
+          || python3 -c "import zlib, struct; W=H=1024; open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + struct.pack('>I', 13) + b'IHDR' + struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0) + struct.pack('>I', 0) + b'IDAT' + zlib.compress(b'\x00' * (W * H * 3 + H)) + struct.pack('>I', 0) + b'IEND' + struct.pack('>I', 0))"
+
 
       - name: Install XcodeGen
         env:
