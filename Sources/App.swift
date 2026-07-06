@@ -5,11 +5,11 @@ import AVKit
 import Combine
 import UIKit
 import UniformTypeIdentifiers
+import MobileVLCKit
 
 // ============================================================
 // MinaAniiApp.swift
 // ============================================================
-
 
 @main
 struct MinaAniiApp: App {
@@ -34,7 +34,6 @@ struct MinaAniiApp: App {
 // ============================================================
 // Models.swift
 // ============================================================
-
 
 // MARK: - File kinds
 
@@ -364,7 +363,6 @@ func formatTime(_ t: Double) -> String {
 // Subtitles.swift
 // ============================================================
 
-
 struct SubtitleCue {
     let start: Double
     let end: Double
@@ -438,7 +436,6 @@ enum SRTParser {
 // PlayerLayer.swift
 // ============================================================
 
-
 /// Keeps a weak reference to the live AVPlayerLayer so the view model
 /// can drive video gravity and Picture in Picture.
 final class PlayerLayerHolder {
@@ -469,6 +466,19 @@ struct PlayerLayerView: UIViewRepresentable {
     }
 }
 
+struct VLCPlayerLayerView: UIViewRepresentable {
+    let player: VLCMediaPlayer
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .black
+        player.drawable = view
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
 struct RoutePickerView: UIViewRepresentable {
     func makeUIView(context: Context) -> AVRoutePickerView {
         let view = AVRoutePickerView()
@@ -485,16 +495,16 @@ struct RoutePickerView: UIViewRepresentable {
 // PlayerView.swift
 // ============================================================
 
-
 // MARK: - View model
 
 @MainActor
-final class PlayerVM: ObservableObject {
+final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     let store: LibraryStore
     let media: MediaItem
     let player = AVPlayer()
     let layerHolder = PlayerLayerHolder()
+    let vlcPlayer = VLCMediaPlayer()
 
     @Published var isPlaying = false
     @Published var current: Double = 0
@@ -511,7 +521,7 @@ final class PlayerVM: ObservableObject {
     @Published var legibleOptions: [AVMediaSelectionOption] = []
     @Published var volumeLevel: Double = 1.0
     @Published var flashText: String?
-
+    
     private var audioGroup: AVMediaSelectionGroup?
     private var legibleGroup: AVMediaSelectionGroup?
     private var cues: [SubtitleCue] = []
@@ -522,10 +532,13 @@ final class PlayerVM: ObservableObject {
     private var hideTask: DispatchWorkItem?
     private var flashTask: DispatchWorkItem?
     private var pip: AVPictureInPictureController?
+    
+    private var pendingVLCSeek: Double?
 
     init(media: MediaItem, store: LibraryStore) {
         self.media = media
         self.store = store
+        super.init()
     }
 
     // MARK: Lifecycle
@@ -536,57 +549,6 @@ final class PlayerVM: ObservableObject {
         try? session.setActive(true)
 
         let url = store.url(for: media)
-        let item = AVPlayerItem(url: url)
-        player.replaceCurrentItem(with: item)
-        player.allowsExternalPlayback = true
-        player.volume = Float(volumeLevel)
-
-        statusCancellable = item.publisher(for: \.status)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] status in
-                guard let self else { return }
-                if status == .failed {
-                    self.errorMessage = "This file can't be played by the built-in engine (unsupported container or codec). MKV/AVI support arrives with the VLC engine upgrade."
-                } else if status == .readyToPlay {
-                    if let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 {
-                        self.duration = d
-                    }
-                }
-            }
-
-        endObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in
-            guard let self else { return }
-            self.isPlaying = false
-            self.showControls = true
-            if self.duration > 0 {
-                self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration)
-            }
-        }
-
-        loadSidecarSubtitles(for: url)
-        loadSelectionGroups(for: item)
-
-        timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
-            queue: .main
-        ) { [weak self] time in
-            guard let self, !self.isScrubbing else { return }
-            self.current = time.seconds
-            if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 {
-                self.duration = d
-            }
-            if self.subtitlesOn, self.hasExternalCues {
-                self.cueText = SRTParser.cue(at: time.seconds, in: self.cues)
-            } else {
-                self.cueText = nil
-            }
-            self.periodicSave()
-        }
-
         let defaults = UserDefaults.standard
         if defaults.object(forKey: "defaultRate") != nil {
             rate = defaults.double(forKey: "defaultRate")
@@ -594,14 +556,72 @@ final class PlayerVM: ObservableObject {
         if rate <= 0 { rate = 1 }
 
         let autoResume = (defaults.object(forKey: "autoResume") as? Bool) ?? true
-        if autoResume,
-           media.lastPosition > 15,
-           media.duration > 0,
-           media.lastPosition < media.duration * 0.95 {
-            player.seek(to: CMTime(seconds: media.lastPosition, preferredTimescale: 600))
-            current = media.lastPosition
+        let shouldResume = autoResume && media.lastPosition > 15 && media.duration > 0 && media.lastPosition < media.duration * 0.95
+
+        if media.isEngineSupported {
+            let item = AVPlayerItem(url: url)
+            player.replaceCurrentItem(with: item)
+            player.allowsExternalPlayback = true
+            player.volume = Float(volumeLevel)
+
+            statusCancellable = item.publisher(for: \.status)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] status in
+                    guard let self else { return }
+                    if status == .readyToPlay, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 {
+                        self.duration = d
+                    }
+                }
+
+            endObserver = NotificationCenter.default.addObserver(
+                forName: .AVPlayerItemDidPlayToEndTime,
+                object: item,
+                queue: .main
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.isPlaying = false
+                self.showControls = true
+                if self.duration > 0 {
+                    self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration)
+                }
+            }
+
+            loadSelectionGroups(for: item)
+
+            timeObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
+                queue: .main
+            ) { [weak self] time in
+                guard let self, !self.isScrubbing else { return }
+                self.current = time.seconds
+                if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 {
+                    self.duration = d
+                }
+                if self.subtitlesOn, self.hasExternalCues {
+                    self.cueText = SRTParser.cue(at: time.seconds, in: self.cues)
+                } else {
+                    self.cueText = nil
+                }
+                self.periodicSave()
+            }
+            
+            if shouldResume {
+                player.seek(to: CMTime(seconds: media.lastPosition, preferredTimescale: 600))
+                current = media.lastPosition
+            }
+            
+        } else {
+            vlcPlayer.delegate = self
+            let vlcMedia = VLCMedia(url: url)
+            vlcPlayer.media = vlcMedia
+            vlcPlayer.audio?.volume = Int32(volumeLevel * 100) 
+            
+            if shouldResume {
+                self.pendingVLCSeek = media.lastPosition
+            }
         }
 
+        loadSidecarSubtitles(for: url)
         play()
         scheduleAutoHide()
     }
@@ -619,20 +639,81 @@ final class PlayerVM: ObservableObject {
         }
         hideTask?.cancel()
         flashTask?.cancel()
-        player.pause()
-        player.replaceCurrentItem(with: nil)
+        
+        if media.isEngineSupported {
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+        } else {
+            vlcPlayer.stop()
+            vlcPlayer.delegate = nil
+        }
+        
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+    }
+
+    // MARK: VLC Delegate Methods
+    
+    nonisolated func mediaPlayerStateChanged(_ aNotification: Notification!) {
+        Task { @MainActor in
+            switch self.vlcPlayer.state {
+            case .playing:
+                self.isPlaying = true
+                if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 {
+                    self.duration = dur / 1000.0
+                }
+                if let target = self.pendingVLCSeek {
+                    self.vlcPlayer.time = VLCTime(int: Int32(target * 1000))
+                    self.current = target
+                    self.pendingVLCSeek = nil
+                }
+            case .paused:
+                self.isPlaying = false
+            case .ended:
+                self.isPlaying = false
+                self.showControls = true
+                if self.duration > 0 {
+                    self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration)
+                }
+            case .error:
+                self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
+            default: break
+            }
+        }
+    }
+    
+    nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification!) {
+        Task { @MainActor in
+            guard !self.isScrubbing else { return }
+            let ms = self.vlcPlayer.time.value?.doubleValue ?? 0
+            self.current = ms / 1000.0
+            
+            if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 {
+                self.duration = dur / 1000.0
+            }
+            
+            if self.subtitlesOn, self.hasExternalCues {
+                self.cueText = SRTParser.cue(at: self.current, in: self.cues)
+            } else {
+                self.cueText = nil
+            }
+            self.periodicSave()
+        }
     }
 
     // MARK: Playback controls
 
     func play() {
-        player.playImmediately(atRate: Float(rate))
+        if media.isEngineSupported {
+            player.playImmediately(atRate: Float(rate))
+        } else {
+            vlcPlayer.play()
+            if rate != 1.0 { vlcPlayer.rate = Float(rate) }
+        }
         isPlaying = true
     }
 
     func pause() {
-        player.pause()
+        if media.isEngineSupported { player.pause() } else { vlcPlayer.pause() }
         isPlaying = false
         saveNow()
     }
@@ -644,11 +725,15 @@ final class PlayerVM: ObservableObject {
 
     func seek(to target: Double) {
         let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target)
-        player.seek(
-            to: CMTime(seconds: clamped, preferredTimescale: 600),
-            toleranceBefore: .zero,
-            toleranceAfter: .zero
-        )
+        if media.isEngineSupported {
+            player.seek(
+                to: CMTime(seconds: clamped, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        } else {
+            vlcPlayer.time = VLCTime(int: Int32(clamped * 1000))
+        }
         current = clamped
         scheduleAutoHide()
     }
@@ -662,14 +747,18 @@ final class PlayerVM: ObservableObject {
         rate = newRate
         UserDefaults.standard.set(newRate, forKey: "defaultRate")
         if isPlaying {
-            player.rate = Float(newRate)
+            if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) }
         }
         flash(String(format: "%.2gx", newRate))
     }
 
     func setVolume(_ value: Double) {
         volumeLevel = min(max(value, 0), 1)
-        player.volume = Float(volumeLevel)
+        if media.isEngineSupported {
+            player.volume = Float(volumeLevel)
+        } else {
+            vlcPlayer.audio?.volume = Int32(volumeLevel * 100)
+        }
         flash("Volume \(Int(volumeLevel * 100))%")
     }
 
@@ -704,7 +793,7 @@ final class PlayerVM: ObservableObject {
     }
 
     // MARK: Subtitles
-
+    
     private func loadSidecarSubtitles(for mediaURL: URL) {
         let srt = mediaURL.deletingPathExtension().appendingPathExtension("srt")
         guard FileManager.default.fileExists(atPath: srt.path) else { return }
@@ -715,9 +804,7 @@ final class PlayerVM: ObservableObject {
         let secured = url.startAccessingSecurityScopedResource()
         defer { if secured { url.stopAccessingSecurityScopedResource() } }
         guard let data = try? Data(contentsOf: url) else { return }
-        let text = String(data: data, encoding: .utf8)
-            ?? String(data: data, encoding: .isoLatin1)
-            ?? ""
+        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
         let parsed = SRTParser.parse(text)
         guard !parsed.isEmpty else {
             flash("Couldn't read subtitles")
@@ -772,6 +859,11 @@ final class PlayerVM: ObservableObject {
     // MARK: Picture in Picture
 
     func togglePiP() {
+        guard media.isEngineSupported else {
+            flash("PiP unavailable for this format")
+            return
+        }
+        
         if pip == nil,
            AVPictureInPictureController.isPictureInPictureSupported(),
            let layer = layerHolder.playerLayer {
@@ -836,12 +928,17 @@ struct PlayerScreen: View {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                PlayerLayerView(
-                    player: vm.player,
-                    holder: vm.layerHolder,
-                    gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect
-                )
-                .ignoresSafeArea()
+                if vm.media.isEngineSupported {
+                    PlayerLayerView(
+                        player: vm.player,
+                        holder: vm.layerHolder,
+                        gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect
+                    )
+                    .ignoresSafeArea()
+                } else {
+                    VLCPlayerLayerView(player: vm.vlcPlayer)
+                        .ignoresSafeArea()
+                }
 
                 subtitleOverlay
 
@@ -1037,7 +1134,7 @@ struct PlayerScreen: View {
                             vm.seek(to: scrubValue)
                         }
                     }
-                )
+                 )
                 .tint(.purple)
                 Text(formatTime(vm.duration))
                     .monospacedDigit()
@@ -1049,7 +1146,7 @@ struct PlayerScreen: View {
                 Menu {
                     ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in
                         Button(String(format: "%.2gx", r)) { vm.setRate(r) }
-                    }
+                     }
                 } label: {
                     Label(String(format: "%.2gx", vm.rate), systemImage: "speedometer")
                 }
@@ -1064,7 +1161,7 @@ struct PlayerScreen: View {
             }
             .font(.subheadline)
             .foregroundStyle(.white)
-        }
+         }
         .padding(.horizontal, 16)
         .padding(.bottom, 14)
     }
@@ -1132,7 +1229,6 @@ struct OSDBadge: View {
 // ============================================================
 // LibraryView.swift
 // ============================================================
-
 
 enum LibrarySort: String, CaseIterable, Identifiable {
     case recent = "Recently Added"
@@ -1366,8 +1462,7 @@ struct LibraryView: View {
         var result = store.items
         if !searchText.isEmpty {
             result = result.filter {
-                $0.title.localizedCaseInsensitiveContains(searchText) ||
-                $0.fileName.localizedCaseInsensitiveContains(searchText)
+                $0.title.localizedCaseInsensitiveContains(searchText) || $0.fileName.localizedCaseInsensitiveContains(searchText)
             }
         }
         switch sort {
@@ -1531,7 +1626,6 @@ struct ThumbImage: View {
 // ============================================================
 // SettingsView.swift
 // ============================================================
-
 
 struct SettingsView: View {
 
