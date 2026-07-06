@@ -10,36 +10,65 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Patch MobileVLCKit Dependency URL
-        run: |
-          echo "Swapping bad URLs for the working Showbie mirror..."
-          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://code.videolan.org/videolan/VLCKit.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
-          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/mjisagal/MobileVLCKit-SPM.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
-          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/yeatse/MobileVLCKit-SPM.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
-          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/stefansp/MobileVLCKit-SPM.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
-          echo "Patch complete."
-
       - name: Generate app icon and asset catalog
         run: |
           mkdir -p Assets.xcassets/AppIcon.appiconset
-          cat > Assets.xcassets/AppIcon.appiconset/Contents.json << 'JSON'
+          cat > Assets.xcassets/Contents.json << 'JSON1'
+          {
+            "info" : {
+              "author" : "xcode",
+              "version" : 1
+            }
+          }
+          JSON1
+          cat > Assets.xcassets/AppIcon.appiconset/Contents.json << 'JSON2'
           {
             "images" : [
               {
+                "filename" : "AppIcon.png",
                 "idiom" : "universal",
                 "platform" : "ios",
-                "size" : "1024x1024",
-                "filename" : "AppIcon.png",
-                "scale" : "1x"
+                "size" : "1024x1024"
               }
             ],
             "info" : {
-              "version" : 1,
-              "author" : "xcode"
+              "author" : "xcode",
+              "version" : 1
             }
           }
-          JSON
-          python3 -c "import zlib, struct; W=H=1024; open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(b'\x89PNG\r\n\x1a\n' + struct.pack('>I', 13) + b'IHDR' + struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0) + struct.pack('>I', 0) + b'IDAT' + zlib.compress(b'\x00' * (W * H * 3 + H)) + struct.pack('>I', 0) + b'IEND' + struct.pack('>I', 0))"
+          JSON2
+          python3 << 'PYEOF'
+          import zlib, struct
+          W = H = 1024
+          ax, ay = 402, 330
+          bx, by = 402, 694
+          cx, cy = 718, 512
+          top = (124, 58, 237)
+          bottom = (46, 16, 101)
+          rows = bytearray()
+          for y in range(H):
+              t = y / (H - 1)
+              rr = int(top[0] + (bottom[0] - top[0]) * t)
+              gg = int(top[1] + (bottom[1] - top[1]) * t)
+              bb = int(top[2] + (bottom[2] - top[2]) * t)
+              rows.append(0)
+              for x in range(W):
+                  d1 = (x - ax) * (by - ay) - (y - ay) * (bx - ax)
+                  d2 = (x - bx) * (cy - by) - (y - by) * (cx - bx)
+                  d3 = (x - cx) * (ay - cy) - (y - cy) * (ax - cx)
+                  has_neg = d1 < 0 or d2 < 0 or d3 < 0
+                  has_pos = d1 > 0 or d2 > 0 or d3 > 0
+                  if not (has_neg and has_pos):
+                      rows += b'\xff\xff\xff'
+                  else:
+                      rows += bytes((rr, gg, bb))
+          def chunk(tag, data):
+              return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
+          ihdr = struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0)
+          png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(bytes(rows), 9)) + chunk(b'IEND', b'')
+          open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(png)
+          print('icon written:', len(png), 'bytes')
+          PYEOF
 
       - name: Install XcodeGen
         env:
@@ -66,14 +95,16 @@ jobs:
           EOF
 
       - name: Generate Xcode project
-        run: xcodegen generate
-
-      - name: Make project readable by this Xcode
         run: |
-          /usr/bin/sed -i '' \
-            -e 's/objectVersion = [0-9][0-9]*;/objectVersion = 56;/' \
-            -e 's/preferredProjectObjectVersion = [0-9][0-9]*;/preferredProjectObjectVersion = 56;/' \
-            MinaAnii.xcodeproj/project.pbxproj
+          xcodegen generate
+          # Format is pinned via Project.yml (objectVersion: 56); just confirm it here.
+          grep -m1 'objectVersion' MinaAnii.xcodeproj/project.pbxproj
+
+      - name: Resolve Swift packages
+        run: |
+          xcodebuild -resolvePackageDependencies \
+            -project MinaAnii.xcodeproj \
+            -scheme MinaAnii
 
       - name: Build (unsigned, Release)
         run: |
@@ -86,14 +117,26 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            build \
+          || xcodebuild \
+            -project MinaAnii.xcodeproj \
+            -target MinaAnii \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             build
 
       - name: Package IPA
         run: |
           APP_PATH=$(find build -type d -name "MinaAnii.app" | head -n 1)
+          echo "Found app at: $APP_PATH"
+          test -n "$APP_PATH"
           mkdir -p Payload
           cp -R "$APP_PATH" Payload/
           zip -qry MinaAnii.ipa Payload
+          ls -la MinaAnii.ipa
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
