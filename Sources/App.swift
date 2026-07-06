@@ -303,10 +303,11 @@ final class TraktService: ObservableObject {
         }
         
         request.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        let scrobbleRequest = request
         
         Task.detached {
             do {
-                let (_, response) = try await URLSession.shared.data(for: request)
+                let (_, response) = try await URLSession.shared.data(for: scrobbleRequest)
                 if let httpResponse = response as? HTTPURLResponse {
                     print("Trakt Scrobble (\(action.rawValue)) Status: \(httpResponse.statusCode)")
                 }
