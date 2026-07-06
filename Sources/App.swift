@@ -1,38 +1,3 @@
-// ============================================================
-// MinaAniiApp.swift
-// ============================================================
-
-@main
-struct MinaAniiApp: App {
-    @StateObject private var store = LibraryStore()
-
-    var body: some Scene {
-        WindowGroup {
-            LibraryView()
-                .environmentObject(store)
-                .preferredColorScheme(.dark)
-                .tint(.purple)
-                .onOpenURL { url in
-                    // 1. Check if the link is a Trakt login redirect
-                    if url.scheme == "minaanii" {
-                        Task { 
-                            await TraktService.shared.handleAuthRedirect(url: url) 
-                        }
-                    } 
-                    // 2. Otherwise, treat it as a media file being imported
-                    else {
-                        Task {
-                            await store.importFile(url)
-                            store.save()
-                        }
-                    }
-                }
-        }
-    }
-}
-
-//
-
 import Foundation
 import SwiftUI
 import AVFoundation
@@ -59,9 +24,18 @@ struct MinaAniiApp: App {
                 .tint(.purple)
                 .task { await TraktService.shared.refreshIfNeeded() }
                 .onOpenURL { url in
-                    Task {
-                        await store.importFile(url)
-                        store.save()
+                    // 1. Check if the link is a Trakt login redirect
+                    if url.scheme == "minaanii" {
+                        Task {
+                            await TraktService.shared.handleAuthRedirect(url: url)
+                        }
+                    }
+                    // 2. Otherwise, treat it as a media file being imported
+                    else {
+                        Task {
+                            await store.importFile(url)
+                            store.save()
+                        }
                     }
                 }
         }
