@@ -63,7 +63,12 @@ struct TMDBResult: Codable {
 }
 
 final class MetadataService {
-    static let apiKey = "5bfac6efc6d9711a7c5751e211d12ac2"
+    static var apiKey: String {
+        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
+              let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
+              let key = dict["TMDBAPIKey"] as? String else { return "" }
+        return key
+    }
     static let baseURL = "https://api.themoviedb.org/3"
     static let imageBaseURL = "https://image.tmdb.org/t/p/w500"
     
