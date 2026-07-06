@@ -620,21 +620,51 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
     }
 
-    func play() { if media.isEngineSupported { player.playImmediately(atRate: Float(rate)) } else { vlcPlayer.play(); if rate != 1.0 { vlcPlayer.rate = Float(rate) } }; isPlaying = true; let prog = duration > 0 ? (current / duration) : 0; TraktService.shared.scrobble(item: media, progress: prog, action: .start) }
-    func pause() { if media.isEngineSupported { player.pause() } else { vlcPlayer.pause() }; isPlaying = false; saveNow(); if !hasScrobbledWatched { let prog = duration > 0 ? (current / duration) : 0; TraktService.shared.scrobble(item: media, progress: prog, action: .pause) } }
-    func togglePlay() { if isPlaying { pause() } else { play() }; scheduleAutoHide() }
+    func play() { 
+        if media.isEngineSupported { player.playImmediately(atRate: Float(rate)) } else { vlcPlayer.play(); if rate != 1.0 { vlcPlayer.rate = Float(rate) } }
+        isPlaying = true
+        scheduleAutoHide()
+        let prog = duration > 0 ? (current / duration) : 0
+        TraktService.shared.scrobble(item: media, progress: prog, action: .start) 
+    }
+    
+    func pause() { 
+        if media.isEngineSupported { player.pause() } else { vlcPlayer.pause() }
+        isPlaying = false; saveNow()
+        hideTask?.cancel()
+        if !hasScrobbledWatched { let prog = duration > 0 ? (current / duration) : 0; TraktService.shared.scrobble(item: media, progress: prog, action: .pause) } 
+    }
+    
+    // Updated: Properly handles manual tap to hide OR show, and manages the timer accordingly
+    func toggleControls() { 
+        showControls.toggle()
+        if showControls { 
+            scheduleAutoHide() 
+        } else {
+            hideTask?.cancel()
+        } 
+    }
+    
     func seek(to target: Double) { let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target); if media.isEngineSupported { player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) } else { vlcPlayer.time = VLCTime(int: Int32(clamped * 1000)) }; current = clamped; scheduleAutoHide() }
     func skip(_ seconds: Double) { seek(to: current + seconds); flash(seconds >= 0 ? "+\(Int(seconds))s" : "\(Int(seconds))s") }
     func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)) }
     func setVolume(_ value: Double) { volumeLevel = min(max(value, 0), 1); if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }; flash("Volume \(Int(volumeLevel * 100))%") }
     
-    // Updated toggle logic: no longer injects animations directly to avoid view-tree destruction
-    func toggleControls() { showControls.toggle(); if showControls { scheduleAutoHide() } }
-    
     func scheduleAutoHide() { 
-        hideTask?.cancel(); guard isPlaying else { return }
-        let work = DispatchWorkItem { [weak self] in guard let self, self.isPlaying, !self.isScrubbing else { return }; self.showControls = false }
-        hideTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work) 
+        hideTask?.cancel()
+        guard isPlaying else { return }
+        
+        let intervalObject = UserDefaults.standard.object(forKey: "autoHideInterval")
+        let interval = intervalObject != nil ? UserDefaults.standard.double(forKey: "autoHideInterval") : 10.0
+        
+        guard interval > 0 else { return } // 0 means "Never hide"
+        
+        let work = DispatchWorkItem { [weak self] in 
+            guard let self, self.isPlaying, !self.isScrubbing else { return }
+            withAnimation(.easeOut(duration: 0.25)) { self.showControls = false } 
+        }
+        hideTask = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: work) 
     }
     
     func flash(_ text: String) { flashText = text; flashTask?.cancel(); let work = DispatchWorkItem { [weak self] in self?.flashText = nil }; flashTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work) }
@@ -678,9 +708,10 @@ struct PlayerScreen: View {
                     VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() 
                 }
                 
-                // THE FIX: This 1% opaque layer explicitly catches all screen taps and gestures safely
-                Rectangle()
-                    .fill(Color(white: 0.01))
+                // THE FIX: This 0.1% opaque layer explicitly catches all screen taps and gestures safely
+                // Color.black.opacity(0.001) is visually totally invisible, but physically present to catch touches
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
                     .ignoresSafeArea()
                     .onTapGesture(count: 2, coordinateSpace: .local) { point in 
                         if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) } 
@@ -693,8 +724,6 @@ struct PlayerScreen: View {
                 subtitleOverlay
                 if let flash = vm.flashText { OSDBadge(text: flash) }
                 
-                // THE FIX: We use Opacity and AllowsHitTesting instead of an if-statement
-                // so the video players can't steal the screen's focus when it disappears
                 controls
                     .opacity(vm.showControls ? 1 : 0)
                     .animation(.easeInOut(duration: 0.25), value: vm.showControls)
@@ -788,7 +817,11 @@ struct PlayerScreen: View {
                 case .none: break
                 }
             }
-            .onEnded { _ in if dragMode == .seek { vm.seek(to: seekTarget) }; dragMode = .none }
+            .onEnded { _ in 
+                if dragMode == .seek { vm.seek(to: seekTarget) }
+                dragMode = .none 
+                vm.scheduleAutoHide()
+            }
     }
 }
 
@@ -1011,12 +1044,33 @@ struct MediaDetailView: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var store: LibraryStore; @Environment(\.dismiss) private var dismiss; @StateObject private var trakt = TraktService.shared
-    @AppStorage("autoResume") private var autoResume = true; @AppStorage("defaultRate") private var defaultRate = 1.0; @State private var storageText = "Calculating…"; @State private var confirmWipe = false
+    
+    @AppStorage("autoResume") private var autoResume = true
+    @AppStorage("defaultRate") private var defaultRate = 1.0
+    @AppStorage("autoHideInterval") private var autoHideInterval = 10.0 // Custom timer option
+    
+    @State private var storageText = "Calculating…"
+    @State private var confirmWipe = false
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Playback") { Toggle("Resume where I left off", isOn: $autoResume); Picker("Default speed", selection: $defaultRate) { ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Text(String(format: "%.2gx", r)).tag(r) } } }
+                Section("Playback") { 
+                    Toggle("Resume where I left off", isOn: $autoResume)
+                    
+                    Picker("Default speed", selection: $defaultRate) { 
+                        ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Text(String(format: "%.2gx", r)).tag(r) } 
+                    } 
+                    
+                    // NEW: Allows you to control how long until the buttons auto-hide
+                    Picker("Auto-hide controls", selection: $autoHideInterval) {
+                        Text("3 seconds").tag(3.0)
+                        Text("5 seconds").tag(5.0)
+                        Text("10 seconds").tag(10.0)
+                        Text("30 seconds").tag(30.0)
+                        Text("Never").tag(0.0)
+                    }
+                }
                 
                 Section("Trakt.tv") {
                     if trakt.isAuthenticated { LabeledContent("Status", value: "Connected"); Button("Disconnect Trakt", role: .destructive) { trakt.logout() } }
