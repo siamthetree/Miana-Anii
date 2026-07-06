@@ -192,7 +192,14 @@ final class TraktService: ObservableObject {
         let scrobbleRequest = request
 
         Task.detached {
-            try? await URLSession.shared.data(for: scrobbleRequest)
+            do {
+                let (_, response) = try await URLSession.shared.data(for: scrobbleRequest)
+                if let httpResponse = response as? HTTPURLResponse {
+                    print("Trakt Scrobble (\(action.rawValue)) Sync Status Code: \(httpResponse.statusCode)")
+                }
+            } catch {
+                print("Trakt Network Error: \(error.localizedDescription)")
+            }
         }
     }
 }
@@ -235,6 +242,11 @@ final class MetadataService {
     static let imageBaseURL = "https://image.tmdb.org/t/p/w780"
     
     static func fetchMetadata(for filename: String, cleanTitle: String) async -> MediaMetadata? {
+        guard !apiKey.isEmpty else {
+            print("TMDB Service Error: Missing API Key inside Secrets.plist")
+            return nil
+        }
+        
         let isTV = filename.localizedStandardContains("S0") || filename.localizedStandardContains("E0") || filename.localizedStandardContains("Season")
         let searchType = isTV ? "tv" : "movie"
         
@@ -248,14 +260,34 @@ final class MetadataService {
             }
         }
         
+        var searchTitle = cleanTitle
+        var explicitYear: String? = nil
+        let yearPattern = "\\b(19\\d{2}|20[0-2]\\d|2030)\\b"
+        if let regex = try? NSRegularExpression(pattern: yearPattern),
+           let match = regex.firstMatch(in: cleanTitle, range: NSRange(cleanTitle.startIndex..., in: cleanTitle)) {
+            if let yearRange = Range(match.range, in: cleanTitle) {
+                explicitYear = String(cleanTitle[yearRange])
+                searchTitle = cleanTitle.replacingCharacters(in: yearRange, with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        
         var components = URLComponents(string: "\(baseURL)/search/\(searchType)")!
-        components.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "query", value: cleanTitle), URLQueryItem(name: "page", value: "1")]
+        var queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "query", value: searchTitle),
+            URLQueryItem(name: "page", value: "1")
+        ]
+        if let year = explicitYear { queryItems.append(URLQueryItem(name: isTV ? "first_air_date_year" : "year", value: year)) }
+        components.queryItems = queryItems
         guard let url = components.url else { return nil }
         
         do {
             let (data, _) = try await URLSession.shared.data(from: url)
             let response = try JSONDecoder().decode(TMDBResponse.self, from: data)
-            guard let firstResult = response.results.first else { return nil }
+            guard let firstResult = response.results.first else {
+                print("TMDB: No matches found for query string: '\(searchTitle)'")
+                return nil
+            }
             
             let dateString = firstResult.release_date ?? firstResult.first_air_date ?? ""
             let year = String(dateString.prefix(4))
@@ -275,12 +307,15 @@ final class MetadataService {
             }
             
             return MediaMetadata(tmdbID: firstResult.id, title: firstResult.title ?? firstResult.name ?? cleanTitle, overview: firstResult.overview ?? "No description available.", posterURL: posterURL, backdropURL: backdropURL, releaseYear: year, isTVShow: isTV, season: season, episode: episode, rating: rating, genres: genres, cast: cast)
-        } catch { return nil }
+        } catch { 
+            print("TMDB Data parsing failure: \(error.localizedDescription)")
+            return nil 
+        }
     }
 }
 
 // ============================================================
-// Local Models
+// Models
 // ============================================================
 
 enum MediaKinds {
@@ -299,7 +334,7 @@ struct MediaItem: Identifiable, Codable, Hashable {
     var duration: Double = 0
     var lastPosition: Double = 0
     var lastPlayed: Date? = nil
-    var metadata: MediaMetadata? = nil // TMDB details!
+    var metadata: MediaMetadata? = nil
 
     var progress: Double { guard duration > 0 else { return 0 }; return min(max(lastPosition / duration, 0), 1) }
     var isWatched: Bool { duration > 0 && progress >= 0.95 }
@@ -511,7 +546,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     
     private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var hideTask: DispatchWorkItem?; private var flashTask: DispatchWorkItem?; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
     
-    // Tracks if we have already officially checked-in this media as watched
     private var hasScrobbledWatched = false
 
     init(media: MediaItem, store: LibraryStore) { self.media = media; self.store = store; super.init() }
@@ -535,7 +569,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
                 self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: time.seconds, in: self.cues) : nil
                 self.periodicSave()
-                self.checkWatchedThreshold() // Check if we hit the 3-minute mark
+                self.checkWatchedThreshold()
             }
             if shouldResume { player.seek(to: CMTime(seconds: media.lastPosition, preferredTimescale: 600)); current = media.lastPosition }
         } else {
@@ -543,18 +577,15 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             if shouldResume { self.pendingVLCSeek = media.lastPosition }
         }
         loadSidecarSubtitles(for: url); play(); scheduleAutoHide()
-        
         TraktService.shared.scrobble(item: media, progress: media.progress, action: .start)
     }
 
     func stop() {
         saveNow()
-        
         if !hasScrobbledWatched {
             let prog = duration > 0 ? (current / duration) : 0
             TraktService.shared.scrobble(item: media, progress: prog, action: .stop)
         }
-        
         statusCancellable = nil; if let observer = timeObserver { player.removeTimeObserver(observer); timeObserver = nil }; if let end = endObserver { NotificationCenter.default.removeObserver(end); endObserver = nil }
         hideTask?.cancel(); flashTask?.cancel()
         if media.isEngineSupported { player.pause(); player.replaceCurrentItem(with: nil) } else { vlcPlayer.stop(); vlcPlayer.delegate = nil }
@@ -574,21 +605,12 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
     
     nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification!) {
-        Task { @MainActor in 
-            guard !self.isScrubbing else { return }
-            let ms = self.vlcPlayer.time.value?.doubleValue ?? 0; self.current = ms / 1000.0
-            if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }
-            self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: self.current, in: self.cues) : nil
-            self.periodicSave()
-            self.checkWatchedThreshold() // Check if we hit the 3-minute mark
-        }
+        Task { @MainActor in guard !self.isScrubbing else { return }; let ms = self.vlcPlayer.time.value?.doubleValue ?? 0; self.current = ms / 1000.0; if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }; self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: self.current, in: self.cues) : nil; self.periodicSave(); self.checkWatchedThreshold() }
     }
     
     private func checkWatchedThreshold() {
         guard !hasScrobbledWatched, duration > 0 else { return }
         let timeRemaining = duration - current
-        
-        // Mark as watched if we have 3 minutes (180s) or less remaining, or 90% progress on very short clips
         let isNearEnd = (duration > 180 && timeRemaining <= 180) || (duration <= 180 && (current / duration) >= 0.90)
         
         if isNearEnd {
@@ -598,30 +620,23 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
     }
 
-    func play() { 
-        if media.isEngineSupported { player.playImmediately(atRate: Float(rate)) } else { vlcPlayer.play(); if rate != 1.0 { vlcPlayer.rate = Float(rate) } }
-        isPlaying = true
-        let prog = duration > 0 ? (current / duration) : 0
-        TraktService.shared.scrobble(item: media, progress: prog, action: .start) 
-    }
-    
-    func pause() { 
-        if media.isEngineSupported { player.pause() } else { vlcPlayer.pause() }
-        isPlaying = false; saveNow()
-        
-        if !hasScrobbledWatched {
-            let prog = duration > 0 ? (current / duration) : 0
-            TraktService.shared.scrobble(item: media, progress: prog, action: .pause) 
-        }
-    }
-    
+    func play() { if media.isEngineSupported { player.playImmediately(atRate: Float(rate)) } else { vlcPlayer.play(); if rate != 1.0 { vlcPlayer.rate = Float(rate) } }; isPlaying = true; let prog = duration > 0 ? (current / duration) : 0; TraktService.shared.scrobble(item: media, progress: prog, action: .start) }
+    func pause() { if media.isEngineSupported { player.pause() } else { vlcPlayer.pause() }; isPlaying = false; saveNow(); if !hasScrobbledWatched { let prog = duration > 0 ? (current / duration) : 0; TraktService.shared.scrobble(item: media, progress: prog, action: .pause) } }
     func togglePlay() { if isPlaying { pause() } else { play() }; scheduleAutoHide() }
     func seek(to target: Double) { let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target); if media.isEngineSupported { player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) } else { vlcPlayer.time = VLCTime(int: Int32(clamped * 1000)) }; current = clamped; scheduleAutoHide() }
     func skip(_ seconds: Double) { seek(to: current + seconds); flash(seconds >= 0 ? "+\(Int(seconds))s" : "\(Int(seconds))s") }
     func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)) }
     func setVolume(_ value: Double) { volumeLevel = min(max(value, 0), 1); if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }; flash("Volume \(Int(volumeLevel * 100))%") }
+    
+    // Updated toggle logic: no longer injects animations directly to avoid view-tree destruction
     func toggleControls() { showControls.toggle(); if showControls { scheduleAutoHide() } }
-    func scheduleAutoHide() { hideTask?.cancel(); guard isPlaying else { return }; let work = DispatchWorkItem { [weak self] in guard let self, self.isPlaying, !self.isScrubbing else { return }; withAnimation(.easeOut(duration: 0.25)) { self.showControls = false } }; hideTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work) }
+    
+    func scheduleAutoHide() { 
+        hideTask?.cancel(); guard isPlaying else { return }
+        let work = DispatchWorkItem { [weak self] in guard let self, self.isPlaying, !self.isScrubbing else { return }; self.showControls = false }
+        hideTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 3.5, execute: work) 
+    }
+    
     func flash(_ text: String) { flashText = text; flashTask?.cancel(); let work = DispatchWorkItem { [weak self] in self?.flashText = nil }; flashTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work) }
     
     private func loadSidecarSubtitles(for mediaURL: URL) { let srt = mediaURL.deletingPathExtension().appendingPathExtension("srt"); guard FileManager.default.fileExists(atPath: srt.path) else { return }; loadSubtitleFile(srt, copySidecar: false) }
@@ -657,24 +672,33 @@ struct PlayerScreen: View {
             ZStack {
                 Color.black.ignoresSafeArea()
                 
-                // VIDEO ENGINES
                 if vm.media.isEngineSupported { 
                     PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect).ignoresSafeArea() 
                 } else { 
                     VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() 
                 }
                 
-                // DEDICATED TOUCH LAYER FIX
-                Color.clear
-                    .contentShape(Rectangle())
+                // THE FIX: This 1% opaque layer explicitly catches all screen taps and gestures safely
+                Rectangle()
+                    .fill(Color(white: 0.01))
                     .ignoresSafeArea()
-                    .onTapGesture(count: 2, coordinateSpace: .local) { point in if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) } }
-                    .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { vm.toggleControls() } }
+                    .onTapGesture(count: 2, coordinateSpace: .local) { point in 
+                        if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) } 
+                    }
+                    .onTapGesture(count: 1) { 
+                        vm.toggleControls() 
+                    }
                     .gesture(panGesture(geo: geo))
 
                 subtitleOverlay
                 if let flash = vm.flashText { OSDBadge(text: flash) }
-                if vm.showControls { controls.transition(.opacity) }
+                
+                // THE FIX: We use Opacity and AllowsHitTesting instead of an if-statement
+                // so the video players can't steal the screen's focus when it disappears
+                controls
+                    .opacity(vm.showControls ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.25), value: vm.showControls)
+                    .allowsHitTesting(vm.showControls)
             }
         }
         .statusBarHidden(true).persistentSystemOverlays(.hidden)
