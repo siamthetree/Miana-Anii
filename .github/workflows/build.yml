@@ -10,6 +10,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Patch MobileVLCKit Dependency URL
+        run: |
+          echo "Swapping dead GitHub forks for the official VideoLAN URL..."
+          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/mjisagal/MobileVLCKit-SPM.git|https://code.videolan.org/videolan/VLCKit.git|g' {} +
+          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/yeatse/MobileVLCKit-SPM.git|https://code.videolan.org/videolan/VLCKit.git|g' {} +
+          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/stefansp/MobileVLCKit-SPM.git|https://code.videolan.org/videolan/VLCKit.git|g' {} +
+          echo "Patch complete."
+
       - name: Generate app icon and asset catalog
         run: |
           mkdir -p Assets.xcassets/AppIcon.appiconset
