@@ -1287,6 +1287,10 @@ struct ThumbImage: View {
 struct SettingsView: View {
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.dismiss) private var dismiss
+    
+    // NEW: Inject Trakt Service
+    @StateObject private var trakt = TraktService.shared
+    
     @AppStorage("autoResume") private var autoResume = true
     @AppStorage("defaultRate") private var defaultRate = 1.0
     @State private var storageText = "Calculating…"
@@ -1299,15 +1303,46 @@ struct SettingsView: View {
                     Toggle("Resume where I left off", isOn: $autoResume)
                     Picker("Default speed", selection: $defaultRate) { ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Text(String(format: "%.2gx", r)).tag(r) } }
                 }
+                
+                // NEW: Trakt Integration Section
+                Section("Trakt.tv") {
+                    if trakt.isAuthenticated {
+                        LabeledContent("Status", value: "Connected")
+                        Button("Disconnect Trakt", role: .destructive) {
+                            trakt.logout()
+                        }
+                    } else if trakt.isAuthenticating {
+                        VStack(alignment: .center, spacing: 12) {
+                            ProgressView()
+                            Text("Go to \(trakt.authVerificationURL ?? "trakt.tv/activate") on your phone")
+                                .font(.subheadline)
+                                .multilineTextAlignment(.center)
+                            if let code = trakt.authUserCode {
+                                Text(code)
+                                    .font(.largeTitle.monospaced().bold())
+                            }
+                            Text("Waiting for approval...")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 8)
+                        
+                        Button("Cancel") {
+                            trakt.logout()
+                        }
+                    } else {
+                        Button("Connect to Trakt") {
+                            Task { await trakt.startDeviceAuthentication() }
+                        }
+                    }
+                }
+                
                 Section("Library") {
                     LabeledContent("Storage used", value: storageText)
                     Button("Rescan for new files") { Task { await store.rescan(); storageText = store.storageString() } }
                     Button("Clear watch history") { store.clearProgress() }
                     Button("Delete all media", role: .destructive) { confirmWipe = true }
-                }
-                Section("Adding media") {
-                    Text("Use the + button in the library, share any video to Mina Anii from another app, or drop files into On My iPad › Mina Anii with the Files app — they're picked up automatically.")
-                        .font(.footnote).foregroundStyle(.secondary)
                 }
                 Section("About") {
                     LabeledContent("App", value: "Mina Anii")
