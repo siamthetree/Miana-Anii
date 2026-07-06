@@ -21,8 +21,19 @@ struct TraktTokenResponse: Codable {
 final class TraktService: ObservableObject {
     static let shared = TraktService()
     
-    private let clientID = "f0bf471d51d179c7ad8c96db05fe4e3b010e9e229be87f884c1d5ed8457520bc"
-    private let clientSecret = "0f5e6adf584cd84a56e3707d2bf4b7cca7602c479e09edc421ce2c01de7fe06d"
+    private var clientID: String {
+        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
+              let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
+              let key = dict["TraktClientID"] as? String else { return "" }
+        return key
+    }
+    
+    private var clientSecret: String {
+        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
+              let dict = NSDictionary(contentsOfFile: path) as? [String: Any],
+              let key = dict["TraktClientSecret"] as? String else { return "" }
+        return key
+    }
     
     @AppStorage("traktAccessToken") var accessToken: String = ""
     
