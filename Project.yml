@@ -4,9 +4,6 @@ options:
   deploymentTarget:
     iOS: "16.0"
   createIntermediateGroups: true
-  # Emit an Xcode 14/15-compatible project format directly, so no post-generation
-  # patching is needed for the CI runner's Xcode (this replaces the old sed step).
-  objectVersion: 56
 
 packages:
   MobileVLCKit:
