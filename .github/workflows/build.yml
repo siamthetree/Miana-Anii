@@ -75,7 +75,7 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: 1
           HOMEBREW_NO_REQUIRE_TAP_TRUST: 1
         run: brew install xcodegen
-        
+
       - name: Inject Secrets.plist
         run: |
           mkdir -p Sources
@@ -95,9 +95,17 @@ jobs:
           EOF
 
       - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Downgrade project format for this Xcode
         run: |
-          xcodegen generate
-          # Format is pinned via Project.yml (objectVersion: 56); just confirm it here.
+          # XcodeGen emits an Xcode 16 project (objectVersion 77), which the Xcode on the
+          # runner cannot open ("future Xcode project file format"). Pin it to the Xcode
+          # 14/15 format (56); every modern Xcode can still read that.
+          /usr/bin/sed -i '' \
+            -e 's/objectVersion = [0-9][0-9]*;/objectVersion = 56;/' \
+            -e 's/preferredProjectObjectVersion = [0-9][0-9]*;/preferredProjectObjectVersion = 56;/' \
+            MinaAnii.xcodeproj/project.pbxproj
           grep -m1 'objectVersion' MinaAnii.xcodeproj/project.pbxproj
 
       - name: Resolve Swift packages
