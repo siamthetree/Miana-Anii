@@ -72,6 +72,23 @@ jobs:
 
       - name: Install XcodeGen
         run: brew install xcodegen
+        
+        - name: Inject Secrets.plist
+        run: |
+          cat > Sources/Secrets.plist << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>TraktClientID</key>
+              <string>${{ secrets.TRAKT_CLIENT_ID }}</string>
+              <key>TraktClientSecret</key>
+              <string>${{ secrets.TRAKT_CLIENT_SECRET }}</string>
+              <key>TMDBAPIKey</key>
+              <string>${{ secrets.TMDB_API_KEY }}</string>
+          </dict>
+          </plist>
+          EOF
 
       - name: Generate Xcode project
         run: xcodegen generate
