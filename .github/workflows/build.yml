@@ -12,10 +12,11 @@ jobs:
 
       - name: Patch MobileVLCKit Dependency URL
         run: |
-          echo "Swapping dead GitHub forks for the official VideoLAN URL..."
-          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/mjisagal/MobileVLCKit-SPM.git|https://code.videolan.org/videolan/VLCKit.git|g' {} +
-          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/yeatse/MobileVLCKit-SPM.git|https://code.videolan.org/videolan/VLCKit.git|g' {} +
-          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/stefansp/MobileVLCKit-SPM.git|https://code.videolan.org/videolan/VLCKit.git|g' {} +
+          echo "Swapping bad URLs for the working Showbie mirror..."
+          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://code.videolan.org/videolan/VLCKit.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
+          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/mjisagal/MobileVLCKit-SPM.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
+          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/yeatse/MobileVLCKit-SPM.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
+          find . -type f \( -name "project.yml" -o -name "Package.swift" \) -exec sed -i '' 's|https://github.com/stefansp/MobileVLCKit-SPM.git|https://github.com/showbie/MobileVLCKit-SPM.git|g' {} +
           echo "Patch complete."
 
       - name: Generate app icon and asset catalog
