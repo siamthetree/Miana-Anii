@@ -7,7 +7,7 @@ options:
 
 packages:
   MobileVLCKit:
-    url: https://github.com/mjisagal/MobileVLCKit-SPM.git
+    url: https://github.com/yeatse/MobileVLCKit-SPM.git
     from: 3.3.17
 
 targets:
