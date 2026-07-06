@@ -993,16 +993,55 @@ struct PlayerScreen: View {
         return types
     }
 
-    var body: some View {
+    var body:     var body: some View {
         GeometryReader { geo in
             ZStack {
+                // 1. Background
                 Color.black.ignoresSafeArea()
-                if vm.media.isEngineSupported { PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect).ignoresSafeArea() } 
-                else { VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() }
+                
+                // 2. Video Player Engines
+                if vm.media.isEngineSupported { 
+                    PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect)
+                        .ignoresSafeArea() 
+                } else { 
+                    VLCPlayerLayerView(player: vm.vlcPlayer)
+                        .ignoresSafeArea() 
+                }
+                
+                // 3. THE FIX: Dedicated Touch Surface Layer
+                // This transparent layer catches all gestures before the UIKit video players can swallow them.
+                Color.clear
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .onTapGesture(count: 2, coordinateSpace: .local) { point in 
+                        if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) } 
+                    }
+                    .onTapGesture { 
+                        withAnimation(.easeInOut(duration: 0.2)) { vm.toggleControls() } 
+                    }
+                    .gesture(panGesture(geo: geo))
+                
+                // 4. Overlays & Controls
                 subtitleOverlay
                 if let flash = vm.flashText { OSDBadge(text: flash) }
                 if vm.showControls { controls.transition(.opacity) }
             }
+        }
+        .statusBarHidden(true)
+        .persistentSystemOverlays(.hidden)
+        .onAppear { vm.start(); UIApplication.shared.isIdleTimerDisabled = true }
+        .onDisappear { vm.stop(); UIApplication.shared.isIdleTimerDisabled = false }
+        .alert("Playback Error", isPresented: Binding(get: { vm.errorMessage != nil }, set: { if !$0 { vm.errorMessage = nil } })) { 
+            Button("OK") { dismiss() } 
+        } message: { 
+            Text(vm.errorMessage ?? "") 
+        }
+        .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in 
+            if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) } 
+        }
+        .preferredColorScheme(.dark)
+    }
+
             .contentShape(Rectangle())
             .onTapGesture(count: 2, coordinateSpace: .local) { point in if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) } }
             .onTapGesture { withAnimation(.easeInOut(duration: 0.2)) { vm.toggleControls() } }
