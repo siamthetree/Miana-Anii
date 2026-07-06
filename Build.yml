@@ -1,0 +1,103 @@
+name: Build Mina Anii IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate app icon and asset catalog
+        run: |
+          mkdir -p Assets.xcassets/AppIcon.appiconset
+          cat > Assets.xcassets/Contents.json << 'JSON1'
+          {
+            "info" : {
+              "author" : "xcode",
+              "version" : 1
+            }
+          }
+          JSON1
+          cat > Assets.xcassets/AppIcon.appiconset/Contents.json << 'JSON2'
+          {
+            "images" : [
+              {
+                "filename" : "AppIcon.png",
+                "idiom" : "universal",
+                "platform" : "ios",
+                "size" : "1024x1024"
+              }
+            ],
+            "info" : {
+              "author" : "xcode",
+              "version" : 1
+            }
+          }
+          JSON2
+          python3 << 'PYEOF'
+          import zlib, struct
+          W = H = 1024
+          ax, ay = 402, 330
+          bx, by = 402, 694
+          cx, cy = 718, 512
+          top = (124, 58, 237)
+          bottom = (46, 16, 101)
+          rows = bytearray()
+          for y in range(H):
+              t = y / (H - 1)
+              rr = int(top[0] + (bottom[0] - top[0]) * t)
+              gg = int(top[1] + (bottom[1] - top[1]) * t)
+              bb = int(top[2] + (bottom[2] - top[2]) * t)
+              rows.append(0)
+              for x in range(W):
+                  d1 = (x - ax) * (by - ay) - (y - ay) * (bx - ax)
+                  d2 = (x - bx) * (cy - by) - (y - by) * (cx - bx)
+                  d3 = (x - cx) * (ay - cy) - (y - cy) * (ax - cx)
+                  has_neg = d1 < 0 or d2 < 0 or d3 < 0
+                  has_pos = d1 > 0 or d2 > 0 or d3 > 0
+                  if not (has_neg and has_pos):
+                      rows += b'\xff\xff\xff'
+                  else:
+                      rows += bytes((rr, gg, bb))
+          def chunk(tag, data):
+              return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', zlib.crc32(tag + data) & 0xffffffff)
+          ihdr = struct.pack('>IIBBBBB', W, H, 8, 2, 0, 0, 0)
+          png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', ihdr) + chunk(b'IDAT', zlib.compress(bytes(rows), 9)) + chunk(b'IEND', b'')
+          open('Assets.xcassets/AppIcon.appiconset/AppIcon.png', 'wb').write(png)
+          print('icon written:', len(png), 'bytes')
+          PYEOF
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build (unsigned, Release)
+        run: |
+          xcodebuild \
+            -project MinaAnii.xcodeproj \
+            -scheme MinaAnii \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R "build/Build/Products/Release-iphoneos/MinaAnii.app" Payload/
+          zip -qry MinaAnii.ipa Payload
+          ls -la MinaAnii.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MinaAnii-IPA
+          path: MinaAnii.ipa
