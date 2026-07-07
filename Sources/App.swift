@@ -6,6 +6,7 @@ import Combine
 import UIKit
 import UniformTypeIdentifiers
 import MobileVLCKit
+import Security
 
 // ============================================================
 // MinaAniiApp.swift
@@ -14,7 +15,7 @@ import MobileVLCKit
 @main
 struct MinaAniiApp: App {
     @StateObject private var store = LibraryStore()
-
+    
     var body: some Scene {
         WindowGroup {
             LibraryView()
