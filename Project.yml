@@ -42,6 +42,12 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         UIBackgroundModes:
           - audio
+          
+        CFBundleURLTypes:
+          - CFBundleURLName: "com.polao.minaanii"
+            CFBundleURLSchemes:
+              - "minaanii"
+              
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
