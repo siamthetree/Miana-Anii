@@ -530,4 +530,5 @@ struct PlayerLayerView: UIViewRepresentable {
 struct VLCPlayerLayerView: UIViewRepresentable {
     let player: VLCMediaPlayer
     func makeUIView(context: Context) -> UIView { let view = UIView(); view.backgroundColor = .black; player.drawable = view; return view }
-    func updateUIView(_ uiView: UIView, context:
+    func updateUIView(_ uiView: UIView, context: Context) { player.drawable = uiView }
+}
