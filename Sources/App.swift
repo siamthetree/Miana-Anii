@@ -33,6 +33,17 @@ struct MinaAniiApp: App {
     }
 }
 
+struct LibraryView: View {
+    @EnvironmentObject private var store: LibraryStore
+
+    var body: some View {
+        Text("Mina Anii")
+            .font(.title2.weight(.semibold))
+            .padding()
+            .task { await store.rescan() }
+    }
+}
+
 // ============================================================
 // Trakt & Keychain Service
 // ============================================================
