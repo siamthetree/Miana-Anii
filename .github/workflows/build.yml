@@ -111,7 +111,7 @@ jobs:
             -project MinaAnii.xcodeproj \
             -scheme MinaAnii
 
-      - name: Build (Ad-Hoc, Release)
+      - name: Build (Unsigned, Release)
         run: |
           xcodebuild build \
             -project MinaAnii.xcodeproj \
@@ -119,9 +119,10 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build \
-            CODE_SIGN_IDENTITY="-" \
-            CODE_SIGNING_REQUIRED=YES \
-            CODE_SIGNING_ALLOWED=YES
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            ENTITLEMENTS_REQUIRED=NO
 
       - name: Package IPA
         run: |
