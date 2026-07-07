@@ -33,17 +33,6 @@ struct MinaAniiApp: App {
     }
 }
 
-struct LibraryView: View {
-    @EnvironmentObject private var store: LibraryStore
-
-    var body: some View {
-        Text("Mina Anii")
-            .font(.title2.weight(.semibold))
-            .padding()
-            .task { await store.rescan() }
-    }
-}
-
 // ============================================================
 // Trakt & Keychain Service
 // ============================================================
@@ -541,5 +530,4 @@ struct PlayerLayerView: UIViewRepresentable {
 struct VLCPlayerLayerView: UIViewRepresentable {
     let player: VLCMediaPlayer
     func makeUIView(context: Context) -> UIView { let view = UIView(); view.backgroundColor = .black; player.drawable = view; return view }
-    func updateUIView(_ uiView: UIView, context: Context) { player.drawable = uiView }
-}
+    func updateUIView(_ uiView: UIView, context:
