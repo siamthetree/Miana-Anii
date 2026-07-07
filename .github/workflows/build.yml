@@ -99,9 +99,6 @@ jobs:
 
       - name: Downgrade project format for this Xcode
         run: |
-          # XcodeGen emits an Xcode 16 project (objectVersion 77), which the Xcode on the
-          # runner cannot open ("future Xcode project file format"). Pin it to the Xcode
-          # 14/15 format (56); every modern Xcode can still read that.
           /usr/bin/sed -i '' \
             -e 's/objectVersion = [0-9][0-9]*;/objectVersion = 56;/' \
             -e 's/preferredProjectObjectVersion = [0-9][0-9]*;/preferredProjectObjectVersion = 56;/' \
@@ -114,27 +111,17 @@ jobs:
             -project MinaAnii.xcodeproj \
             -scheme MinaAnii
 
-      - name: Build (unsigned, Release)
+      - name: Build (Ad-Hoc, Release)
         run: |
-          xcodebuild \
+          xcodebuild build \
             -project MinaAnii.xcodeproj \
             -scheme MinaAnii \
             -configuration Release \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build \
-          || xcodebuild \
-            -project MinaAnii.xcodeproj \
-            -target MinaAnii \
-            -configuration Release \
             -sdk iphoneos \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            build
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES
 
       - name: Package IPA
         run: |
