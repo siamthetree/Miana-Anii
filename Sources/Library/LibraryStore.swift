@@ -78,19 +78,13 @@ final class LibraryStore: ObservableObject {
     }
 
     private func copyToDocumentsIfNeeded(_ sourceURL: URL) throws -> URL {
-        let dest = documentsDirectory().appendingPathComponent(sourceURL.lastPathComponent)
+    let started = sourceURL.startAccessingSecurityScopedResource()
+    defer { if started { sourceURL.stopAccessingSecurityScopedResource() } }
 
-        // Security-scoped access for Files app URLs
-        let needsScope = sourceURL.startAccessingSecurityScopedResource()
-        defer {
-            if needsScope { sourceURL.stopAccessingSecurityScopedResource() }
-        }
+    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    let dest = docs.appendingPathComponent(sourceURL.lastPathComponent)
 
-        if FileManager.default.fileExists(atPath: dest.path) {
-            return dest
-        }
-
-        try FileManager.default.copyItem(at: sourceURL, to: dest)
-        return dest
-    }
+    if FileManager.default.fileExists(atPath: dest.path) { return dest }
+    try FileManager.default.copyItem(at: sourceURL, to: dest)
+    return dest
 }
