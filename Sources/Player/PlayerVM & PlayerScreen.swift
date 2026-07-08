@@ -302,3 +302,57 @@ struct OSDBadge: View {
     let text: String
     var body: some View { Text(text).font(.headline.monospacedDigit()).padding(.horizontal, 16).padding(.vertical, 10).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white) }
 }
+
+import Foundation
+
+struct SubtitleCue: Hashable {
+    let start: Double
+    let end: Double
+    let text: String
+}
+
+enum SRTParser {
+    static func parse(_ text: String) -> [SubtitleCue] {
+        var cues: [SubtitleCue] = []
+        
+        // Standardize line endings
+        let standardized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let blocks = standardized.components(separatedBy: "\n\n")
+        
+        for block in blocks {
+            let lines = block.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            guard lines.count >= 3 else { continue }
+            
+            let timeString = lines[1]
+            let textLines = lines.dropFirst(2).joined(separator: "\n")
+            
+            let times = timeString.components(separatedBy: " --> ")
+            guard times.count == 2,
+                  let start = parseTime(times[0]),
+                  let end = parseTime(times[1]) else { continue }
+            
+            // Clean HTML tags often found in SRTs
+            let cleanText = textLines.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression, range: nil)
+            
+            cues.append(SubtitleCue(start: start, end: end, text: cleanText))
+        }
+        return cues
+    }
+
+    static func cue(at time: Double, in cues: [SubtitleCue]) -> String? {
+        // Find the subtitle that should be showing at the current timestamp
+        return cues.first(where: { time >= $0.start && time <= $0.end })?.text
+    }
+
+    private static func parseTime(_ timeStr: String) -> Double? {
+        // SRT uses a comma for milliseconds, Swift's Double expects a period
+        let parts = timeStr.replacingOccurrences(of: ",", with: ".").components(separatedBy: ":")
+        guard parts.count == 3,
+              let h = Double(parts[0]),
+              let m = Double(parts[1]),
+              let s = Double(parts[2]) else { return nil }
+        
+        return (h * 3600) + (m * 60) + s
+    }
+}
+
