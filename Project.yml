@@ -16,9 +16,6 @@ targets:
     platform: iOS
     sources:
       - path: Sources
-        excludes:
-          - Info.plist
-          - Secrets.plist
     dependencies:
       - package: MobileVLCKit
     settings:
