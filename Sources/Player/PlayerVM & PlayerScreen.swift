@@ -1,4 +1,10 @@
+import Foundation
 import SwiftUI
+import AVFoundation
+import AVKit
+import Combine
+import UIKit
+import UniformTypeIdentifiers
 import MobileVLCKit
 
 @MainActor
