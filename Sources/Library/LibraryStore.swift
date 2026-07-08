@@ -23,10 +23,13 @@ final class LibraryStore: ObservableObject {
                                  .replacingOccurrences(of: "_", with: " ")
         
         // Optional: Remove common scene tags using Regex
-        let pattern = "(1080p|720p|4k|2160p|x264|x265|blu-?ray|web-?dl|\\[.*\\]|\\(.*\\))"
-        if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-            cleanTitle = regex.stringByReplacingMatches(in: cleanTitle, range: NSRange(0..<cleanTitle.utf16.count), withTemplate: "")
-        }
+let pattern = "(1080p|720p|4k|2160p|x264|x265|blu-?ray|web-?dl|\\[.*\\]|\\(.*\\))"
+if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+    // FIX: Use location and length for the NSRange
+    let range = NSRange(location: 0, length: cleanTitle.utf16.count)
+    cleanTitle = regex.stringByReplacingMatches(in: cleanTitle, options: [], range: range, withTemplate: "")
+}
+
         cleanTitle = cleanTitle.trimmingCharacters(in: .whitespacesAndNewlines)
 
         var item = MediaItem(title: filename, fileURL: importedURL)
