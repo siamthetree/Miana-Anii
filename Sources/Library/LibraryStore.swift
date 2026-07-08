@@ -3,8 +3,7 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
-
-@MainActor
+@MainActor // FIXED: Added the @ symbol here
 final class LibraryStore: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     private let fm = FileManager.default
