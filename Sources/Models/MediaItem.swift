@@ -1,5 +1,3 @@
-
-
 import Foundation
 
 enum MediaKinds {
@@ -19,6 +17,10 @@ struct MediaItem: Identifiable, Codable, Hashable {
     var lastPosition: Double = 0
     var lastPlayed: Date? = nil
     var metadata: MediaMetadata? = nil
+
+    /// Set when the file lives in a watched folder instead of the app's own
+    /// Media directory. relativePath is measured from the folder root, so
+    /// "Breaking Bad/Season 1/ep.mkv" survives a relaunch.
     var folderID: UUID? = nil
     var relativePath: String? = nil
 
