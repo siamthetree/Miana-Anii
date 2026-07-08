@@ -1,3 +1,5 @@
+
+
 import Foundation
 import SwiftUI
 import AVFoundation
@@ -33,7 +35,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     init(media: MediaItem, store: LibraryStore) { self.media = media; self.store = store; super.init() }
 
     func start() {
-        let session = AVAudioSession.sharedInstance(); try? session.setCategory(.playback, mode: .moviePlayback); try? session.setActive(true)
+        configureAudioSession()
         setupRemoteCommands()
         observeAudioSession()
         Task { @MainActor [weak self] in await self?.loadArtwork() }
@@ -70,6 +72,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             if shouldResume { player.seek(to: CMTime(seconds: media.lastPosition, preferredTimescale: 600)); current = media.lastPosition }
         } else {
             vlcPlayer.delegate = self; vlcPlayer.media = VLCMedia(url: url); vlcPlayer.audio?.volume = Int32(volumeLevel * 100)
+            vlcPlayer.audio?.passthrough = UserDefaults.standard.bool(forKey: "audioPassthrough")
             if shouldResume { self.pendingVLCSeek = media.lastPosition }
         }
         loadSidecarSubtitles(for: url); play(); scheduleAutoHide()
@@ -307,15 +310,40 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             }
         })
 
-        // Headphones pulled out, or a Bluetooth speaker walking out of range.
-        // Without this the audio jumps to the built-in speaker at full volume.
+        // Two jobs. Pause when the old output disappears, so pulling headphones
+        // out does not dump the audio onto the iPad speaker at whatever volume it
+        // happened to be at. And re-ask for the channel count, because plugging
+        // into a receiver mid-film is exactly when more than two become available.
         audioObservers.append(notifications.addObserver(forName: AVAudioSession.routeChangeNotification,
                                                         object: nil, queue: .main) { [weak self] note in
-            guard let self,
-                  let raw = note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt,
-                  AVAudioSession.RouteChangeReason(rawValue: raw) == .oldDeviceUnavailable else { return }
-            Task { @MainActor in if self.isPlaying { self.pause() } }
+            guard let self else { return }
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt)
+                .flatMap { AVAudioSession.RouteChangeReason(rawValue: $0) }
+
+            Task { @MainActor in
+                self.applyPreferredChannels()
+                if reason == .oldDeviceUnavailable, self.isPlaying { self.pause() }
+            }
         })
+    }
+
+    /// .moviePlayback already asks for spatialisation on AirPods. What was missing
+    /// is the declaration that this app has multichannel content to spatialise:
+    /// without it, AirPlay and HDMI stay stereo and a 5.1 mix is folded down
+    /// before it ever leaves the device.
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .moviePlayback)
+        try? session.setSupportsMultichannelContent(true)
+        try? session.setActive(true)
+        applyPreferredChannels()
+    }
+
+    /// Ask the current route for everything it has. Two on the built-in speaker,
+    /// more over USB-C to HDMI or a digital receiver.
+    private func applyPreferredChannels() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setPreferredOutputNumberOfChannels(session.maximumOutputNumberOfChannels)
     }
 
     private func teardownRemoteControl() {
