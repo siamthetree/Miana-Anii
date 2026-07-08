@@ -10,9 +10,7 @@ struct VideoPlayerView: UIViewControllerRepresentable {
         return controller
     }
 
-    func updateUIViewController(_ uiViewController: VLCViewController, context: Context) {
-      
-    }
+    func updateUIViewController(_ uiViewController: VLCViewController, context: Context) {}
 }
 
 class VLCViewController: UIViewController, VLCMediaPlayerDelegate {
@@ -23,7 +21,6 @@ class VLCViewController: UIViewController, VLCMediaPlayerDelegate {
         super.viewDidLoad()
         view.backgroundColor = .black
         
-        // Setup VLC Player
         mediaPlayer.drawable = self.view
         mediaPlayer.delegate = self
         
