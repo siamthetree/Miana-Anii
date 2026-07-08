@@ -470,7 +470,7 @@ struct ContinueCard: View {
 }
 
 // MARK: - Artwork loader
-.
+
 struct ArtworkImage: View {
     let thumbURL: URL
     var remoteURL: URL? = nil
