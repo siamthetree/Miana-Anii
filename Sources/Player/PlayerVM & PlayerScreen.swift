@@ -16,6 +16,10 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var hideTask: DispatchWorkItem?; private var flashTask: DispatchWorkItem?; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
 
     private var hasScrobbledWatched = false
+    private var isScrobbling = false
+
+    /// Trakt checks the title in as watched once this much time is left.
+    private static let watchedSecondsRemaining: Double = 180
 
     init(media: MediaItem, store: LibraryStore) { self.media = media; self.store = store; super.init() }
 
@@ -34,7 +38,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.isPlaying = false; self.showControls = true
-                    if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) } 
+                    if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
+                    self.scrobbleWatched()
                 }
             }
             loadSelectionGroups(for: item)
@@ -55,15 +60,12 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             if shouldResume { self.pendingVLCSeek = media.lastPosition }
         }
         loadSidecarSubtitles(for: url); play(); scheduleAutoHide()
-        TraktService.shared.scrobble(item: media, progress: media.progress, action: .start)
     }
 
     func stop() {
         saveNow()
-        if !hasScrobbledWatched {
-            let prog = duration > 0 ? (current / duration) : 0
-            TraktService.shared.scrobble(item: media, progress: prog, action: .stop)
-        }
+        checkWatchedThreshold()
+        scrobbleAbandon()
         statusCancellable = nil; if let observer = timeObserver { player.removeTimeObserver(observer); timeObserver = nil }; if let end = endObserver { NotificationCenter.default.removeObserver(end); endObserver = nil }
         hideTask?.cancel(); flashTask?.cancel()
         if media.isEngineSupported { player.pause(); player.replaceCurrentItem(with: nil) } else { vlcPlayer.stop(); vlcPlayer.delegate = nil }
@@ -75,7 +77,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             switch self.vlcPlayer.state {
             case .playing: self.isPlaying = true; if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }; if let target = self.pendingVLCSeek { self.vlcPlayer.time = VLCTime(int: Int32(target * 1000)); self.current = target; self.pendingVLCSeek = nil }
             case .paused: self.isPlaying = false
-            case .ended: self.isPlaying = false; self.showControls = true; if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
+            case .ended: self.isPlaying = false; self.showControls = true; if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }; self.scrobbleWatched()
             case .error: self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
             default: break
             }
@@ -94,31 +96,67 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
     }
 
-    private func checkWatchedThreshold() {
-        guard !hasScrobbledWatched, duration > 0 else { return }
-        let timeRemaining = duration - current
-        let isNearEnd = (duration > 180 && timeRemaining <= 180) || (duration <= 180 && (current / duration) >= 0.90)
+    // MARK: - Trakt
 
-        if isNearEnd {
-            hasScrobbledWatched = true
-            let prog = current / duration
-            TraktService.shared.scrobble(item: media, progress: prog, action: .stop)
-        }
+    /// Falls back to the stored progress before the engine reports a duration.
+    private var scrobbleProgress: Double {
+        guard duration > 0 else { return media.progress }
+        return min(max(current / duration, 0), 1)
     }
 
-    func play() { 
+    /// Opens a scrobble. Silent once the title has been checked in.
+    private func scrobbleStart() {
+        guard !hasScrobbledWatched else { return }
+        isScrobbling = true
+        TraktService.shared.scrobble(item: media, progress: scrobbleProgress, action: .start)
+    }
+
+    private func scrobblePause() {
+        guard !hasScrobbledWatched, isScrobbling else { return }
+        isScrobbling = false
+        TraktService.shared.scrobble(item: media, progress: scrobbleProgress, action: .pause)
+    }
+
+    /// Checks the title in as watched. Reports 100 percent so Trakt writes it
+    /// to history regardless of the account's scrobble threshold.
+    private func scrobbleWatched() {
+        guard !hasScrobbledWatched else { return }
+        hasScrobbledWatched = true
+        isScrobbling = false
+        TraktService.shared.scrobble(item: media, progress: 1.0, action: .stop)
+    }
+
+    /// Closing the player early. Reports the real position, so Trakt keeps it
+    /// in progress rather than marking it watched.
+    private func scrobbleAbandon() {
+        guard !hasScrobbledWatched, isScrobbling else { return }
+        isScrobbling = false
+        TraktService.shared.scrobble(item: media, progress: scrobbleProgress, action: .stop)
+    }
+
+    /// Three minutes from the end, check in. Under six minutes long the three
+    /// minute rule would fire near the start, so use 90 percent instead.
+    private func checkWatchedThreshold() {
+        guard !hasScrobbledWatched, duration > 0, current > 0 else { return }
+        let remaining = duration - current
+        let reachedEnd = duration > 360
+            ? remaining <= Self.watchedSecondsRemaining
+            : (current / duration) >= 0.90
+        if reachedEnd { scrobbleWatched() }
+    }
+
+    func play() {
         if media.isEngineSupported { player.playImmediately(atRate: Float(rate)) } else { vlcPlayer.play(); if rate != 1.0 { vlcPlayer.rate = Float(rate) } }
         isPlaying = true
         scheduleAutoHide()
-        let prog = duration > 0 ? (current / duration) : 0
-        TraktService.shared.scrobble(item: media, progress: prog, action: .start) 
+        scrobbleStart()
     }
 
-    func pause() { 
+    func pause() {
         if media.isEngineSupported { player.pause() } else { vlcPlayer.pause() }
         isPlaying = false; saveNow()
         hideTask?.cancel()
-        if !hasScrobbledWatched { let prog = duration > 0 ? (current / duration) : 0; TraktService.shared.scrobble(item: media, progress: prog, action: .pause) } 
+        scrobblePause()
     }
 
     func toggleControls() { 
@@ -172,6 +210,7 @@ struct PlayerScreen: View {
     @State private var dragMode: DragMode = .none
     @State private var dragStartValue: Double = 0
     @State private var seekTarget: Double = 0
+    @State private var isWindowed = false
     private enum DragMode { case none, seek, volume, brightness }
 
     init(item: MediaItem, store: LibraryStore) { _vm = StateObject(wrappedValue: PlayerVM(media: item, store: store)) }
@@ -213,6 +252,7 @@ struct PlayerScreen: View {
                     .allowsHitTesting(vm.showControls)
             }
         }
+        .background(WindowChromeProbe(isWindowed: $isWindowed))
         .statusBarHidden(true).persistentSystemOverlays(.hidden)
         .onAppear { vm.start(); UIApplication.shared.isIdleTimerDisabled = true }
         .onDisappear { vm.stop(); UIApplication.shared.isIdleTimerDisabled = false }
@@ -246,7 +286,12 @@ struct PlayerScreen: View {
             Text(vm.media.title).font(.headline).lineLimit(1); Spacer(); RoutePickerView().frame(width: 40, height: 40)
             Button { vm.togglePiP() } label: { Image(systemName: "pip.enter").font(.title3).frame(width: 40, height: 40) }
             trackMenu
-        }.foregroundStyle(.white).padding(.horizontal, 16).padding(.top, 6)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
+        .padding(.leading, isWindowed ? 96 : 0)
+        .animation(.easeInOut(duration: 0.2), value: isWindowed)
     }
 
     private var trackMenu: some View {
