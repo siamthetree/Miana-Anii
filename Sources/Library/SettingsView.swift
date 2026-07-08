@@ -1,3 +1,8 @@
+import Foundation
+import SwiftUI
+import UIKit
+import UniformTypeIdentifiers
+
 struct SettingsView: View {
     @EnvironmentObject private var store: LibraryStore; @Environment(\.dismiss) private var dismiss; @StateObject private var trakt = TraktService.shared
 
