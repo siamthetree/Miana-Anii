@@ -50,21 +50,22 @@ struct LibraryView: View {
             .searchable(text: $searchText, prompt: "Search your library")
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    sortMenu
                     Menu {
                         Button { showImporter = true } label: { Label("Import Files", systemImage: "doc.badge.plus") }
                         Button { showFolderPicker = true } label: { Label("Add Watched Folder", systemImage: "folder.badge.plus") }
                     } label: { Image(systemName: "plus") }
-
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
             }
+            // Attached inside the NavigationStack, deliberately. Two fileImporters
+            // on the same view cancel each other out; on different views both work.
+            .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
+                if case .success(let url) = result { Task { await store.addFolder(url) } }
+            }
         }
-               .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { r in
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { r in
             if case .success(let urls) = r { Task { await store.importFiles(urls) } }
-        }
-        .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
-            if case .success(let url) = result { Task { await store.addFolder(url) } }
-        }
         }
         .fullScreenCover(item: $playing) { item in PlayerScreen(item: item, store: store) }
         .sheet(item: $route) { destination in
