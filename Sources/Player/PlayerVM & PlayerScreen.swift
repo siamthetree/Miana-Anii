@@ -104,7 +104,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if !hasScrobbledWatched { let prog = duration > 0 ? (current / duration) : 0; TraktService.shared.scrobble(item: media, progress: prog, action: .pause) } 
     }
 
-    // Updated: Properly handles manual tap to hide OR show, and manages the timer accordingly
     func toggleControls() { 
         showControls.toggle()
         if showControls { 
@@ -126,7 +125,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         let intervalObject = UserDefaults.standard.object(forKey: "autoHideInterval")
         let interval = intervalObject != nil ? UserDefaults.standard.double(forKey: "autoHideInterval") : 10.0
 
-        guard interval > 0 else { return } // 0 means "Never hide"
+        guard interval > 0 else { return }
 
         let work = DispatchWorkItem { [weak self] in 
             guard let self, self.isPlaying, !self.isScrubbing else { return }
@@ -177,8 +176,6 @@ struct PlayerScreen: View {
                     VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() 
                 }
 
-                // THE FIX: This 0.1% opaque layer explicitly catches all screen taps and gestures safely
-                // Color.black.opacity(0.001) is visually totally invisible, but physically present to catch touches
                 Color.black.opacity(0.001)
                     .contentShape(Rectangle())
                     .ignoresSafeArea()
@@ -247,16 +244,13 @@ struct PlayerScreen: View {
     }
 
     private var centerButtons: some View {
-    HStack(spacing: 58) {
-        Button { vm.skip(-10) } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
-        
-        // Removed the broken vm.togglePlay() button here. 
-        // Keep only this working one:
-        Button { vm.isPlaying ? vm.pause() : vm.play() } label: { Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84) }
-        
-        Button { vm.skip(10) } label: { Image(systemName: "goforward.10").font(.system(size: 34)) }
-    }.foregroundStyle(.white)
-}
+        // FIXED: Removed the duplicate button that was crashing the build
+        HStack(spacing: 58) {
+            Button { vm.skip(-10) } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
+            Button { vm.isPlaying ? vm.pause() : vm.play() } label: { Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84) }
+            Button { vm.skip(10) } label: { Image(systemName: "goforward.10").font(.system(size: 34)) }
+        }.foregroundStyle(.white)
+    }
 
     private var bottomBar: some View {
         VStack(spacing: 10) {
@@ -303,8 +297,7 @@ struct OSDBadge: View {
     var body: some View { Text(text).font(.headline.monospacedDigit()).padding(.horizontal, 16).padding(.vertical, 10).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white) }
 }
 
-import Foundation
-
+// FIXED: Added the missing SRT structures the compiler was looking for
 struct SubtitleCue: Hashable {
     let start: Double
     let end: Double
@@ -314,8 +307,6 @@ struct SubtitleCue: Hashable {
 enum SRTParser {
     static func parse(_ text: String) -> [SubtitleCue] {
         var cues: [SubtitleCue] = []
-        
-        // Standardize line endings
         let standardized = text.replacingOccurrences(of: "\r\n", with: "\n")
         let blocks = standardized.components(separatedBy: "\n\n")
         
@@ -331,28 +322,22 @@ enum SRTParser {
                   let start = parseTime(times[0]),
                   let end = parseTime(times[1]) else { continue }
             
-            // Clean HTML tags often found in SRTs
             let cleanText = textLines.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression, range: nil)
-            
             cues.append(SubtitleCue(start: start, end: end, text: cleanText))
         }
         return cues
     }
 
     static func cue(at time: Double, in cues: [SubtitleCue]) -> String? {
-        // Find the subtitle that should be showing at the current timestamp
         return cues.first(where: { time >= $0.start && time <= $0.end })?.text
     }
 
     private static func parseTime(_ timeStr: String) -> Double? {
-        // SRT uses a comma for milliseconds, Swift's Double expects a period
         let parts = timeStr.replacingOccurrences(of: ",", with: ".").components(separatedBy: ":")
         guard parts.count == 3,
               let h = Double(parts[0]),
               let m = Double(parts[1]),
               let s = Double(parts[2]) else { return nil }
-        
         return (h * 3600) + (m * 60) + s
     }
 }
-
