@@ -251,15 +251,13 @@ final class MetadataService {
         let isTV = season != nil || hasSeasonKeyword
         let searchType = isTV ? "tv" : "movie"
         
-             var components = URLComponents(string: "\(baseURL)/search/\(searchType)")!
+                     var components = URLComponents(string: "\(baseURL)/search/\(searchType)")!
         
-        // 1. Close the array properly
         components.queryItems = [
             URLQueryItem(name: "api_key", value: apiKey), 
             URLQueryItem(name: "query", value: cleanTitle)
         ]
         
-        // 2. Perform the network request
         guard let url = components.url else { return nil }
         
         do {
@@ -268,7 +266,6 @@ final class MetadataService {
             
             guard let firstResult = response.results.first else { return nil }
             
-            // 3. Construct MediaMetadata (which uses the 'episode' variable)
             var metadata = MediaMetadata(
                 tmdbID: firstResult.id,
                 title: firstResult.title ?? firstResult.name ?? cleanTitle,
@@ -281,7 +278,6 @@ final class MetadataService {
                 episode: episode 
             )
             
-            // Optionally fetch details for rating, genres, and cast
             let detailURL = URL(string: "\(baseURL)/\(searchType)/\(firstResult.id)?api_key=\(apiKey)&append_to_response=credits")!
             if let (detailData, _) = try? await URLSession.shared.data(from: detailURL),
                let detail = try? JSONDecoder().decode(TMDBDetailResponse.self, from: detailData) {
