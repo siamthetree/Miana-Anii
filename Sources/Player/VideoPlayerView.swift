@@ -1,24 +1,41 @@
 import SwiftUI
-import AVKit
+import MobileVLCKit
 
-struct VideoPlayerView: View {
+struct VideoPlayerView: UIViewControllerRepresentable {
     let item: MediaItem
-    @State private var player: AVPlayer?
 
-    var body: some View {
-        Group {
-            if let player {
-                VideoPlayer(player: player)
-                    .onAppear { player.play() }
-                    .onDisappear { player.pause() }
-            } else {
-                ProgressView("Loading video…")
-            }
+    func makeUIViewController(context: Context) -> VLCViewController {
+        let controller = VLCViewController()
+        controller.mediaURL = item.fileURL
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: VLCViewController, context: Context) {
+      
+    }
+}
+
+class VLCViewController: UIViewController, VLCMediaPlayerDelegate {
+    var mediaPlayer = VLCMediaPlayer()
+    var mediaURL: URL?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        
+        // Setup VLC Player
+        mediaPlayer.drawable = self.view
+        mediaPlayer.delegate = self
+        
+        if let url = mediaURL {
+            let media = VLCMedia(url: url)
+            mediaPlayer.media = media
+            mediaPlayer.play()
         }
-        .navigationTitle(item.title)
-        .navigationBarTitleDisplayMode(.inline)
-        .task {
-            player = AVPlayer(url: item.fileURL)
-        }
+    }
+    
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        mediaPlayer.stop()
     }
 }
