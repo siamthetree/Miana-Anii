@@ -1,3 +1,5 @@
+
+
 import Foundation
 import SwiftUI
 import AVFoundation
@@ -12,9 +14,12 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let store: LibraryStore; let media: MediaItem; let player = AVPlayer(); let layerHolder = PlayerLayerHolder(); let vlcPlayer = VLCMediaPlayer()
 
     @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var fillScreen = false; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var audioOptions: [AVMediaSelectionOption] = []; @Published var legibleOptions: [AVMediaSelectionOption] = []; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
+    @Published var vlcSubtitleTracks: [PlayerTrack] = []; @Published var vlcAudioTracks: [PlayerTrack] = []
+    @Published var vlcSubtitleIndex: Int32 = -1; @Published var vlcAudioIndex: Int32 = -1
 
     private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var hideTask: DispatchWorkItem?; private var flashTask: DispatchWorkItem?; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
 
+    private var didAutoSelectSubtitle = false
     private var hasScrobbledWatched = false
     private var isScrobbling = false
 
@@ -60,6 +65,15 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             if shouldResume { self.pendingVLCSeek = media.lastPosition }
         }
         loadSidecarSubtitles(for: url); play(); scheduleAutoHide()
+
+        // VLC does not publish its elementary streams the instant playback
+        // begins. State changes usually cover it; this catches the rest.
+        if !media.isEngineSupported {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                self?.refreshVLCTracks()
+            }
+        }
     }
 
     func stop() {
@@ -81,6 +95,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             case .error: self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
             default: break
             }
+            self.refreshVLCTracks()
         }
     }
 
@@ -195,6 +210,58 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private func loadSidecarSubtitles(for mediaURL: URL) { let srt = mediaURL.deletingPathExtension().appendingPathExtension("srt"); guard FileManager.default.fileExists(atPath: srt.path) else { return }; loadSubtitleFile(srt, copySidecar: false) }
     func loadSubtitleFile(_ url: URL, copySidecar: Bool = true) { let secured = url.startAccessingSecurityScopedResource(); defer { if secured { url.stopAccessingSecurityScopedResource() } }; guard let data = try? Data(contentsOf: url) else { return }; let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""; let parsed = SRTParser.parse(text); guard !parsed.isEmpty else { flash("Couldn't read subtitles"); return }; cues = parsed; hasExternalCues = true; subtitlesOn = true; flash("Subtitles loaded"); if copySidecar { let dest = store.url(for: media).deletingPathExtension().appendingPathExtension("srt"); try? data.write(to: dest, options: .atomic) } }
     private func loadSelectionGroups(for item: AVPlayerItem) { let asset = item.asset; Task { [weak self] in let chars = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []; let audio = chars.contains(.audible) ? try? await asset.loadMediaSelectionGroup(for: .audible) : nil; let legible = chars.contains(.legible) ? try? await asset.loadMediaSelectionGroup(for: .legible) : nil; guard let self else { return }; self.audioGroup = audio; self.legibleGroup = legible; self.audioOptions = audio?.options ?? []; self.legibleOptions = legible?.options ?? [] } }
+    // MARK: - VLC tracks
+
+    var usesVLC: Bool { !media.isEngineSupported }
+
+    /// AVFoundation exposes embedded tracks through AVMediaSelectionGroup, which
+    /// only ever gets loaded on the AVPlayer path. Files that fall through to VLC
+    /// had no track list at all, so an mkv with embedded subtitles showed nothing
+    /// and the menu offered only "Load .srt file". These are the VLC equivalents.
+    private func refreshVLCTracks() {
+        guard usesVLC else { return }
+
+        vlcSubtitleTracks = Self.trackList(indexes: vlcPlayer.videoSubTitlesIndexes, names: vlcPlayer.videoSubTitlesNames)
+        vlcAudioTracks = Self.trackList(indexes: vlcPlayer.audioTrackIndexes, names: vlcPlayer.audioTrackNames)
+        vlcSubtitleIndex = vlcPlayer.currentVideoSubTitleIndex
+        vlcAudioIndex = vlcPlayer.currentAudioTrackIndex
+
+        // VLC leaves subtitles off unless a track matches the preferred language.
+        // Turn the first one on once, so a subtitled file plays subtitled.
+        if !didAutoSelectSubtitle, vlcSubtitleIndex < 0, let first = vlcSubtitleTracks.first {
+            didAutoSelectSubtitle = true
+            selectVLCSubtitle(first)
+        }
+    }
+
+    /// VLC hands back two parallel arrays and includes its own "Disable" entry
+    /// at index -1, which we drop in favour of our own Off button.
+    private static func trackList(indexes: [Any]?, names: [Any]?) -> [PlayerTrack] {
+        let numbers = (indexes as? [NSNumber]) ?? []
+        let titles = (names as? [String]) ?? []
+        var result: [PlayerTrack] = []
+        for (offset, number) in numbers.enumerated() {
+            let index = number.int32Value
+            guard index >= 0 else { continue }
+            let name = offset < titles.count ? titles[offset] : "Track \(index)"
+            result.append(PlayerTrack(index: index, name: name))
+        }
+        return result
+    }
+
+    func selectVLCSubtitle(_ track: PlayerTrack?) {
+        vlcPlayer.currentVideoSubTitleIndex = track?.index ?? -1
+        vlcSubtitleIndex = vlcPlayer.currentVideoSubTitleIndex
+        didAutoSelectSubtitle = true
+        flash(track?.name ?? "Subtitles off")
+    }
+
+    func selectVLCAudio(_ track: PlayerTrack) {
+        vlcPlayer.currentAudioTrackIndex = track.index
+        vlcAudioIndex = vlcPlayer.currentAudioTrackIndex
+        flash(track.name)
+    }
+
     func selectAudio(_ option: AVMediaSelectionOption) { guard let group = audioGroup else { return }; player.currentItem?.select(option, in: group); flash(option.displayName) }
     func selectLegible(_ option: AVMediaSelectionOption?) { guard let group = legibleGroup else { return }; player.currentItem?.select(option, in: group); if let option { flash(option.displayName) } }
     func togglePiP() { guard media.isEngineSupported else { flash("PiP unavailable for this format"); return }; if pip == nil, AVPictureInPictureController.isPictureInPictureSupported(), let layer = layerHolder.playerLayer { pip = AVPictureInPictureController(playerLayer: layer) }; guard let pip else { flash("PiP unavailable"); return }; if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() } }
@@ -296,13 +363,49 @@ struct PlayerScreen: View {
 
     private var trackMenu: some View {
         Menu {
-            if !vm.audioOptions.isEmpty { Section("Audio") { ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } } }
-            Section("Subtitles") {
-                Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
-                ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
-                Button("Load .srt file…") { showSubImporter = true }; if vm.hasExternalCues { Toggle("External subtitles", isOn: $vm.subtitlesOn) }
-            }
+            if vm.usesVLC { vlcTrackSections } else { engineTrackSections }
         } label: { Image(systemName: "captions.bubble").font(.title3).frame(width: 40, height: 40) }
+    }
+
+    @ViewBuilder
+    private var engineTrackSections: some View {
+        if !vm.audioOptions.isEmpty {
+            Section("Audio") { ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } }
+        }
+        Section("Subtitles") {
+            Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
+            ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
+            subtitleFileControls
+        }
+    }
+
+    @ViewBuilder
+    private var vlcTrackSections: some View {
+        if !vm.vlcAudioTracks.isEmpty {
+            Section("Audio") {
+                ForEach(vm.vlcAudioTracks) { track in
+                    Button { vm.selectVLCAudio(track) } label: { trackLabel(track.name, selected: track.index == vm.vlcAudioIndex) }
+                }
+            }
+        }
+        Section("Subtitles") {
+            Button { vm.selectVLCSubtitle(nil) } label: { trackLabel("Off", selected: vm.vlcSubtitleIndex < 0) }
+            ForEach(vm.vlcSubtitleTracks) { track in
+                Button { vm.selectVLCSubtitle(track) } label: { trackLabel(track.name, selected: track.index == vm.vlcSubtitleIndex) }
+            }
+            subtitleFileControls
+        }
+    }
+
+    @ViewBuilder
+    private func trackLabel(_ name: String, selected: Bool) -> some View {
+        if selected { Label(name, systemImage: "checkmark") } else { Text(name) }
+    }
+
+    @ViewBuilder
+    private var subtitleFileControls: some View {
+        Button("Load .srt file…") { showSubImporter = true }
+        if vm.hasExternalCues { Toggle("External subtitles", isOn: $vm.subtitlesOn) }
     }
 
     private var centerButtons: some View {
@@ -361,6 +464,13 @@ struct OSDBadge: View {
 // -----------------------------------------------------------
 // SUBTITLE PARSING LOGIC
 // -----------------------------------------------------------
+
+/// One embedded elementary stream reported by VLC.
+struct PlayerTrack: Identifiable, Hashable {
+    let index: Int32
+    let name: String
+    var id: Int32 { index }
+}
 
 struct SubtitleCue: Hashable {
     let start: Double
