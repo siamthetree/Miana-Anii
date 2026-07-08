@@ -108,7 +108,17 @@ final class LibraryStore: ObservableObject {
     func clearProgress() { for i in items.indices { items[i].lastPosition = 0; items[i].lastPlayed = nil }; save() }
     func deleteAll() { for item in items { try? fm.removeItem(at: url(for: item)); try? fm.removeItem(at: thumbURL(for: item)) }; items.removeAll(); save() }
     func storageString() -> String { var total: Int64 = 0; if let enumerator = fm.enumerator(at: mediaDir, includingPropertiesForKeys: [.fileSizeKey]) { for case let f as URL in enumerator { if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += Int64(size) } } }; return ByteCountFormatter.string(fromByteCount: total, countStyle: .file) }
-
+func refreshMetadata() async {
+        let snapshot = items
+        for item in snapshot {
+            let raw = (item.fileName as NSString).deletingPathExtension
+            let clean = Self.prettyTitle(from: raw)
+            guard let meta = await MetadataService.fetchMetadata(for: item.fileName, cleanTitle: clean) else { continue }
+            guard let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
+            items[index].metadata = meta
+        }
+        save()
+    }
     static func prettyTitle(from raw: String) -> String {
         var s = raw.replacingOccurrences(of: "_", with: " ")
         if !s.contains(" ") { s = s.replacingOccurrences(of: ".", with: " ") }
