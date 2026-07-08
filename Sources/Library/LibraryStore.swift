@@ -12,29 +12,38 @@ final class LibraryStore: ObservableObject {
     }
 
     func importFile(_ externalURL: URL) async {
-        do {
-            let importedURL = try copyToDocumentsIfNeeded(externalURL)
-            let title = importedURL.deletingPathExtension().lastPathComponent
+    do {
+        let importedURL = try copyToDocumentsIfNeeded(externalURL)
+        let filename = importedURL.deletingPathExtension().lastPathComponent
 
-            // Avoid duplicates
-            if items.contains(where: { $0.fileURL == importedURL }) { return }
+        if items.contains(where: { $0.fileURL == importedURL }) { return }
 
-            var item = MediaItem(title: title, fileURL: importedURL)
-
-            // Optional metadata lookup (safe fallback if it fails)
-            if let metadata = await MetadataService.fetchMetadata(
-                for: importedURL.lastPathComponent,
-                cleanTitle: title
-            ) {
-                item.metadata = metadata
-            }
-
-            items.insert(item, at: 0)
-            save()
-        } catch {
-            print("Import failed: \(error)")
+        // CLEAN THE TITLE for TMDB
+        var cleanTitle = filename.replacingOccurrences(of: ".", with: " ")
+                                 .replacingOccurrences(of: "_", with: " ")
+        
+        // Optional: Remove common scene tags using Regex
+        let pattern = "(1080p|720p|4k|2160p|x264|x265|blu-?ray|web-?dl|\\[.*\\]|\\(.*\\))"
+        if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+            cleanTitle = regex.stringByReplacingMatches(in: cleanTitle, range: NSRange(0..<cleanTitle.utf16.count), withTemplate: "")
         }
+        cleanTitle = cleanTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        var item = MediaItem(title: filename, fileURL: importedURL)
+
+        if let metadata = await MetadataService.fetchMetadata(
+            for: importedURL.lastPathComponent,
+            cleanTitle: cleanTitle // <--- Pass the cleaned title here
+        ) {
+            item.metadata = metadata
+        }
+
+        items.insert(item, at: 0)
+        save()
+    } catch {
+        print("Import failed: \(error)")
     }
+}
 
     func remove(at offsets: IndexSet) {
         let removed = offsets.map { items[$0] }
