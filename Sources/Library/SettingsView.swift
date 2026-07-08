@@ -39,7 +39,7 @@ struct SettingsView: View {
 
                 Section {
                     if store.folders.isEmpty {
-                        Text("No folders yet").foregroundStyle(.secondary)
+                        Text("No sources yet").foregroundStyle(.secondary)
                     } else {
                         ForEach(store.folders) { folder in
                             VStack(alignment: .leading, spacing: 3) {
@@ -56,19 +56,19 @@ struct SettingsView: View {
                     }
 
                     Button { showFolderPicker = true } label: {
-                        Label("Add Folder", systemImage: "folder.badge.plus")
+                        Label("Add Media Source", systemImage: "folder.badge.plus")
                     }
 
                     if store.isScanning {
                         HStack(spacing: 10) {
                             ProgressView()
-                            Text("Scanning folders…").foregroundStyle(.secondary)
+                            Text("Scanning sources…").foregroundStyle(.secondary)
                         }
                     }
                 } header: {
-                    Text("Watched Folders")
+                    Text("Media Sources")
                 } footer: {
-                    Text("New media dropped into a watched folder is added to your library automatically. Files stay where they are, nothing is copied. Swipe a folder to stop watching it, which leaves the files untouched.")
+                    Text("A media source is a folder the app keeps an eye on. Drop new media into it and the library picks it up on its own. Files stay where they are, nothing is copied. Swipe a source away to remove it, which leaves every file untouched.")
                 }
 
                 Section("Trakt.tv") {
@@ -95,7 +95,7 @@ struct SettingsView: View {
                 }
 
                 Section("Adding media") {
-                    Text("Use the + button in the library, share any video to Mina Anii from another app, or drop files into On My iPad › Mina Anii with the Files app. For a folder you keep adding to, use Add Folder above.")
+                    Text("Use the + button in the library, share any video to Mina Anii from another app, or drop files into On My iPad › Mina Anii with the Files app. For a folder you keep adding to, add it as a media source above.")
                         .font(.footnote).foregroundStyle(.secondary)
                 }
 
@@ -111,7 +111,7 @@ struct SettingsView: View {
             .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
                 if case .success(let url) = result { Task { await store.addFolder(url) } }
             }
-            .confirmationDialog("Delete all imported media and stop watching every folder? Files inside watched folders are left alone.",
+            .confirmationDialog("Delete all imported media and remove every media source? Files inside a source folder are left alone.",
                                 isPresented: $confirmWipe, titleVisibility: .visible) {
                 Button("Delete Everything", role: .destructive) { store.deleteAll(); storageText = store.storageString() }
             }
