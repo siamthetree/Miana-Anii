@@ -244,7 +244,6 @@ struct PlayerScreen: View {
     }
 
     private var centerButtons: some View {
-        // FIXED: Removed the duplicate button that was crashing the build
         HStack(spacing: 58) {
             Button { vm.skip(-10) } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
             Button { vm.isPlaying ? vm.pause() : vm.play() } label: { Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84) }
@@ -297,7 +296,10 @@ struct OSDBadge: View {
     var body: some View { Text(text).font(.headline.monospacedDigit()).padding(.horizontal, 16).padding(.vertical, 10).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white) }
 }
 
-// FIXED: Added the missing SRT structures the compiler was looking for
+// -----------------------------------------------------------
+// SUBTITLE PARSING LOGIC
+// -----------------------------------------------------------
+
 struct SubtitleCue: Hashable {
     let start: Double
     let end: Double
