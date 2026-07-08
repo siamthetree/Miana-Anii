@@ -247,13 +247,16 @@ struct PlayerScreen: View {
     }
 
     private var centerButtons: some View {
-        HStack(spacing: 58) {
-            Button { vm.skip(-10) } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
-            Button { vm.togglePlay() } label: { Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84) }
-            Button { vm.isPlaying ? vm.pause() : vm.play() } label: { Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84) }
-            Button { vm.skip(10) } label: { Image(systemName: "goforward.10").font(.system(size: 34)) }
-        }.foregroundStyle(.white)
-    }
+    HStack(spacing: 58) {
+        Button { vm.skip(-10) } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
+        
+        // Removed the broken vm.togglePlay() button here. 
+        // Keep only this working one:
+        Button { vm.isPlaying ? vm.pause() : vm.play() } label: { Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84) }
+        
+        Button { vm.skip(10) } label: { Image(systemName: "goforward.10").font(.system(size: 34)) }
+    }.foregroundStyle(.white)
+}
 
     private var bottomBar: some View {
         VStack(spacing: 10) {
