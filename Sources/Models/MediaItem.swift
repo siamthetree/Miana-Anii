@@ -35,7 +35,6 @@ extension MediaItem {
                                  "hevc", "web-dl", "webdl", "webrip", "bluray", "brrip", "bdrip", "hdrip",
                                  "hdtv", "dvdrip", "remux", "10bit", "yify", "rarbg", "aac", "ddp", "dts"]
 
-    /// True when TMDB matched this file to a television show.
     var isEpisode: Bool { metadata?.isTVShow == true }
 
     /// Stable identity for the show this file belongs to, or nil for a movie.
@@ -54,11 +53,32 @@ extension MediaItem {
                           : "Season \(seasonNumber)"
     }
 
-    /// Pulls the episode name out of the filename, i.e. everything sitting
-    /// between the S01E02 token and the first release-quality marker.
-    var episodeName: String? {
+    /// TMDB still for this exact episode, when we have one.
+    var stillURL: URL? { metadata?.stillURL }
+
+    var episodeOverview: String? {
+        guard let text = metadata?.episodeOverview, !text.isEmpty else { return nil }
+        return text
+    }
+
+    /// "20 January 2008"
+    var formattedAirDate: String? {
+        guard let raw = metadata?.airDate, !raw.isEmpty else { return nil }
+        let parser = DateFormatter()
+        parser.dateFormat = "yyyy-MM-dd"
+        parser.locale = Locale(identifier: "en_US_POSIX")
+        guard let date = parser.date(from: raw) else { return raw }
+        let printer = DateFormatter()
+        printer.dateStyle = .long
+        printer.timeStyle = .none
+        return printer.string(from: date)
+    }
+
+    /// Everything between the S01E02 token and the first quality marker.
+    var episodeNameFromFile: String? {
         let base = (fileName as NSString).deletingPathExtension
-        guard let range = base.range(of: "(?i)s\\d{1,2}\\s?e\\d{1,2}", options: .regularExpression) else { return nil }
+        guard let range = base.range(of: "(?i)s\\d{1,2}\\s?e\\d{1,2}", options: .regularExpression)
+                ?? base.range(of: "(?i)(?<![a-z0-9])\\d{1,2}x\\d{2}", options: .regularExpression) else { return nil }
 
         var tail = String(base[range.upperBound...]).replacingOccurrences(of: "_", with: " ")
         if !tail.contains(" ") { tail = tail.replacingOccurrences(of: ".", with: " ") }
@@ -75,20 +95,33 @@ extension MediaItem {
         return tail.isEmpty ? nil : tail
     }
 
+    /// TMDB episode title wins, then the filename, then a plain number.
     var displayEpisodeTitle: String {
-        if let name = episodeName { return name }
+        if let tmdb = metadata?.episodeTitle, !tmdb.isEmpty { return tmdb }
+        if let fromFile = episodeNameFromFile { return fromFile }
         return episodeNumber > 0 ? "Episode \(episodeNumber)" : title
     }
 }
 
 // MARK: - Grouped library model
 
-struct Season: Identifiable {
+struct Season: Identifiable, Hashable {
     let number: Int
+    let name: String?
+    let overview: String?
+    let posterURL: URL?
     let episodes: [MediaItem]
-    var id: Int { number }
 
+    var id: Int { number }
+    var displayName: String {
+        if let name, !name.isEmpty, name.lowercased() != "season \(number)" { return name }
+        return number == 0 ? "Specials" : "Season \(number)"
+    }
     var unwatchedCount: Int { episodes.filter { !$0.isWatched }.count }
+    var episodeCountText: String { episodes.count == 1 ? "1 episode" : "\(episodes.count) episodes" }
+    var nextUp: MediaItem? {
+        episodes.first(where: { $0.progress > 0.01 && !$0.isWatched }) ?? episodes.first(where: { !$0.isWatched })
+    }
 }
 
 struct Series: Identifiable {
@@ -106,10 +139,17 @@ struct Series: Identifiable {
     var seasons: [Season] {
         Dictionary(grouping: episodes, by: { $0.seasonNumber })
             .map { number, eps in
-                Season(number: number, episodes: eps.sorted { lhs, rhs in
+                let sorted = eps.sorted { lhs, rhs in
                     if lhs.episodeNumber != rhs.episodeNumber { return lhs.episodeNumber < rhs.episodeNumber }
                     return lhs.fileName.localizedStandardCompare(rhs.fileName) == .orderedAscending
-                })
+                }
+                return Season(
+                    number: number,
+                    name: eps.compactMap { $0.metadata?.seasonName }.first,
+                    overview: eps.compactMap { $0.metadata?.seasonOverview }.first(where: { !$0.isEmpty }),
+                    posterURL: eps.compactMap { $0.metadata?.seasonPosterURL }.first ?? posterURL,
+                    episodes: sorted
+                )
             }
             .sorted { $0.number < $1.number }
     }
@@ -120,8 +160,8 @@ struct Series: Identifiable {
     var lastPlayed: Date? { episodes.compactMap(\.lastPlayed).max() }
 
     var subtitle: String {
-        let seasonCount = seasons.count
-        let seasonText = seasonCount == 1 ? "1 season" : "\(seasonCount) seasons"
+        let count = seasons.count
+        let seasonText = count == 1 ? "1 season" : "\(count) seasons"
         let episodeText = episodeCount == 1 ? "1 episode" : "\(episodeCount) episodes"
         return "\(seasonText) • \(episodeText)"
     }
@@ -192,7 +232,7 @@ extension Array where Element == MediaItem {
         for key in order {
             guard let eps = buckets[key], let first = eps.first else { continue }
             let meta = eps.compactMap(\.metadata).first
-            let show = Series(
+            entries.append(.series(Series(
                 id: key,
                 title: meta?.title ?? first.title,
                 posterURL: eps.compactMap { $0.metadata?.posterURL }.first,
@@ -203,10 +243,16 @@ extension Array where Element == MediaItem {
                 genres: eps.compactMap { $0.metadata?.genres }.first(where: { !$0.isEmpty }) ?? [],
                 cast: eps.compactMap { $0.metadata?.cast }.first(where: { !$0.isEmpty }) ?? [],
                 episodes: eps
-            )
-            entries.append(.series(show))
+            )))
         }
 
         return entries
+    }
+
+    func series(withID id: String) -> Series? {
+        for entry in groupedIntoEntries() {
+            if case .series(let show) = entry, show.id == id { return show }
+        }
+        return nil
     }
 }
