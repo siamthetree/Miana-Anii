@@ -251,5 +251,56 @@ final class MetadataService {
         let isTV = season != nil || hasSeasonKeyword
         let searchType = isTV ? "tv" : "movie"
         
-        var components = URLComponents(string: "\(baseURL)/search/\(searchType)")!
-        components.queryItems = [URLQueryItem(name: "api_key", value: apiKey), URLQueryItem(name: "query", value: cleanTitle),
+             var components = URLComponents(string: "\(baseURL)/search/\(searchType)")!
+        
+        // 1. Close the array properly
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey), 
+            URLQueryItem(name: "query", value: cleanTitle)
+        ]
+        
+        // 2. Perform the network request
+        guard let url = components.url else { return nil }
+        
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            let response = try JSONDecoder().decode(TMDBResponse.self, from: data)
+            
+            guard let firstResult = response.results.first else { return nil }
+            
+            // 3. Construct MediaMetadata (which uses the 'episode' variable)
+            var metadata = MediaMetadata(
+                tmdbID: firstResult.id,
+                title: firstResult.title ?? firstResult.name ?? cleanTitle,
+                overview: firstResult.overview ?? "",
+                posterURL: firstResult.poster_path.flatMap { URL(string: "\(imageBaseURL)\($0)") },
+                backdropURL: firstResult.backdrop_path.flatMap { URL(string: "\(imageBaseURL)\($0)") },
+                releaseYear: String((firstResult.release_date ?? firstResult.first_air_date ?? "").prefix(4)),
+                isTVShow: isTV,
+                season: season,
+                episode: episode 
+            )
+            
+            // Optionally fetch details for rating, genres, and cast
+            let detailURL = URL(string: "\(baseURL)/\(searchType)/\(firstResult.id)?api_key=\(apiKey)&append_to_response=credits")!
+            if let (detailData, _) = try? await URLSession.shared.data(from: detailURL),
+               let detail = try? JSONDecoder().decode(TMDBDetailResponse.self, from: detailData) {
+                
+                metadata.rating = detail.vote_average
+                metadata.genres = detail.genres?.map { $0.name } ?? []
+                metadata.cast = detail.credits?.cast?.prefix(10).map { cast in
+                    CastMember(
+                        name: cast.name, 
+                        profileURL: cast.profile_path.flatMap { URL(string: "\(profileBaseURL)\($0)") }
+                    )
+                } ?? []
+            }
+            
+            return metadata
+            
+        } catch {
+            print("TMDB Fetch Error: \(error)")
+            return nil
+        }
+    }
+}
