@@ -2,9 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
-    @ObservedObject private var trakt = TraktService.shared 
-}
-
+    @ObservedObject private var trakt = TraktService.shared
 
     var body: some View {
         NavigationStack {
