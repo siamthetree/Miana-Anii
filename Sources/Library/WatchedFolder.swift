@@ -50,6 +50,5 @@ final class FolderWatcher {
     }
 
     func stopAll() {
-        for id in handles.keys { stop(folderID: id) }
+        for id in Array(handles.keys) { stop(folderID: id) }
     }
-}
