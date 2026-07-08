@@ -19,11 +19,14 @@ struct MediaItem: Identifiable, Codable, Hashable {
     var lastPosition: Double = 0
     var lastPlayed: Date? = nil
     var metadata: MediaMetadata? = nil
+    var folderID: UUID? = nil
+    var relativePath: String? = nil
 
     var progress: Double { guard duration > 0 else { return 0 }; return min(max(lastPosition / duration, 0), 1) }
     var isWatched: Bool { duration > 0 && progress >= 0.95 }
     var fileExtension: String { (fileName as NSString).pathExtension.lowercased() }
     var isAudio: Bool { MediaKinds.audio.contains(fileExtension) }
+    var isExternal: Bool { folderID != nil }
     var isEngineSupported: Bool { MediaKinds.native.contains(fileExtension) }
 }
 
