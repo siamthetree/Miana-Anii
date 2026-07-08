@@ -23,6 +23,7 @@ struct LibraryView: View {
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.scenePhase) private var scenePhase
     @State private var showImporter = false
+    @State private var showFolderPicker = false
     @State private var showSettings = false
     @State private var searchText = ""
     @State private var sort: LibrarySort = .recent
@@ -50,13 +51,21 @@ struct LibraryView: View {
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
                     sortMenu
-                    Button { showImporter = true } label: { Image(systemName: "plus") }
+                    Menu {
+                        Button { showImporter = true } label: { Label("Import Files", systemImage: "doc.badge.plus") }
+                        Button { showFolderPicker = true } label: { Label("Add Watched Folder", systemImage: "folder.badge.plus") }
+                    } label: { Image(systemName: "plus") }
+
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
             }
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { r in
+               .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { r in
             if case .success(let urls) = r { Task { await store.importFiles(urls) } }
+        }
+        .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result { Task { await store.addFolder(url) } }
+        }
         }
         .fullScreenCover(item: $playing) { item in PlayerScreen(item: item, store: store) }
         .sheet(item: $route) { destination in
