@@ -1,4 +1,4 @@
-Import
+Import foundation
 struct MediaDetailView: View {
     let item: MediaItem
     @Environment(\.dismiss) private var dismiss
