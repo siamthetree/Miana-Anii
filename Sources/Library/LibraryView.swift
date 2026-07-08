@@ -91,14 +91,19 @@ struct LibraryView: View {
     // MARK: - Sections
 
     private var libraryList: some View {
-        ScrollView {
+        // Grouped once per redraw and handed down, rather than rebuilt by every
+        // computed property that happens to need it.
+        let grouped = store.items.groupedIntoEntries()
+        let upNext = searchText.isEmpty ? Self.continueWatching(in: grouped) : []
+
+        return ScrollView {
             LazyVStack(alignment: .leading, spacing: 26) {
-                if searchText.isEmpty && !continueItems.isEmpty {
+                if !upNext.isEmpty {
                     sectionHeader("Continue Watching")
-                    continueRow
+                    continueRow(upNext)
                 }
                 sectionHeader(searchText.isEmpty ? "Library" : "Results")
-                grid
+                grid(grouped)
             }
             .padding(.horizontal)
             .padding(.top, 6)
@@ -110,10 +115,10 @@ struct LibraryView: View {
         Text(text).font(.title3.weight(.semibold)).foregroundStyle(.white)
     }
 
-    private var continueRow: some View {
+    private func continueRow(_ items: [MediaItem]) -> some View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 14) {
-                ForEach(continueItems) { item in
+                ForEach(items) { item in
                     Button { route = .detail(item) } label: {
                         ContinueCard(item: item, thumbURL: store.thumbURL(for: item))
                     }
@@ -125,11 +130,11 @@ struct LibraryView: View {
         }
     }
 
-    private var grid: some View {
+    private func grid(_ grouped: [LibraryEntry]) -> some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 132, maximum: 190), spacing: 16)],
                   alignment: .leading, spacing: 20) {
             if searchText.isEmpty {
-                ForEach(entries) { entry in
+                ForEach(sorted(grouped)) { entry in
                     switch entry {
                     case .movie(let item):
                         Button { route = .detail(item) } label: {
@@ -209,14 +214,32 @@ struct LibraryView: View {
 
     // MARK: - Data
 
-    private var continueItems: [MediaItem] {
-        store.items
-            .filter { $0.lastPosition > 20 && $0.duration > 0 && !$0.isWatched }
-            .sorted { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
+    /// A movie you left half-finished, and for every show you have started,
+    /// either the episode you paused or the next one you have not seen.
+    ///
+    /// A never-started show stays out. A finished show stays out. An episode
+    /// that has never been played carries no lastPlayed date of its own, so it
+    /// sorts by when you last watched anything from that show.
+    private static func continueWatching(in grouped: [LibraryEntry]) -> [MediaItem] {
+        var candidates: [(item: MediaItem, watchedAt: Date)] = []
+
+        for entry in grouped {
+            switch entry {
+            case .movie(let item):
+                guard item.lastPosition > 20, item.duration > 0, !item.isWatched else { continue }
+                candidates.append((item, item.lastPlayed ?? item.dateAdded))
+
+            case .series(let show):
+                guard let episode = show.continueEpisode else { continue }
+                candidates.append((episode, episode.lastPlayed ?? show.lastPlayed ?? episode.dateAdded))
+            }
+        }
+
+        return candidates.sorted { $0.watchedAt > $1.watchedAt }.map(\.item)
     }
 
-    private var entries: [LibraryEntry] {
-        var result = store.items.groupedIntoEntries()
+    private func sorted(_ grouped: [LibraryEntry]) -> [LibraryEntry] {
+        var result = grouped
         switch sort {
         case .recent:
             result.sort { $0.dateAdded > $1.dateAdded }
@@ -441,11 +464,13 @@ struct ContinueCard: View {
                             .foregroundStyle(.white.opacity(0.92))
                     )
 
-                ZStack(alignment: .leading) {
-                    Rectangle().fill(Color.white.opacity(0.25))
-                    Rectangle().fill(Color.purple).frame(width: cardWidth * item.progress)
+                if item.progress > 0.01 {
+                    ZStack(alignment: .leading) {
+                        Rectangle().fill(Color.white.opacity(0.25))
+                        Rectangle().fill(Color.purple).frame(width: cardWidth * item.progress)
+                    }
+                    .frame(height: 4)
                 }
-                .frame(height: 4)
             }
             .clipShape(RoundedRectangle(cornerRadius: 10))
 
@@ -463,6 +488,9 @@ struct ContinueCard: View {
     }
 
     private var subtitle: String {
+        guard item.progress > 0.01 else {
+            return item.isEpisode && item.episodeNumber > 0 ? "Up Next • \(item.episodeCode)" : "Up Next"
+        }
         let left = "\(formatTime(max(item.duration - item.lastPosition, 0))) left"
         if item.isEpisode, item.episodeNumber > 0 { return "\(item.episodeCode) • \(left)" }
         return left
@@ -471,6 +499,9 @@ struct ContinueCard: View {
 
 // MARK: - Artwork loader
 
+/// Draws a remote TMDB image when one exists, otherwise the locally
+/// generated frame grab. A landscape frame grab placed in a portrait
+/// frame is shown whole over a blurred copy of itself rather than cropped.
 struct ArtworkImage: View {
     let thumbURL: URL
     var remoteURL: URL? = nil
