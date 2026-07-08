@@ -1,3 +1,5 @@
+
+
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -11,6 +13,9 @@ struct SettingsView: View {
     @AppStorage("defaultRate") private var defaultRate = 1.0
     @AppStorage("autoHideInterval") private var autoHideInterval = 10.0
     @AppStorage("audioPassthrough") private var audioPassthrough = false
+    @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
+    @AppStorage("subtitleBold") private var subtitleBold = true
+    @AppStorage("subtitleBackground") private var subtitleBackground = 0.55
 
     @State private var storageText = "Calculating…"
     @State private var confirmWipe = false
@@ -36,6 +41,26 @@ struct SettingsView: View {
                         Text("30 seconds").tag(30.0)
                         Text("Never").tag(0.0)
                     }
+                }
+
+                Section {
+                    Picker("Text size", selection: $subtitleFontSize) {
+                        Text("Small").tag(18.0)
+                        Text("Medium").tag(22.0)
+                        Text("Large").tag(28.0)
+                        Text("Extra Large").tag(34.0)
+                    }
+                    Toggle("Bold text", isOn: $subtitleBold)
+                    Picker("Background", selection: $subtitleBackground) {
+                        Text("None").tag(0.0)
+                        Text("Light").tag(0.35)
+                        Text("Medium").tag(0.55)
+                        Text("Solid").tag(0.85)
+                    }
+                } header: {
+                    Text("Subtitles")
+                } footer: {
+                    Text("Applies to .srt files sitting next to a video, and to any you load from the player. Subtitle tracks embedded inside an mkv are drawn by VLC itself, underneath the interface, and ignore these settings.")
                 }
 
                 Section {
