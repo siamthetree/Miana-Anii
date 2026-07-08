@@ -2,7 +2,7 @@ name: MinaAnii
 options:
   bundleIdPrefix: com.polao
   deploymentTarget:
-    iOS: "16.0"
+    iOS: "18.0"
   createIntermediateGroups: true
 
 packages:
