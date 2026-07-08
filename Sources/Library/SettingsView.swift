@@ -37,7 +37,17 @@ struct SettingsView: View {
                     else { if let authURL = trakt.authorizationURL { Link("Connect to Trakt", destination: authURL) } }
                 }
                 
-                Section("Library") { LabeledContent("Storage used", value: storageText); Button("Rescan for new files") { Task { await store.rescan(); storageText = store.storageString() } }; Button("Clear watch history") { store.clearProgress() }; Button("Delete all media", role: .destructive) { confirmWipe = true } }
+                Section("Library") {
+                    LabeledContent("Storage used", value: storageText)
+                    Button("Rescan for new files") { Task { await store.rescan(); storageText = store.storageString() } }
+                    Button(refreshing ? "Refreshing…" : "Refresh metadata") {
+                        refreshing = true
+                        Task { await store.refreshMetadata(); refreshing = false }
+                    }
+                    .disabled(refreshing)
+                    Button("Clear watch history") { store.clearProgress() }
+                    Button("Delete all media", role: .destructive) { confirmWipe = true }
+                }
                 Section("Adding media") { Text("Use the + button in the library, share any video to Mina Anii from another app, or drop files into On My iPad › Mina Anii with the Files app — they're picked up automatically.").font(.footnote).foregroundStyle(.secondary) }
                 Section("About") { LabeledContent("App", value: "Mina Anii"); LabeledContent("Developer", value: "Polao"); LabeledContent("Version", value: "1.0 (1)") }
             }
