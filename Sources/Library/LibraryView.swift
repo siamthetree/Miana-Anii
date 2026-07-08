@@ -1,3 +1,5 @@
+
+
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -108,6 +110,7 @@ struct LibraryView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                    .accessibilityLabel("Settings")
             }
         }
     }
@@ -142,6 +145,7 @@ struct LibraryView: View {
                     Button { showImporter = true } label: { Label("Import Files", systemImage: "doc.badge.plus") }
                     Button { showFolderPicker = true } label: { Label("Add Media Source", systemImage: "folder.badge.plus") }
                 } label: { Image(systemName: "plus") }
+                .accessibilityLabel("Add media")
             }
         }
         .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { r in
@@ -198,6 +202,7 @@ struct LibraryView: View {
                         ContinueCard(item: item, thumbURL: store.thumbURL(for: item))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(spokenLabel(for: item))
                     .contextMenu { contextButtons(for: item) }
                 }
             }
@@ -216,6 +221,7 @@ struct LibraryView: View {
                             MediaCard(item: item, thumbURL: store.thumbURL(for: item))
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel(spokenLabel(for: item))
                         .contextMenu { contextButtons(for: item) }
 
                     case .series(let show):
@@ -223,6 +229,7 @@ struct LibraryView: View {
                             SeriesCard(series: show)
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel(spokenLabel(for: show))
                         .contextMenu { seriesButtons(for: show) }
                     }
                 }
@@ -232,6 +239,7 @@ struct LibraryView: View {
                         MediaCard(item: item, thumbURL: store.thumbURL(for: item))
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(spokenLabel(for: item))
                     .contextMenu { contextButtons(for: item) }
                 }
             }
@@ -270,11 +278,14 @@ struct LibraryView: View {
         Menu {
             Picker("Sort", selection: $sort) { ForEach(LibrarySort.allCases) { s in Text(s.rawValue).tag(s) } }
         } label: { Image(systemName: "arrow.up.arrow.down") }
+        .accessibilityLabel("Sort")
+        .accessibilityValue(sort.rawValue)
     }
 
     private var emptyState: some View {
         VStack(spacing: 18) {
             Image(systemName: "film.stack").font(.system(size: 64)).foregroundStyle(.purple)
+                .accessibilityHidden(true)
             Text("Your library is empty").font(.title2.weight(.semibold))
             Text("Import videos with the + button, share files to Mina Anii from any app, or drop them into On My iPad › Mina Anii using the Files app.")
                 .font(.subheadline).foregroundStyle(.secondary)
@@ -285,6 +296,30 @@ struct LibraryView: View {
             .buttonStyle(.borderedProminent)
         }
         .padding().frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Accessibility
+
+    /// A card is a poster, a duration pill, a progress bar and two lines of text.
+    /// VoiceOver would read all of it, in whatever order it found. One sentence
+    /// each instead.
+    private func spokenLabel(for item: MediaItem) -> String {
+        var parts = [item.metadata?.title ?? item.title]
+        if item.isEpisode, item.episodeNumber > 0 {
+            parts.append("season \(item.seasonNumber), episode \(item.episodeNumber)")
+        }
+        if item.isWatched {
+            parts.append("watched")
+        } else if item.progress > 0.01 {
+            parts.append("\(Int(item.progress * 100)) percent watched")
+        }
+        return parts.joined(separator: ", ")
+    }
+
+    private func spokenLabel(for show: Series) -> String {
+        var parts = [show.title, show.subtitle.replacingOccurrences(of: " • ", with: ", ")]
+        if show.unwatchedCount > 0 { parts.append("\(show.unwatchedCount) unwatched") }
+        return parts.joined(separator: ", ")
     }
 
     // MARK: - Data
