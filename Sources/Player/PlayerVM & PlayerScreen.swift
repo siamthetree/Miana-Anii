@@ -29,16 +29,25 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if media.isEngineSupported {
             let item = AVPlayerItem(url: url); player.replaceCurrentItem(with: item); player.allowsExternalPlayback = true; player.volume = Float(volumeLevel)
             statusCancellable = item.publisher(for: \.status).receive(on: DispatchQueue.main).sink { [weak self] status in guard let self else { return }; if status == .readyToPlay, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d } }
-            endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in guard let self else { return }; self.isPlaying = false; self.showControls = true; if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) } }
+            
+            endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in 
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.isPlaying = false; self.showControls = true
+                    if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) } 
+                }
+            }
             loadSelectionGroups(for: item)
 
             timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in 
-                guard let self, !self.isScrubbing else { return }
-                self.current = time.seconds
-                if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
-                self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: time.seconds, in: self.cues) : nil
-                self.periodicSave()
-                self.checkWatchedThreshold()
+                Task { @MainActor [weak self] in
+                    guard let self, !self.isScrubbing else { return }
+                    self.current = time.seconds
+                    if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
+                    self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: time.seconds, in: self.cues) : nil
+                    self.periodicSave()
+                    self.checkWatchedThreshold()
+                }
             }
             if shouldResume { player.seek(to: CMTime(seconds: media.lastPosition, preferredTimescale: 600)); current = media.lastPosition }
         } else {
@@ -61,7 +70,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
 
-    nonisolated func mediaPlayerStateChanged(_ aNotification: Notification!) {
+    nonisolated func mediaPlayerStateChanged(_ aNotification: Notification) {
         Task { @MainActor in
             switch self.vlcPlayer.state {
             case .playing: self.isPlaying = true; if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }; if let target = self.pendingVLCSeek { self.vlcPlayer.time = VLCTime(int: Int32(target * 1000)); self.current = target; self.pendingVLCSeek = nil }
@@ -73,8 +82,16 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
     }
 
-    nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification!) {
-        Task { @MainActor in guard !self.isScrubbing else { return }; let ms = self.vlcPlayer.time.value?.doubleValue ?? 0; self.current = ms / 1000.0; if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }; self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: self.current, in: self.cues) : nil; self.periodicSave(); self.checkWatchedThreshold() }
+    nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification) {
+        Task { @MainActor in 
+            guard !self.isScrubbing else { return }
+            let ms = self.vlcPlayer.time.value?.doubleValue ?? 0
+            self.current = ms / 1000.0
+            if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }
+            self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: self.current, in: self.cues) : nil
+            self.periodicSave()
+            self.checkWatchedThreshold() 
+        }
     }
 
     private func checkWatchedThreshold() {
