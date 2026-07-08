@@ -8,37 +8,6 @@ import UniformTypeIdentifiers
 import MobileVLCKit
 import Security
 
-import Foundation
-import SwiftUI
-
-final class LibraryStore: ObservableObject {
-    @Published var items: [MediaItem] = []
-
-    func importFile(_ url: URL) async {
-        // TODO: replace with real importer
-    }
-
-    func save() {
-        // TODO: replace with real persistence
-    }
-}
-
-struct LibraryView: View {
-    @EnvironmentObject var store: LibraryStore
-
-    var body: some View {
-        NavigationStack {
-            Text("Library")
-                .navigationTitle("MinaAnii")
-        }
-    }
-}
-
-struct MediaItem: Hashable, Codable {
-    var id: UUID = UUID()
-    var metadata: MediaMetadata?
-}
-
 // ============================================================
 // MinaAniiApp.swift
 // ============================================================
