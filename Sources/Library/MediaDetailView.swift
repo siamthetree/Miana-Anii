@@ -1,4 +1,6 @@
 import Foundation
+import SwiftUI
+
 struct MediaDetailView: View {
     let item: MediaItem
     @Environment(\.dismiss) private var dismiss
@@ -48,7 +50,8 @@ struct MediaDetailView: View {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Cast").font(.title3.weight(.bold)).foregroundStyle(.white)
                             ScrollView(.horizontal, showsIndicators: false) {
-                                HStack(spacing: 10) { ForEach(cast, id: \.self) { actor in Text(actor).font(.subheadline).foregroundStyle(.white).padding(.horizontal, 16).padding(.vertical, 10).background(Color.white.opacity(0.1)).clipShape(Capsule()) } }
+                                // FIXED: actor.name instead of just actor
+                                HStack(spacing: 10) { ForEach(cast, id: \.self) { actor in Text(actor.name).font(.subheadline).foregroundStyle(.white).padding(.horizontal, 16).padding(.vertical, 10).background(Color.white.opacity(0.1)).clipShape(Capsule()) } }
                             }
                         }
                     }
