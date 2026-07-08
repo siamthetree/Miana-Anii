@@ -53,7 +53,7 @@ struct LibraryView: View {
                     sortMenu
                     Menu {
                         Button { showImporter = true } label: { Label("Import Files", systemImage: "doc.badge.plus") }
-                        Button { showFolderPicker = true } label: { Label("Add Watched Folder", systemImage: "folder.badge.plus") }
+                        Button { showFolderPicker = true } label: { Label("Add Media Source", systemImage: "folder.badge.plus") }
                     } label: { Image(systemName: "plus") }
                     Button { showSettings = true } label: { Image(systemName: "gearshape") }
                 }
@@ -470,10 +470,7 @@ struct ContinueCard: View {
 }
 
 // MARK: - Artwork loader
-
-/// Draws a remote TMDB image when one exists, otherwise the locally
-/// generated frame grab. A landscape frame grab placed in a portrait
-/// frame is shown whole over a blurred copy of itself rather than cropped.
+.
 struct ArtworkImage: View {
     let thumbURL: URL
     var remoteURL: URL? = nil
