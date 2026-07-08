@@ -12,51 +12,45 @@ final class LibraryStore: ObservableObject {
     }
 
     func importFile(_ externalURL: URL) async {
-    do {
-        let importedURL = try copyToDocumentsIfNeeded(externalURL)
-        let filename = importedURL.deletingPathExtension().lastPathComponent
+        do {
+            let importedURL = try copyToDocumentsIfNeeded(externalURL)
+            let filename = importedURL.deletingPathExtension().lastPathComponent
 
-        if items.contains(where: { $0.fileURL == importedURL }) { return }
+            if items.contains(where: { $0.fileURL == importedURL }) { return }
 
-        // CLEAN THE TITLE for TMDB
-        var cleanTitle = filename.replacingOccurrences(of: ".", with: " ")
-                                 .replacingOccurrences(of: "_", with: " ")
-        
-        // Optional: Remove common scene tags using Regex
-let pattern = "(1080p|720p|4k|2160p|x264|x265|blu-?ray|web-?dl|\\[.*\\]|\\(.*\\))"
-if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-    // FIX: Use location and length for the NSRange
-    let range = NSRange(location: 0, length: cleanTitle.utf16.count)
-    cleanTitle = regex.stringByReplacingMatches(in: cleanTitle, options: [], range: range, withTemplate: "")
-}
+            var cleanTitle = filename.replacingOccurrences(of: ".", with: " ")
+                                     .replacingOccurrences(of: "_", with: " ")
+            
+            let pattern = "(1080p|720p|4k|2160p|x264|x265|blu-?ray|web-?dl|\\[.*\\]|\\(.*\\))"
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let range = NSRange(location: 0, length: cleanTitle.utf16.count)
+                cleanTitle = regex.stringByReplacingMatches(in: cleanTitle, options: [], range: range, withTemplate: "")
+            }
+            cleanTitle = cleanTitle.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        cleanTitle = cleanTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            var item = MediaItem(title: filename, fileURL: importedURL)
 
-        var item = MediaItem(title: filename, fileURL: importedURL)
+            if let metadata = await MetadataService.fetchMetadata(
+                for: importedURL.lastPathComponent,
+                cleanTitle: cleanTitle
+            ) {
+                item.metadata = metadata
+            }
 
-        if let metadata = await MetadataService.fetchMetadata(
-            for: importedURL.lastPathComponent,
-            cleanTitle: cleanTitle // <--- Pass the cleaned title here
-        ) {
-            item.metadata = metadata
+            items.insert(item, at: 0)
+            save()
+        } catch {
+            print("Import failed: \(error)")
         }
-
-        items.insert(item, at: 0)
-        save()
-    } catch {
-        print("Import failed: \(error)")
     }
-}
 
     func remove(at offsets: IndexSet) {
         let removed = offsets.map { items[$0] }
         items.remove(atOffsets: offsets)
 
-        // Optional: delete local file
         for item in removed {
             try? FileManager.default.removeItem(at: item.fileURL)
         }
-
         save()
     }
 
@@ -90,13 +84,14 @@ if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensit
     }
 
     private func copyToDocumentsIfNeeded(_ sourceURL: URL) throws -> URL {
-    let started = sourceURL.startAccessingSecurityScopedResource()
-    defer { if started { sourceURL.stopAccessingSecurityScopedResource() } }
+        let started = sourceURL.startAccessingSecurityScopedResource()
+        defer { if started { sourceURL.stopAccessingSecurityScopedResource() } }
 
-    let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-    let dest = docs.appendingPathComponent(sourceURL.lastPathComponent)
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let dest = docs.appendingPathComponent(sourceURL.lastPathComponent)
 
-    if FileManager.default.fileExists(atPath: dest.path) { return dest }
-    try FileManager.default.copyItem(at: sourceURL, to: dest)
-    return dest
+        if FileManager.default.fileExists(atPath: dest.path) { return dest }
+        try FileManager.default.copyItem(at: sourceURL, to: dest)
+        return dest
+    }
 }
