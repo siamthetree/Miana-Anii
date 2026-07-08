@@ -1,4 +1,6 @@
-
+import Foundation
+import SwiftUI
+import UniformTypeIdentifiers
 
 enum LibrarySort: String, CaseIterable, Identifiable { case recent = "Recently Added", title = "Title", lastPlayed = "Last Played"; var id: String { rawValue } }
 
@@ -137,3 +139,4 @@ struct ThumbImage: View {
         }.task(id: url) { if metadata?.posterURL == nil { image = await Self.load(url) } }
     }
     static func load(_ url: URL) async -> UIImage? { let path = url.path; return await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value }
+}
