@@ -1,9 +1,11 @@
-
 import SwiftUI
 
-
 struct SettingsView: View {
-    @EnvironmentObject private var store: LibraryStore; @Environment(\.dismiss) private var dismiss; @StateObject private var trakt = TraktService.shared
+    @EnvironmentObject private var store: LibraryStore
+    @Environment(\.dismiss) private var dismiss
+    
+    // FIXED: Changed StateObject to ObservedObject
+    @ObservedObject private var trakt = TraktService.shared
     
     @AppStorage("autoResume") private var autoResume = true
     @AppStorage("defaultRate") private var defaultRate = 1.0
@@ -22,7 +24,6 @@ struct SettingsView: View {
                         ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Text(String(format: "%.2gx", r)).tag(r) } 
                     } 
                     
-                    // NEW: Allows you to control how long until the buttons auto-hide
                     Picker("Auto-hide controls", selection: $autoHideInterval) {
                         Text("3 seconds").tag(3.0)
                         Text("5 seconds").tag(5.0)
