@@ -1,3 +1,4 @@
+
 import Foundation
 
 enum MediaKinds {
@@ -169,6 +170,23 @@ struct Series: Identifiable {
         let seasonText = count == 1 ? "1 season" : "\(count) seasons"
         let episodeText = episodeCount == 1 ? "1 episode" : "\(episodeCount) episodes"
         return "\(seasonText) • \(episodeText)"
+    }
+
+    /// What Continue Watching should offer for this show, or nil when there is
+    /// nothing to continue. A half-finished episode wins. Failing that, if you
+    /// have finished at least one episode, the next unwatched one. A show you
+    /// have never started does not belong in the row at all.
+    var continueEpisode: MediaItem? {
+        let ordered = seasons.flatMap(\.episodes)
+
+        if let inProgress = ordered
+            .filter({ $0.progress > 0.01 && !$0.isWatched })
+            .max(by: { ($0.lastPlayed ?? .distantPast) < ($1.lastPlayed ?? .distantPast) }) {
+            return inProgress
+        }
+
+        guard ordered.contains(where: { $0.isWatched }) else { return nil }
+        return ordered.first(where: { !$0.isWatched })
     }
 
     /// Half-watched episode first, then the earliest unwatched one.
