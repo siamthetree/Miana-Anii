@@ -12,6 +12,7 @@ struct SettingsView: View {
     
     @State private var storageText = "Calculating…"
     @State private var confirmWipe = false
+    @State private var refreshing = false
 
     var body: some View {
         NavigationStack {
