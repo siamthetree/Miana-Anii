@@ -1,3 +1,4 @@
+
 import Foundation
 import SwiftUI
 import UIKit
@@ -17,7 +18,8 @@ final class LibraryStore: ObservableObject {
     private let indexURL: URL
     private let foldersURL: URL
 
-  
+    /// Resolved, access-started URL for each watched folder. Missing key means
+    /// the folder could not be reached this launch.
     private var folderURLs: [UUID: URL] = [:]
     private let watcher = FolderWatcher()
     private var debouncedScan: Task<Void, Never>?
@@ -117,7 +119,8 @@ final class LibraryStore: ObservableObject {
         }
 
         watcher.watch(folderID: folder.id, directories: directories(under: url)) { [weak self] in
-            Task { @MainActor in self?.scheduleFolderScan() }
+            guard let self else { return }
+            Task { @MainActor in self.scheduleFolderScan() }
         }
     }
 
@@ -138,7 +141,8 @@ final class LibraryStore: ObservableObject {
         await scanFolders()
     }
 
- 
+    /// Forgets the folder and drops its library entries. Never touches the
+    /// files on disk.
     func removeFolder(_ folder: WatchedFolder) {
         watcher.stop(folderID: folder.id)
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
@@ -153,7 +157,8 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
-    
+    /// Coalesces a burst of filesystem events into one scan, and gives a file
+    /// that is still being copied a couple of seconds to finish.
     private func scheduleFolderScan() {
         debouncedScan?.cancel()
         debouncedScan = Task { [weak self] in
@@ -183,7 +188,8 @@ final class LibraryStore: ObservableObject {
                 await ingest(fileURL: file, folderID: folder.id, relativePath: relative)
             }
             watcher.watch(folderID: folder.id, directories: directories(under: root)) { [weak self] in
-                Task { @MainActor in self?.scheduleFolderScan() }
+                guard let self else { return }
+                Task { @MainActor in self.scheduleFolderScan() }
             }
         }
 
