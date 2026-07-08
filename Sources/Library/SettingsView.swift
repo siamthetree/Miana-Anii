@@ -53,6 +53,7 @@ struct SettingsView: View {
                             let doomed = offsets.map { store.folders[$0] }
                             for folder in doomed { store.removeFolder(folder) }
                         }
+                    }
 
                     Button { showFolderPicker = true } label: {
                         Label("Add Folder", systemImage: "folder.badge.plus")
