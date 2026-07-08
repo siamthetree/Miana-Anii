@@ -10,6 +10,7 @@ struct SettingsView: View {
     @AppStorage("autoResume") private var autoResume = true
     @AppStorage("defaultRate") private var defaultRate = 1.0
     @AppStorage("autoHideInterval") private var autoHideInterval = 10.0
+    @AppStorage("audioPassthrough") private var audioPassthrough = false
 
     @State private var storageText = "Calculating…"
     @State private var confirmWipe = false
@@ -35,6 +36,14 @@ struct SettingsView: View {
                         Text("30 seconds").tag(30.0)
                         Text("Never").tag(0.0)
                     }
+                }
+
+                Section {
+                    Toggle("Audio passthrough", isOn: $audioPassthrough)
+                } header: {
+                    Text("Audio")
+                } footer: {
+                    Text("Sends Dolby Digital and DTS soundtracks to your receiver untouched, instead of decoding them on the iPad. Only turn this on when the iPad is wired to something that can decode them, over USB-C to HDMI or a digital receiver. Leave it on with AirPods or the built-in speaker and those soundtracks fall silent. Takes effect the next time you open a file.")
                 }
 
                 Section {
