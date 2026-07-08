@@ -7,6 +7,18 @@ enum LibrarySort: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum LibraryRoute: Identifiable {
+    case detail(MediaItem)
+    case series(Series)
+
+    var id: String {
+        switch self {
+        case .detail(let item): return "detail-" + item.id.uuidString
+        case .series(let show): return "series-" + show.id
+        }
+    }
+}
+
 struct LibraryView: View {
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.scenePhase) private var scenePhase
@@ -16,7 +28,7 @@ struct LibraryView: View {
     @State private var sort: LibrarySort = .recent
 
     @State private var playing: MediaItem?
-    @State private var detailedItem: MediaItem?
+    @State private var route: LibraryRoute?
 
     @State private var renaming: MediaItem?
     @State private var renameText = ""
@@ -47,7 +59,14 @@ struct LibraryView: View {
             if case .success(let urls) = r { Task { await store.importFiles(urls) } }
         }
         .fullScreenCover(item: $playing) { item in PlayerScreen(item: item, store: store) }
-        .sheet(item: $detailedItem) { item in MediaDetailView(item: item, playingItem: $playing) }
+        .sheet(item: $route) { destination in
+            switch destination {
+            case .detail(let item):
+                MediaDetailView(item: item, playingItem: $playing)
+            case .series(let show):
+                SeriesDetailView(series: show, playingItem: $playing).environmentObject(store)
+            }
+        }
         .sheet(isPresented: $showSettings) { SettingsView().environmentObject(store) }
         .alert("Rename", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })) {
             TextField("Title", text: $renameText)
@@ -86,7 +105,7 @@ struct LibraryView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             LazyHStack(alignment: .top, spacing: 14) {
                 ForEach(continueItems) { item in
-                    Button { detailedItem = item } label: {
+                    Button { route = .detail(item) } label: {
                         ContinueCard(item: item, thumbURL: store.thumbURL(for: item))
                     }
                     .buttonStyle(.plain)
@@ -100,15 +119,37 @@ struct LibraryView: View {
     private var grid: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 132, maximum: 190), spacing: 16)],
                   alignment: .leading, spacing: 20) {
-            ForEach(filteredItems) { item in
-                Button { detailedItem = item } label: {
-                    MediaCard(item: item, thumbURL: store.thumbURL(for: item))
+            if searchText.isEmpty {
+                ForEach(entries) { entry in
+                    switch entry {
+                    case .movie(let item):
+                        Button { route = .detail(item) } label: {
+                            MediaCard(item: item, thumbURL: store.thumbURL(for: item))
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu { contextButtons(for: item) }
+
+                    case .series(let show):
+                        Button { route = .series(show) } label: {
+                            SeriesCard(series: show)
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu { seriesButtons(for: show) }
+                    }
                 }
-                .buttonStyle(.plain)
-                .contextMenu { contextButtons(for: item) }
+            } else {
+                ForEach(searchResults) { item in
+                    Button { route = .detail(item) } label: {
+                        MediaCard(item: item, thumbURL: store.thumbURL(for: item))
+                    }
+                    .buttonStyle(.plain)
+                    .contextMenu { contextButtons(for: item) }
+                }
             }
         }
     }
+
+    // MARK: - Menus
 
     @ViewBuilder
     private func contextButtons(for item: MediaItem) -> some View {
@@ -121,6 +162,19 @@ struct LibraryView: View {
             Button { store.markWatched(item) } label: { Label("Mark as Watched", systemImage: "eye") }
         }
         Button(role: .destructive) { store.delete(item) } label: { Label("Delete", systemImage: "trash") }
+    }
+
+    @ViewBuilder
+    private func seriesButtons(for show: Series) -> some View {
+        if let next = show.nextUp {
+            Button { playing = next } label: {
+                Label("Play \(next.episodeCode)", systemImage: "play.fill")
+            }
+        }
+        Button { route = .series(show) } label: { Label("Show Episodes", systemImage: "list.bullet") }
+        Button { for episode in show.episodes { store.markWatched(episode) } } label: {
+            Label("Mark Series as Watched", systemImage: "eye")
+        }
     }
 
     private var sortMenu: some View {
@@ -152,27 +206,106 @@ struct LibraryView: View {
             .sorted { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
     }
 
-    private var filteredItems: [MediaItem] {
-        var result = store.items
-        if !searchText.isEmpty {
-            result = result.filter {
-                $0.title.localizedCaseInsensitiveContains(searchText) ||
-                $0.fileName.localizedCaseInsensitiveContains(searchText)
-            }
-        }
+    private var entries: [LibraryEntry] {
+        var result = store.items.groupedIntoEntries()
         switch sort {
         case .recent:
             result.sort { $0.dateAdded > $1.dateAdded }
         case .title:
-            result.sort { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
+            result.sort { $0.sortTitle.localizedCaseInsensitiveCompare($1.sortTitle) == .orderedAscending }
         case .lastPlayed:
             result.sort { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
         }
         return result
     }
+
+    private var searchResults: [MediaItem] {
+        store.items
+            .filter {
+                $0.title.localizedCaseInsensitiveContains(searchText) ||
+                $0.fileName.localizedCaseInsensitiveContains(searchText) ||
+                ($0.metadata?.title ?? "").localizedCaseInsensitiveContains(searchText)
+            }
+            .sorted { $0.dateAdded > $1.dateAdded }
+    }
 }
 
-// MARK: - Portrait card
+// MARK: - Series card
+
+struct SeriesCard: View {
+    let series: Series
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Color.clear
+                .aspectRatio(2.0 / 3.0, contentMode: .fit)
+                .overlay(SeriesPoster(posterURL: series.posterURL))
+                .overlay(alignment: .topTrailing) { countBadge }
+                .overlay(alignment: .bottomLeading) { unwatchedBadge }
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .shadow(color: .black.opacity(0.4), radius: 6, y: 3)
+
+            Text(series.title)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+                .foregroundStyle(.white)
+
+            Text(series.subtitle)
+                .font(.caption2)
+                .lineLimit(1)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var countBadge: some View {
+        Label("\(series.episodeCount)", systemImage: "square.stack.fill")
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 6).padding(.vertical, 3)
+            .background(.black.opacity(0.65), in: Capsule())
+            .padding(6)
+    }
+
+    @ViewBuilder
+    private var unwatchedBadge: some View {
+        if series.unwatchedCount > 0 && series.unwatchedCount < series.episodeCount {
+            Text("\(series.unwatchedCount) new")
+                .font(.caption2.weight(.bold))
+                .foregroundStyle(.white)
+                .padding(.horizontal, 7).padding(.vertical, 3)
+                .background(.purple, in: Capsule())
+                .padding(6)
+        }
+    }
+}
+
+/// A show has no local frame grab of its own, so this is poster or nothing.
+struct SeriesPoster: View {
+    let posterURL: URL?
+
+    var body: some View {
+        ZStack {
+            Rectangle().fill(
+                LinearGradient(colors: [Color(white: 0.18), Color(white: 0.10)],
+                               startPoint: .top, endPoint: .bottom)
+            )
+            if let posterURL {
+                AsyncImage(url: posterURL, transaction: Transaction(animation: .easeIn(duration: 0.18))) { phase in
+                    switch phase {
+                    case .success(let image): image.resizable().scaledToFill()
+                    case .empty: ProgressView().tint(.white.opacity(0.5))
+                    default: Image(systemName: "tv").font(.system(size: 30)).foregroundStyle(.secondary)
+                    }
+                }
+            } else {
+                Image(systemName: "tv").font(.system(size: 30)).foregroundStyle(.secondary)
+            }
+        }
+        .clipped()
+    }
+}
+
+// MARK: - Portrait card (single file: movie, or episode inside search results)
 
 struct MediaCard: View {
     let item: MediaItem
@@ -258,8 +391,8 @@ struct MediaCard: View {
 
     private var caption: String {
         var parts: [String] = []
-        if let m = item.metadata, m.isTVShow, let s = m.season, let e = m.episode {
-            parts.append(String(format: "S%02dE%02d", s, e))
+        if item.isEpisode, item.episodeNumber > 0 {
+            parts.append(item.episodeCode)
         } else if let year = item.metadata?.releaseYear, !year.isEmpty {
             parts.append(year)
         }
@@ -322,9 +455,7 @@ struct ContinueCard: View {
 
     private var subtitle: String {
         let left = "\(formatTime(max(item.duration - item.lastPosition, 0))) left"
-        if let m = item.metadata, m.isTVShow, let s = m.season, let e = m.episode {
-            return String(format: "S%02dE%02d • %@", s, e, left)
-        }
+        if item.isEpisode, item.episodeNumber > 0 { return "\(item.episodeCode) • \(left)" }
         return left
     }
 }
