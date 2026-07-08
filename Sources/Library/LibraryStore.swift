@@ -17,8 +17,7 @@ final class LibraryStore: ObservableObject {
     private let indexURL: URL
     private let foldersURL: URL
 
-    /// Resolved, access-started URL for each watched folder. Missing key means
-    /// the folder could not be reached this launch.
+  
     private var folderURLs: [UUID: URL] = [:]
     private let watcher = FolderWatcher()
     private var debouncedScan: Task<Void, Never>?
@@ -139,8 +138,7 @@ final class LibraryStore: ObservableObject {
         await scanFolders()
     }
 
-    /// Forgets the folder and drops its library entries. Never touches the
-    /// files on disk.
+ 
     func removeFolder(_ folder: WatchedFolder) {
         watcher.stop(folderID: folder.id)
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
@@ -155,14 +153,13 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
-    /// Coalesces a burst of filesystem events into one scan, and gives a file
-    /// that is still being copied a couple of seconds to finish.
+    
     private func scheduleFolderScan() {
         debouncedScan?.cancel()
-        debouncedScan = Task { @MainActor in
+        debouncedScan = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 2_000_000_000)
-            guard !Task.isCancelled else { return }
-            await scanFolders()
+            guard !Task.isCancelled, let self else { return }
+            await self.scanFolders()
         }
     }
 
