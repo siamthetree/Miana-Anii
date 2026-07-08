@@ -4,7 +4,7 @@ import UIKit
 import UniformTypeIdentifiers
 
 
-MainActor
+@MainActor
 final class LibraryStore: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     private let fm = FileManager.default
