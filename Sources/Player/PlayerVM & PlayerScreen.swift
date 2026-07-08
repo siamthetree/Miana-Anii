@@ -467,6 +467,10 @@ struct PlayerScreen: View {
     @State private var dragStartValue: Double = 0
     @State private var seekTarget: Double = 0
     @State private var isWindowed = false
+
+    @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
+    @AppStorage("subtitleBold") private var subtitleBold = true
+    @AppStorage("subtitleBackground") private var subtitleBackground = 0.55
     private enum DragMode { case none, seek, volume, brightness }
 
     init(item: MediaItem, store: LibraryStore) { _vm = StateObject(wrappedValue: PlayerVM(media: item, store: store)) }
@@ -517,13 +521,27 @@ struct PlayerScreen: View {
         .preferredColorScheme(.dark)
     }
 
+    /// Styles the external .srt overlay. VLC draws embedded subtitle tracks into
+    /// the video itself, well below SwiftUI, so none of this reaches them.
     private var subtitleOverlay: some View {
         VStack {
             Spacer()
             if vm.subtitlesOn, let cue = vm.cueText {
-                Text(cue).font(.system(size: 22, weight: .semibold)).multilineTextAlignment(.center).foregroundStyle(.white).padding(.horizontal, 14).padding(.vertical, 8).background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 8)).padding(.horizontal, 24)
+                Text(cue)
+                    .font(.system(size: subtitleFontSize, weight: subtitleBold ? .semibold : .regular))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(subtitleBackground < 0.05 ? 0.9 : 0), radius: 3, y: 1)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(subtitleBackground), in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.horizontal, 24)
             }
-        }.padding(.bottom, vm.showControls ? 140 : 44).animation(.easeInOut(duration: 0.2), value: vm.showControls).allowsHitTesting(false)
+        }
+        .padding(.bottom, vm.showControls ? 140 : 44)
+        .animation(.easeInOut(duration: 0.2), value: vm.showControls)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     private var controls: some View {
@@ -539,8 +557,18 @@ struct PlayerScreen: View {
     private var topBar: some View {
         HStack(spacing: 18) {
             Button { dismiss() } label: { Image(systemName: "xmark").font(.title3.weight(.semibold)).frame(width: 40, height: 40) }
-            Text(vm.media.title).font(.headline).lineLimit(1); Spacer(); RoutePickerView().frame(width: 40, height: 40)
+                .accessibilityLabel("Close player")
+
+            Text(vm.media.title).font(.headline).lineLimit(1)
+
+            Spacer()
+
+            RoutePickerView().frame(width: 40, height: 40)
+                .accessibilityLabel("AirPlay")
+
             Button { vm.togglePiP() } label: { Image(systemName: "pip.enter").font(.title3).frame(width: 40, height: 40) }
+                .accessibilityLabel("Picture in Picture")
+
             trackMenu
         }
         .foregroundStyle(.white)
@@ -554,6 +582,7 @@ struct PlayerScreen: View {
         Menu {
             if vm.usesVLC { vlcTrackSections } else { engineTrackSections }
         } label: { Image(systemName: "captions.bubble").font(.title3).frame(width: 40, height: 40) }
+        .accessibilityLabel("Audio and subtitle tracks")
     }
 
     @ViewBuilder
@@ -600,8 +629,15 @@ struct PlayerScreen: View {
     private var centerButtons: some View {
         HStack(spacing: 58) {
             Button { vm.skip(-10) } label: { Image(systemName: "gobackward.10").font(.system(size: 34)) }
-            Button { vm.isPlaying ? vm.pause() : vm.play() } label: { Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84) }
+                .accessibilityLabel("Skip back 10 seconds")
+
+            Button { vm.isPlaying ? vm.pause() : vm.play() } label: {
+                Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 56)).frame(width: 84, height: 84)
+            }
+            .accessibilityLabel(vm.isPlaying ? "Pause" : "Play")
+
             Button { vm.skip(10) } label: { Image(systemName: "goforward.10").font(.system(size: 34)) }
+                .accessibilityLabel("Skip forward 10 seconds")
         }.foregroundStyle(.white)
     }
 
@@ -611,12 +647,19 @@ struct PlayerScreen: View {
                 Text(formatTime(vm.isScrubbing ? scrubValue : vm.current)).monospacedDigit()
                 Slider(value: Binding(get: { vm.isScrubbing ? scrubValue : vm.current }, set: { scrubValue = $0 }), in: 0...max(vm.duration, 1),
                        onEditingChanged: { e in if e { scrubValue = vm.current; vm.isScrubbing = true } else { vm.isScrubbing = false; vm.seek(to: scrubValue) } }).tint(.purple)
+                    .accessibilityLabel("Playback position")
+                    .accessibilityValue("\(formatTime(vm.current)) of \(formatTime(vm.duration))")
                 Text(formatTime(vm.duration)).monospacedDigit()
             }.font(.footnote).foregroundStyle(.white)
 
             HStack(spacing: 26) {
                 Menu { ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Button(String(format: "%.2gx", r)) { vm.setRate(r) } } } label: { Label(String(format: "%.2gx", vm.rate), systemImage: "speedometer") }
+                    .accessibilityLabel("Playback speed")
+                    .accessibilityValue(String(format: "%.2gx", vm.rate))
+
                 Button { vm.fillScreen.toggle() } label: { Image(systemName: vm.fillScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }
+                    .accessibilityLabel(vm.fillScreen ? "Fit video to screen" : "Fill screen with video")
+
                 Spacer()
             }.font(.subheadline).foregroundStyle(.white)
          }.padding(.horizontal, 16).padding(.bottom, 14)
