@@ -50,7 +50,6 @@ struct LibraryView: View {
             .searchable(text: $searchText, prompt: "Search your library")
             .toolbar {
                 ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    sortMenu
                     Menu {
                         Button { showImporter = true } label: { Label("Import Files", systemImage: "doc.badge.plus") }
                         Button { showFolderPicker = true } label: { Label("Add Watched Folder", systemImage: "folder.badge.plus") }
