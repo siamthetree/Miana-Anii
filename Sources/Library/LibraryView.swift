@@ -19,9 +19,19 @@ enum LibraryRoute: Identifiable {
     }
 }
 
+/// What the sidebar is pointing at.
+enum LibraryFilter: Hashable {
+    case all
+    case movies
+    case series
+    case source(UUID)
+}
+
 struct LibraryView: View {
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.scenePhase) private var scenePhase
+
+    @State private var filter: LibraryFilter? = .all
     @State private var showImporter = false
     @State private var showFolderPicker = false
     @State private var showSettings = false
@@ -43,29 +53,16 @@ struct LibraryView: View {
     }()
 
     var body: some View {
-        NavigationStack {
-            Group { if store.items.isEmpty { emptyState } else { libraryList } }
-            .background(Color(white: 0.06).ignoresSafeArea())
-            .navigationTitle("Mina Anii")
-            .searchable(text: $searchText, prompt: "Search your library")
-            .toolbar {
-                ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    sortMenu
-                    Menu {
-                        Button { showImporter = true } label: { Label("Import Files", systemImage: "doc.badge.plus") }
-                        Button { showFolderPicker = true } label: { Label("Add Media Source", systemImage: "folder.badge.plus") }
-                    } label: { Image(systemName: "plus") }
-                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
-                }
-            }
-            // Attached inside the NavigationStack, deliberately. Two fileImporters
-            // on the same view cancel each other out; on different views both work.
-            .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
-                if case .success(let url) = result { Task { await store.addFolder(url) } }
-            }
+        NavigationSplitView {
+            sidebar
+        } detail: {
+            detailColumn
         }
-        .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { r in
-            if case .success(let urls) = r { Task { await store.importFiles(urls) } }
+        .navigationSplitViewStyle(.balanced)
+        // Deliberately on different views. Two fileImporters on one view and
+        // SwiftUI honours only the first, silently.
+        .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
+            if case .success(let url) = result { Task { await store.addFolder(url) } }
         }
         .fullScreenCover(item: $playing) { item in PlayerScreen(item: item, store: store) }
         .sheet(item: $route) { destination in
@@ -88,13 +85,82 @@ struct LibraryView: View {
         }
     }
 
-    // MARK: - Sections
+    // MARK: - Sidebar
+
+    private var sidebar: some View {
+        List(selection: $filter) {
+            Section("Library") {
+                sidebarRow("All", "square.grid.2x2", .all, store.items.count)
+                sidebarRow("Movies", "film", .movies, movieCount)
+                sidebarRow("TV Shows", "tv", .series, showCount)
+            }
+
+            if !store.folders.isEmpty {
+                Section("Media Sources") {
+                    ForEach(store.folders) { folder in
+                        sidebarRow(folder.name, "folder", .source(folder.id), store.itemCount(in: folder))
+                    }
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .navigationTitle("Mina Anii")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button { showSettings = true } label: { Image(systemName: "gearshape") }
+            }
+        }
+    }
+
+    private func sidebarRow(_ title: String, _ icon: String, _ value: LibraryFilter, _ count: Int) -> some View {
+        Label(title, systemImage: icon)
+            .badge(count)
+            .tag(value)
+    }
+
+    private var movieCount: Int {
+        store.items.filter { !$0.isEpisode }.count
+    }
+
+    private var showCount: Int {
+        Set(store.items.compactMap(\.seriesKey)).count
+    }
+
+    // MARK: - Detail column
+
+    private var detailColumn: some View {
+        Group {
+            if store.items.isEmpty { emptyState } else { libraryList }
+        }
+        .background(Color(white: 0.06).ignoresSafeArea())
+        .navigationTitle(title(for: activeFilter))
+        .searchable(text: $searchText, prompt: "Search your library")
+        .toolbar {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                sortMenu
+                Menu {
+                    Button { showImporter = true } label: { Label("Import Files", systemImage: "doc.badge.plus") }
+                    Button { showFolderPicker = true } label: { Label("Add Media Source", systemImage: "folder.badge.plus") }
+                } label: { Image(systemName: "plus") }
+            }
+        }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: Self.importTypes, allowsMultipleSelection: true) { r in
+            if case .success(let urls) = r { Task { await store.importFiles(urls) } }
+        }
+    }
+
+    /// A source you removed while it was selected leaves a dangling filter.
+    private var activeFilter: LibraryFilter {
+        guard let filter else { return .all }
+        if case .source(let id) = filter, !store.folders.contains(where: { $0.id == id }) { return .all }
+        return filter
+    }
 
     private var libraryList: some View {
-        // Grouped once per redraw and handed down, rather than rebuilt by every
-        // computed property that happens to need it.
+        let active = activeFilter
         let grouped = store.items.groupedIntoEntries()
-        let upNext = searchText.isEmpty ? Self.continueWatching(in: grouped) : []
+        let visible = entries(for: active, in: grouped)
+        let upNext = (active == .all && searchText.isEmpty) ? Self.continueWatching(in: grouped) : []
 
         return ScrollView {
             LazyVStack(alignment: .leading, spacing: 26) {
@@ -102,8 +168,17 @@ struct LibraryView: View {
                     sectionHeader("Continue Watching")
                     continueRow(upNext)
                 }
-                sectionHeader(searchText.isEmpty ? "Library" : "Results")
-                grid(grouped)
+
+                sectionHeader(searchText.isEmpty ? title(for: active) : "Results")
+
+                if visible.isEmpty {
+                    Text("Nothing here yet")
+                        .foregroundStyle(.secondary)
+                        .padding(.vertical, 40)
+                        .frame(maxWidth: .infinity)
+                } else {
+                    grid(visible)
+                }
             }
             .padding(.horizontal)
             .padding(.top, 6)
@@ -130,11 +205,11 @@ struct LibraryView: View {
         }
     }
 
-    private func grid(_ grouped: [LibraryEntry]) -> some View {
+    private func grid(_ visible: [LibraryEntry]) -> some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 132, maximum: 190), spacing: 16)],
                   alignment: .leading, spacing: 20) {
             if searchText.isEmpty {
-                ForEach(sorted(grouped)) { entry in
+                ForEach(sorted(visible)) { entry in
                     switch entry {
                     case .movie(let item):
                         Button { route = .detail(item) } label: {
@@ -152,7 +227,7 @@ struct LibraryView: View {
                     }
                 }
             } else {
-                ForEach(searchResults) { item in
+                ForEach(searchResults(in: visible)) { item in
                     Button { route = .detail(item) } label: {
                         MediaCard(item: item, thumbURL: store.thumbURL(for: item))
                     }
@@ -214,12 +289,48 @@ struct LibraryView: View {
 
     // MARK: - Data
 
+    private func title(for filter: LibraryFilter) -> String {
+        switch filter {
+        case .all: return "Library"
+        case .movies: return "Movies"
+        case .series: return "TV Shows"
+        case .source(let id): return store.folders.first(where: { $0.id == id })?.name ?? "Library"
+        }
+    }
+
+    private func entries(for filter: LibraryFilter, in grouped: [LibraryEntry]) -> [LibraryEntry] {
+        switch filter {
+        case .all:
+            return grouped
+        case .movies:
+            return grouped.filter { if case .movie = $0 { return true } else { return false } }
+        case .series:
+            return grouped.filter { if case .series = $0 { return true } else { return false } }
+        case .source(let id):
+            return store.items.filter { $0.folderID == id }.groupedIntoEntries()
+        }
+    }
+
+    /// Search stays inside whatever the sidebar is pointing at, and flattens
+    /// shows back into episodes, which is what you want when hunting one file.
+    private func searchResults(in visible: [LibraryEntry]) -> [MediaItem] {
+        let pool = visible.flatMap { entry -> [MediaItem] in
+            switch entry {
+            case .movie(let item): return [item]
+            case .series(let show): return show.episodes
+            }
+        }
+        return pool
+            .filter {
+                $0.title.localizedCaseInsensitiveContains(searchText) ||
+                $0.fileName.localizedCaseInsensitiveContains(searchText) ||
+                ($0.metadata?.title ?? "").localizedCaseInsensitiveContains(searchText)
+            }
+            .sorted { $0.dateAdded > $1.dateAdded }
+    }
+
     /// A movie you left half-finished, and for every show you have started,
     /// either the episode you paused or the next one you have not seen.
-    ///
-    /// A never-started show stays out. A finished show stays out. An episode
-    /// that has never been played carries no lastPlayed date of its own, so it
-    /// sorts by when you last watched anything from that show.
     private static func continueWatching(in grouped: [LibraryEntry]) -> [MediaItem] {
         var candidates: [(item: MediaItem, watchedAt: Date)] = []
 
@@ -249,16 +360,6 @@ struct LibraryView: View {
             result.sort { ($0.lastPlayed ?? .distantPast) > ($1.lastPlayed ?? .distantPast) }
         }
         return result
-    }
-
-    private var searchResults: [MediaItem] {
-        store.items
-            .filter {
-                $0.title.localizedCaseInsensitiveContains(searchText) ||
-                $0.fileName.localizedCaseInsensitiveContains(searchText) ||
-                ($0.metadata?.title ?? "").localizedCaseInsensitiveContains(searchText)
-            }
-            .sorted { $0.dateAdded > $1.dateAdded }
     }
 }
 
