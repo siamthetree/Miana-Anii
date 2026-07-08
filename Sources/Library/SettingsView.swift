@@ -4,12 +4,11 @@ struct SettingsView: View {
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.dismiss) private var dismiss
     
-    // FIXED: Changed StateObject to ObservedObject
     @ObservedObject private var trakt = TraktService.shared
     
     @AppStorage("autoResume") private var autoResume = true
     @AppStorage("defaultRate") private var defaultRate = 1.0
-    @AppStorage("autoHideInterval") private var autoHideInterval = 10.0 // Custom timer option
+    @AppStorage("autoHideInterval") private var autoHideInterval = 10.0
     
     @State private var storageText = "Calculating…"
     @State private var confirmWipe = false
