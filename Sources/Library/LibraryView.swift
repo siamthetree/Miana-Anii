@@ -287,8 +287,8 @@ struct LibraryView: View {
             
             // MARK: - Dedication
             VStack(spacing: 8) {
-                Text("For Minar & Anika.")
-                    .font(.title3) // Made slightly larger since it's now the main focus
+                Text("For Minar & Anika")
+                    .font(.title3)
                     .fontWeight(.bold)
                     .foregroundStyle(.primary) 
                 
