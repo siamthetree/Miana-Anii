@@ -285,7 +285,7 @@ struct LibraryView: View {
         private var emptyState: some View { 
         VStack(spacing: 32) { 
             
-            // MARK: - Your Dedication
+            // MARK: - Dedication
             VStack(spacing: 8) {
                 Text("For Minar & Anika.")
                     .font(.title3) // Made slightly larger since it's now the main focus
@@ -293,7 +293,6 @@ struct LibraryView: View {
                     .foregroundStyle(.primary) 
                 
                 Text("For the four years that shaped us, and the separate paths that await us.")
-                    .italic()
                     .foregroundStyle(.secondary) 
                     .multilineTextAlignment(.center)
             }
