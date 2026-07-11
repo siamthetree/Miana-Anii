@@ -282,21 +282,36 @@ struct LibraryView: View {
         .accessibilityValue(sort.rawValue)
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 18) {
-            Image(systemName: "film.stack").font(.system(size: 64)).foregroundStyle(.purple)
-                .accessibilityHidden(true)
-            Text("Your library is empty").font(.title2.weight(.semibold))
-            Text("Import videos with the + button, share files to Mina Anii from any app, or drop them into On My iPad › Mina Anii using the Files app.")
-                .font(.subheadline).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).frame(maxWidth: 420)
-            Button { showImporter = true } label: {
-                Label("Import Media", systemImage: "plus").padding(.horizontal, 8)
+        private var emptyState: some View { 
+        VStack(spacing: 32) { 
+            
+            // MARK: - Your Dedication
+            VStack(spacing: 8) {
+                Text("For Minar & Anika.")
+                    .font(.title3) // Made slightly larger since it's now the main focus
+                    .fontWeight(.bold)
+                    .foregroundStyle(.primary) 
+                
+                Text("For the four years that shaped us, and the separate paths that await us.")
+                    .italic()
+                    .foregroundStyle(.secondary) 
+                    .multilineTextAlignment(.center)
             }
-            .buttonStyle(.borderedProminent)
+            .padding(.horizontal, 20)
+            .frame(maxWidth: 420) 
+                
+            Button { 
+                showImporter = true 
+            } label: { 
+                Label("Import Media", systemImage: "plus")
+                    .padding(.horizontal, 8) 
+            }
+            .buttonStyle(.borderedProminent) 
         }
-        .padding().frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity) 
     }
+
 
     // MARK: - Accessibility
 
