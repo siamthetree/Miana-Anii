@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: SUBTITLE SYNC & PLACEMENT CONTROLS
+//  REFACTORED: COMPACT TRACK MENUS & SUBMENU FIX
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -20,14 +20,12 @@ import MobileVLCKit
 @MainActor
 final class SystemMediaCoordinator {
     
-    // Callbacks to let the System control the PlayerVM
     var onPlay: (() -> Void)?
     var onPause: (() -> Void)?
     var onTogglePlayPause: (() -> Void)?
     var onSkip: ((Double) -> Void)?
     var onSeek: ((Double) -> Void)?
     
-    // Internal State
     private var media: MediaItem?
     private var current: Double = 0
     private var duration: Double = 0
@@ -218,7 +216,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var vlcSubtitleTracks: [PlayerTrack] = []; @Published var vlcAudioTracks: [PlayerTrack] = []
     @Published var vlcSubtitleIndex: Int32 = -1; @Published var vlcAudioIndex: Int32 = -1
     
-    // NEW: Subtitle Delay
     @Published var subtitleDelay: Double = 0.0
 
     private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
@@ -358,10 +355,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         systemMedia.updateState(current: current, duration: duration, rate: rate, isPlaying: isPlaying)
     }
 
-    // MARK: - Trakt
-
     private var scrobbleProgress: Double {
-        guard duration > 0 else { return media.lastPosition > 0 ? media.lastPosition / 10000 : 0 } // Fallback
+        guard duration > 0 else { return media.lastPosition > 0 ? media.lastPosition / 10000 : 0 }
         return min(max(current / duration, 0), 1)
     }
 
@@ -425,15 +420,11 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)); syncSystemState() }
     func setVolume(_ value: Double) { volumeLevel = min(max(value, 0), 1); if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }; flash("Volume \(Int(volumeLevel * 100))%") }
     
-    // NEW: Subtitle Delay Adjustment
     func adjustSubtitleDelay(by seconds: Double) {
         subtitleDelay = ((subtitleDelay + seconds) * 10).rounded() / 10
-        
-        // Pass to VLC natively if we are using its internal subtitles
         if usesVLC && !hasExternalCues {
             vlcPlayer.currentVideoSubTitleDelay = NSInteger(subtitleDelay * 1_000_000)
         }
-        
         flash("Sync: \(String(format: "%+.1fs", subtitleDelay))")
         updateCue(at: current)
     }
@@ -468,13 +459,9 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             return
         }
 
-        // Apply dynamic subtitle delay
         let adjustedTime = time - subtitleDelay
 
-        // Reset cursor if time drops backwards aggressively
-        if cueCursor > 0 && adjustedTime < cues[0].start {
-            cueCursor = 0
-        }
+        if cueCursor > 0 && adjustedTime < cues[0].start { cueCursor = 0 }
 
         while cueCursor > 0 && adjustedTime < cues[cueCursor].start {
             cueCursor -= 1
@@ -610,7 +597,6 @@ struct PlayerScreen: View {
     @State private var seekTarget: Double = 0
     @State private var isWindowed = false
 
-    // NEW: Subtitle Placement Offset
     @AppStorage("subtitleYOffset") private var subtitleYOffset: Double = 0.0
     @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
     @AppStorage("subtitleBold") private var subtitleBold = true
@@ -681,7 +667,6 @@ struct PlayerScreen: View {
                     .padding(.horizontal, 24)
             }
         }
-        // Subtitle Placement Injection
         .padding(.bottom, max(0, (vm.showControls ? 140 : 44) + subtitleYOffset))
         .animation(.easeInOut(duration: 0.2), value: vm.showControls)
         .allowsHitTesting(false)
@@ -753,11 +738,15 @@ struct PlayerScreen: View {
     @ViewBuilder
     private var engineTrackSections: some View {
         if !vm.audioOptions.isEmpty {
-            Section("Audio") { ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } }
+            Menu("Audio Tracks") { 
+                ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } 
+            }
         }
-        Section("Subtitles") {
+        Menu("Subtitle Tracks") {
             Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
             ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
+        }
+        Section {
             subtitleFileControls
         }
         subtitleSettingsSection
@@ -766,17 +755,19 @@ struct PlayerScreen: View {
     @ViewBuilder
     private var vlcTrackSections: some View {
         if !vm.vlcAudioTracks.isEmpty {
-            Section("Audio") {
+            Menu("Audio Tracks") {
                 ForEach(vm.vlcAudioTracks) { track in
                     Button { vm.selectVLCAudio(track) } label: { trackLabel(track.name, selected: track.index == vm.vlcAudioIndex) }
                 }
             }
         }
-        Section("Subtitles") {
+        Menu("Subtitle Tracks") {
             Button { vm.selectVLCSubtitle(nil) } label: { trackLabel("Off", selected: vm.vlcSubtitleIndex < 0) }
             ForEach(vm.vlcSubtitleTracks) { track in
                 Button { vm.selectVLCSubtitle(track) } label: { trackLabel(track.name, selected: track.index == vm.vlcSubtitleIndex) }
             }
+        }
+        Section {
             subtitleFileControls
         }
         subtitleSettingsSection
@@ -793,7 +784,6 @@ struct PlayerScreen: View {
         if vm.hasExternalCues { Toggle("External subtitles", isOn: $vm.subtitlesOn) }
     }
     
-    // NEW: Subtitles Settings Menu
     @ViewBuilder
     private var subtitleSettingsSection: some View {
         Section("Settings") {
@@ -805,8 +795,14 @@ struct PlayerScreen: View {
                 Button("-0.5s") { vm.adjustSubtitleDelay(by: -0.5) }
             }
             Menu("Placement") {
-                Button("Move Up") { subtitleYOffset += 20; vm.flash("Subtitles Up") }
-                Button("Move Down") { subtitleYOffset -= 20; vm.flash("Subtitles Down") }
+                Button("Move Up") { 
+                    guard vm.hasExternalCues else { vm.flash("External .srt only"); return }
+                    subtitleYOffset += 20; vm.flash("Subtitles Up") 
+                }
+                Button("Move Down") { 
+                    guard vm.hasExternalCues else { vm.flash("External .srt only"); return }
+                    subtitleYOffset -= 20; vm.flash("Subtitles Down") 
+                }
                 Button("Reset Position") { subtitleYOffset = 0; vm.flash("Position Reset") }
             }
         }
