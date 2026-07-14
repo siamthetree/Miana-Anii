@@ -1,9 +1,3 @@
-// ==========================================================
-//  IMPROVEMENT 1  -  MKV DURATION AND THUMBNAILS  (file 1 of 2)
-//
-//  File:  Sources/Player/VLCProbe.swift
-// ==========================================================
-
 import Foundation
 import UIKit
 import CoreGraphics
@@ -12,14 +6,10 @@ import MobileVLCKit
 enum VLCProbe {
 
     /// Length in seconds, or 0 if VLC cannot work it out.
-    ///
-    /// This blocks the calling thread for up to ten seconds. Never call it
-    /// on the main thread. LibraryStore hands it to a detached task.
     nonisolated static func duration(of url: URL) -> Double {
         let media = VLCMedia(url: url)
 
-        // Local parse only. No network fetch, no cover art, no user interaction.
-        // Swift 6 / Modern MobileVLCKit drops the zero-value .parseLocal and uses parse(options:)
+        // FIX: Replaced C-style bitwise OR with the correct Swift array syntax for OptionSet
         _ = media.parse(options: [.fetchLocal])
 
         let parsed: VLCTime? = media.lengthWait(until: Date().addingTimeInterval(10))
@@ -29,7 +19,6 @@ enum VLCProbe {
     }
 
     /// Grabs a frame at `position` (0 to 1) and writes it as a JPEG.
-    /// Suspends rather than blocks, so calling it from the main actor is fine.
     @MainActor
     static func writeThumbnail(for url: URL, position: Float, to destination: URL) async {
         let grabber = VLCFrameGrabber()
@@ -41,12 +30,6 @@ enum VLCProbe {
 
 // MARK: - Frame grabber
 
-/// Wraps VLCMediaThumbnailer's delegate callbacks in an async call.
-///
-/// The thumbnailer holds its delegate weakly and does not retain its media,
-/// so this object owns both for the duration of the fetch. It also owns a
-/// watchdog: if libvlc neither finishes nor times out, the continuation
-/// would otherwise be leaked and the awaiting task hung forever.
 @MainActor
 private final class VLCFrameGrabber: NSObject, VLCMediaThumbnailerDelegate {
 
@@ -78,6 +61,7 @@ private final class VLCFrameGrabber: NSObject, VLCMediaThumbnailerDelegate {
         }
     }
 
+    // FIX: Updated to non-optional parameters to match modern SDK headers
     nonisolated func mediaThumbnailerDidTimeOut(_ mediaThumbnailer: VLCMediaThumbnailer) {
         Task { @MainActor [weak self] in self?.finish(nil) }
     }
@@ -87,7 +71,6 @@ private final class VLCFrameGrabber: NSObject, VLCMediaThumbnailerDelegate {
         Task { @MainActor [weak self] in self?.finish(image) }
     }
 
-    /// Idempotent. Whichever of the three paths arrives first wins.
     private func finish(_ image: UIImage?) {
         guard let continuation else { return }
         self.continuation = nil
