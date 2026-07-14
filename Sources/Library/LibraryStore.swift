@@ -1,5 +1,5 @@
 // ==========================================================
-//  FINAL STABILIZED: DISK WRITER + ASYNC STREAM OBSERVER
+//  FINAL STABILIZED: SWIFTDATA + NATIVE ASYNC THUMBNAILS
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -7,16 +7,9 @@
 
 import Foundation
 import SwiftUI
-import UIKit
+import SwiftData
 import UniformTypeIdentifiers
 import AVFoundation
-
-actor DiskWriter {
-    static let shared = DiskWriter()
-    func write(_ data: Data, to url: URL) {
-        try? data.write(to: url, options: .atomic)
-    }
-}
 
 @MainActor
 final class LibraryStore: ObservableObject {
@@ -36,13 +29,9 @@ final class LibraryStore: ObservableObject {
     let mediaDir: URL
     let thumbsDir: URL
     let subsDir: URL
-    private let indexURL: URL
-    private let foldersURL: URL
 
     private var folderURLs: [UUID: URL] = [:]
     private let watcher = FolderWatcher()
-    
-    // SWIFT 6 ARCHITECTURE: Track the AsyncStream tasks
     private var watcherTasks: [UUID: Task<Void, Never>] = [:]
     
     private var debouncedScan: Task<Void, Never>?
@@ -51,21 +40,78 @@ final class LibraryStore: ObservableObject {
     
     private var importQueue: [URL] = []
     private var isProcessingQueue = false
+    
+    // SWIFTDATA: The main thread database context
+    private let context: ModelContext
 
-    init() {
+    init(context: ModelContext) {
+        self.context = context
         documentsURL = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         mediaDir = documentsURL.appendingPathComponent("Media", isDirectory: true)
         thumbsDir = documentsURL.appendingPathComponent("Thumbnails", isDirectory: true)
         subsDir = documentsURL.appendingPathComponent("Subtitles", isDirectory: true)
-        indexURL = documentsURL.appendingPathComponent("library.json")
-        foldersURL = documentsURL.appendingPathComponent("folders.json")
+        
         try? fm.createDirectory(at: mediaDir, withIntermediateDirectories: true)
         try? fm.createDirectory(at: thumbsDir, withIntermediateDirectories: true)
         try? fm.createDirectory(at: subsDir, withIntermediateDirectories: true)
-        load()
-        loadFolders()
+        
+        performMigrationIfNeeded()
+        fetchData()
         activateFolders()
     }
+    
+    // MARK: - SwiftData Integration
+    
+    /// Checks for legacy JSON files. If found, decodes them, injects them into SwiftData, and deletes the JSON.
+    private func performMigrationIfNeeded() {
+        let indexURL = documentsURL.appendingPathComponent("library.json")
+        let foldersURL = documentsURL.appendingPathComponent("folders.json")
+        var migrated = false
+
+        if fm.fileExists(atPath: foldersURL.path), let data = try? Data(contentsOf: foldersURL) {
+            if let decoded = try? JSONDecoder().decode([WatchedFolder].self, from: data) {
+                for folder in decoded { context.insert(folder) }
+                migrated = true
+            }
+            try? fm.removeItem(at: foldersURL)
+        }
+
+        if fm.fileExists(atPath: indexURL.path), let data = try? Data(contentsOf: indexURL) {
+            if let decoded = try? JSONDecoder().decode([MediaItem].self, from: data) {
+                for item in decoded { context.insert(item) }
+                migrated = true
+            }
+            try? fm.removeItem(at: indexURL)
+        }
+
+        if migrated { try? context.save() }
+    }
+    
+    /// Pulls the entire database into memory for blazing fast SwiftUI rendering.
+    private func fetchData() {
+        let itemDesc = FetchDescriptor<MediaItem>(sortBy: [SortDescriptor(\.dateAdded, order: .reverse)])
+        items = (try? context.fetch(itemDesc)) ?? []
+        
+        let folderDesc = FetchDescriptor<WatchedFolder>(sortBy: [SortDescriptor(\.dateAdded, order: .reverse)])
+        folders = (try? context.fetch(folderDesc)) ?? []
+        
+        regroup()
+    }
+
+    /// Persists changes instantly to the underlying SQLite database
+    func save() {
+        try? context.save()
+        regroup()
+    }
+
+    private func regroup() {
+        entries = items.groupedIntoEntries()
+        seriesIndex = entries.reduce(into: [:]) { index, entry in
+            if case .series(let show) = entry { index[show.id] = show }
+        }
+    }
+
+    // MARK: - Import Queue Bridge
     
     func importFiles(_ urls: [URL]) async { for url in urls { enqueueImport(url: url) } }
     func importFile(_ url: URL) async { enqueueImport(url: url) }
@@ -78,38 +124,7 @@ final class LibraryStore: ObservableObject {
         Task { await performImport(nextURL); processNextQueueItem() }
     }
 
-    private func load() {
-        guard let data = try? Data(contentsOf: indexURL),
-              let decoded = try? JSONDecoder().decode([MediaItem].self, from: data) else { return }
-        items = decoded; regroup()
-    }
-
-    func save() {
-        regroup()
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        let targetURL = self.indexURL
-        Task { await DiskWriter.shared.write(data, to: targetURL) }
-    }
-
-    private func regroup() {
-        entries = items.groupedIntoEntries()
-        seriesIndex = entries.reduce(into: [:]) { index, entry in
-            if case .series(let show) = entry { index[show.id] = show }
-        }
-    }
-
-    private func loadFolders() {
-        guard let data = try? Data(contentsOf: foldersURL),
-              let decoded = try? JSONDecoder().decode([WatchedFolder].self, from: data) else { return }
-        folders = decoded
-    }
-
-    private func saveFolders() {
-        guard let data = try? JSONEncoder().encode(folders) else { return }
-        let targetURL = self.foldersURL
-        Task { await DiskWriter.shared.write(data, to: targetURL) }
-    }
-
+    // MARK: - Paths
     func url(for item: MediaItem) -> URL {
         if let folderID = item.folderID, let relative = item.relativePath, let root = folderURLs[folderID] { return root.appendingPathComponent(relative) }
         return mediaDir.appendingPathComponent(item.fileName)
@@ -137,14 +152,16 @@ final class LibraryStore: ObservableObject {
         return dest
     }
 
+    // MARK: - Folders
     private func activateFolders() { for folder in folders { activate(folder) } }
     private func activate(_ folder: WatchedFolder) {
         var stale = false
         guard let url = try? URL(resolvingBookmarkData: folder.bookmark, bookmarkDataIsStale: &stale),
               url.startAccessingSecurityScopedResource() else { return }
         folderURLs[folder.id] = url
-        if stale, let refreshed = try? url.bookmarkData(), let index = folders.firstIndex(where: { $0.id == folder.id }) {
-            folders[index].bookmark = refreshed; saveFolders()
+        if stale, let refreshed = try? url.bookmarkData() {
+            folder.bookmark = refreshed
+            save()
         }
         rewatchIfNeeded(folder.id, root: url)
     }
@@ -154,8 +171,6 @@ final class LibraryStore: ObservableObject {
         guard watchedDirectories[folderID] != current else { return }
         watchedDirectories[folderID] = current
         
-        // SWIFT 6 ARCHITECTURE: Safely iterate the AsyncStream.
-        // No cross-actor closures, no crashes.
         watcherTasks[folderID]?.cancel()
         watcherTasks[folderID] = Task { [weak self] in
             guard let self else { return }
@@ -176,7 +191,13 @@ final class LibraryStore: ObservableObject {
         }
         guard !alreadyWatching else { return }
         let folder = WatchedFolder(name: pickedURL.lastPathComponent, bookmark: bookmark)
-        folders.append(folder); saveFolders(); activate(folder); await scanFolders()
+        
+        context.insert(folder)
+        folders.append(folder)
+        save()
+        
+        activate(folder)
+        await scanFolders()
     }
 
     func removeFolder(_ folder: WatchedFolder) {
@@ -187,15 +208,20 @@ final class LibraryStore: ObservableObject {
         watchedDirectories[folder.id] = nil
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
         folderURLs[folder.id] = nil
-        for item in items where item.folderID == folder.id {
+        
+        let doomedItems = items.filter { $0.folderID == folder.id }
+        for item in doomedItems {
             let t = thumbURL(for: item)
             let s = savedSubtitleURL(for: item)
             if fm.fileExists(atPath: t.path) { try? fm.removeItem(at: t) }
             if fm.fileExists(atPath: s.path) { try? fm.removeItem(at: s) }
+            context.delete(item)
         }
         items.removeAll { $0.folderID == folder.id }
+        
+        context.delete(folder)
         folders.removeAll { $0.id == folder.id }
-        saveFolders(); save()
+        save()
     }
 
     private func scheduleFolderScan() {
@@ -285,8 +311,7 @@ final class LibraryStore: ObservableObject {
 
     func ingest(fileURL: URL, folderID: UUID? = nil, relativePath: String? = nil) async {
         let pretty = Self.prettyTitle(from: (fileURL.lastPathComponent as NSString).deletingPathExtension)
-        var item = MediaItem(title: pretty, fileName: fileURL.lastPathComponent)
-        item.folderID = folderID; item.relativePath = relativePath
+        let item = MediaItem(title: pretty, fileName: fileURL.lastPathComponent, folderID: folderID, relativePath: relativePath)
 
         if let meta = await MetadataService.fetchMetadata(for: fileURL.lastPathComponent, cleanTitle: pretty) { item.metadata = meta }
 
@@ -301,7 +326,10 @@ final class LibraryStore: ObservableObject {
             if item.isEngineSupported { await Self.writeThumbnail(assetURL: fileURL, at: max(1.0, item.duration * 0.12), to: dest) }
             else { await VLCProbe.writeThumbnail(for: fileURL, position: 0.12, to: dest) }
         }
+        
+        context.insert(item)
         items.insert(item, at: 0)
+        save()
     }
 
     func rescan() async {
@@ -339,16 +367,24 @@ final class LibraryStore: ObservableObject {
         let combined = unreachable.union(failedToResolve)
         if combined != unreachableFolders { unreachableFolders = combined }
 
-        items.removeAll { item in
+        let doomed = items.filter { item in
             if let folderID = item.folderID { if isOffline(item) || unreachable.contains(folderID) { return false } }
             return !fm.fileExists(atPath: url(for: item).path)
         }
+        
+        for item in doomed { context.delete(item) }
+        items.removeAll { item in doomed.contains(where: { $0.id == item.id }) }
+        if !doomed.isEmpty { save() }
     }
+
+    /// Extracted properties to pass into TaskGroup to prevent crossing SwiftData Actor Isolation boundaries
+    private struct MetadataSnapshot: Sendable { let id: UUID; let fileName: String }
 
     func refreshMetadata() async {
         guard refreshProgress == nil else { return }
         await TMDBCache.shared.clear()
-        let snapshot = items
+        
+        let snapshot = items.map { MetadataSnapshot(id: $0.id, fileName: $0.fileName) }
         guard !snapshot.isEmpty else { return }
         refreshProgress = (0, snapshot.count)
         defer { refreshProgress = nil }
@@ -359,8 +395,12 @@ final class LibraryStore: ObservableObject {
         await withTaskGroup(of: (UUID, MediaMetadata?).self) { group in
             func enqueue() {
                 if next < snapshot.count {
-                    let item = snapshot[next]; next += 1
-                    group.addTask { (item.id, await MetadataService.fetchMetadata(for: item.fileName, cleanTitle: Self.prettyTitle(from: (item.fileName as NSString).deletingPathExtension))) }
+                    let data = snapshot[next]; next += 1
+                    group.addTask {
+                        let clean = Self.prettyTitle(from: (data.fileName as NSString).deletingPathExtension)
+                        let meta = await MetadataService.fetchMetadata(for: data.fileName, cleanTitle: clean)
+                        return (data.id, meta)
+                    }
                 }
             }
             for _ in 0..<concurrency { enqueue() }
@@ -373,6 +413,9 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
+    // MARK: - Mutations
+    
+    // Changing properties directly on SwiftData @Models will automatically flag them as modified
     func updateProgress(id: UUID, position: Double, duration: Double) {
         if let i = items.firstIndex(where: { $0.id == id }) { items[i].lastPosition = max(0, position); if duration > 0 { items[i].duration = duration }; items[i].lastPlayed = Date(); save() }
     }
@@ -394,7 +437,10 @@ final class LibraryStore: ObservableObject {
     
     func delete(_ item: MediaItem) {
         let target = url(for: item), thumb = thumbURL(for: item), sub = savedSubtitleURL(for: item), isExt = item.isExternal, offline = isOffline(item)
-        items.removeAll { $0.id == item.id }; save()
+        
+        context.delete(item)
+        items.removeAll { $0.id == item.id }
+        save()
         
         Task.detached(priority: .userInitiated) {
             let localFm = FileManager.default
@@ -422,6 +468,7 @@ final class LibraryStore: ObservableObject {
             let sub = savedSubtitleURL(for: item)
             if fm.fileExists(atPath: thumb.path) { try? fm.removeItem(at: thumb) }
             if fm.fileExists(atPath: sub.path) { try? fm.removeItem(at: sub) }
+            context.delete(item)
         }
         
         for task in watcherTasks.values { task.cancel() }
@@ -430,8 +477,12 @@ final class LibraryStore: ObservableObject {
         
         watchedDirectories.removeAll()
         for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }
-        folderURLs.removeAll(); folders.removeAll(); items.removeAll()
-        saveFolders(); save()
+        folderURLs.removeAll()
+        
+        for folder in folders { context.delete(folder) }
+        folders.removeAll()
+        items.removeAll()
+        save()
     }
 
     func storageString() -> String { "Calculating…" }
@@ -465,19 +516,23 @@ final class LibraryStore: ObservableObject {
         return s.isEmpty ? raw : s
     }
 
+    // SWIFT 6 ARCHITECTURE: Replaced legacy Objective-C CGImage copy with Native Async Framework
     nonisolated static func writeThumbnail(assetURL: URL, at seconds: Double, to dest: URL) async {
-        await Task.detached(priority: .utility) {
-            let generator = AVAssetImageGenerator(asset: AVURLAsset(url: assetURL))
-            generator.appliesPreferredTrackTransform = true
-            generator.maximumSize = CGSize(width: 720, height: 720)
-            generator.requestedTimeToleranceBefore = .positiveInfinity
-            generator.requestedTimeToleranceAfter = .positiveInfinity
-            let time = CMTime(seconds: seconds, preferredTimescale: 600)
-            guard let cg = try? generator.copyCGImage(at: time, actualTime: nil) else { return }
-            let image = UIImage(cgImage: cg)
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: assetURL))
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 720, height: 720)
+        generator.requestedTimeToleranceBefore = .positiveInfinity
+        generator.requestedTimeToleranceAfter = .positiveInfinity
+        let time = CMTime(seconds: seconds, preferredTimescale: 600)
+        
+        do {
+            let (cgImage, _) = try await generator.image(at: time)
+            let image = UIImage(cgImage: cgImage)
             guard let data = image.jpegData(compressionQuality: 0.75) else { return }
             try? data.write(to: dest, options: .atomic)
-        }.value
+        } catch {
+            // Silently fail if AVFoundation cannot decode the frame
+        }
     }
 }
 
