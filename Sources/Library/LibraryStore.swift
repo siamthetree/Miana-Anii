@@ -1,5 +1,5 @@
 // ==========================================================
-//  FINAL STABILIZED: BUG 10 + ACTOR DISK WRITER + SWIFT 6
+//  FINAL STABILIZED: ALL FIXES MERGED
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -101,7 +101,7 @@ final class LibraryStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(items) else { return }
         let targetURL = self.indexURL
         
-        // CRASH FIX: Route through the DiskWriter actor to serialize file system access
+        // CRASH FIX: Route through the DiskWriter actor
         Task { await DiskWriter.shared.write(data, to: targetURL) }
     }
 
@@ -302,7 +302,9 @@ final class LibraryStore: ObservableObject {
             let asset = AVURLAsset(url: fileURL)
             if let d = try? await asset.load(.duration), d.seconds > 0 { item.duration = d.seconds }
         }
-        if item.duration <= 0 { item.duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: fileURL) }.value }
+        
+        // VLC CRASH FIX: Direct async call on MainActor instead of Task.detached
+        if item.duration <= 0 { item.duration = await VLCProbe.duration(of: fileURL) }
 
         if !item.isAudio {
             let dest = thumbURL(for: item)
@@ -390,7 +392,9 @@ final class LibraryStore: ObservableObject {
         for item in items.filter({ $0.duration <= 0 }) {
             guard !isOffline(item), let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
             let targetURL = url(for: item)
-            items[index].duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: targetURL) }.value
+            
+            // VLC CRASH FIX: Direct async call on MainActor instead of Task.detached
+            items[index].duration = await VLCProbe.duration(of: targetURL)
         }
         save()
     }
@@ -441,7 +445,9 @@ final class LibraryStore: ObservableObject {
     func storageString() -> String { "Calculating…" }
 
     func calculateStorageAsync() async -> String {
+        // SWIFT 6 FIX: Resolve the directory path on the main thread
         let targetPath = mediaDir
+        
         let totalBytes = await Task.detached(priority: .utility) {
             var total: Int64 = 0
             let localFm = FileManager.default
