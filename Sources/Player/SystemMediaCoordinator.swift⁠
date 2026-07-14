@@ -1,0 +1,195 @@
+import Foundation
+import AVFoundation
+import MediaPlayer
+import UIKit
+
+@MainActor
+final class SystemMediaCoordinator {
+    
+    // Callbacks to let the System control the PlayerVM
+    var onPlay: (() -> Void)?
+    var onPause: (() -> Void)?
+    var onTogglePlayPause: (() -> Void)?
+    var onSkip: ((Double) -> Void)?
+    var onSeek: ((Double) -> Void)?
+    
+    // Internal State
+    private var media: MediaItem?
+    private var current: Double = 0
+    private var duration: Double = 0
+    private var rate: Double = 1.0
+    private var isPlaying: Bool = false
+    
+    private var remoteTargets: [(MPRemoteCommand, Any)] = []
+    private var audioObservers: [NSObjectProtocol] = []
+    private var nowPlayingArtwork: MPMediaItemArtwork?
+    private var resumeAfterInterruption = false
+    
+    // MARK: - Lifecycle
+    
+    func start(media: MediaItem, store: LibraryStore) {
+        self.media = media
+        configureAudioSession()
+        setupRemoteCommands()
+        observeAudioSession()
+        Task { await loadArtwork(store: store) }
+    }
+    
+    func stop() {
+        teardownRemoteControl()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        media = nil
+    }
+    
+    func updateState(current: Double, duration: Double, rate: Double, isPlaying: Bool) {
+        self.current = current
+        self.duration = duration
+        self.rate = rate
+        self.isPlaying = isPlaying
+        publishNowPlaying()
+    }
+    
+    // MARK: - Lock Screen (Now Playing)
+    
+    private func publishNowPlaying() {
+        guard let media else { return }
+
+        var info: [String: Any] = [:]
+        info[MPMediaItemPropertyTitle] = nowPlayingTitle(for: media)
+        info[MPMediaItemPropertyArtist] = nowPlayingSubtitle(for: media)
+        info[MPNowPlayingInfoPropertyMediaType] = (media.isAudio ? MPNowPlayingInfoMediaType.audio : MPNowPlayingInfoMediaType.video).rawValue
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = current
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? rate : 0.0
+        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+        if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
+        if let nowPlayingArtwork { info[MPMediaItemPropertyArtwork] = nowPlayingArtwork }
+
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+    
+    private func nowPlayingTitle(for media: MediaItem) -> String {
+        // Fallbacks for episode titles if defined on your model, otherwise just uses title
+        media.title 
+    }
+
+    private func nowPlayingSubtitle(for media: MediaItem) -> String {
+        if let year = media.metadata?.releaseYear, !year.isEmpty { return year }
+        return (media.fileName as NSString).pathExtension.uppercased()
+    }
+    
+    private func loadArtwork(store: LibraryStore) async {
+        guard let media else { return }
+        let path = store.thumbURL(for: media).path
+        var image: UIImage? = await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
+
+        if image == nil, let poster = media.metadata?.posterURL,
+           let response = try? await URLSession.shared.data(from: poster) {
+            image = UIImage(data: response.0)
+        }
+        guard let image else { return }
+
+        nowPlayingArtwork = MPMediaItemArtwork(boundsSize: image.size) { @Sendable _ in image }
+        publishNowPlaying()
+    }
+
+    // MARK: - Remote Commands
+    
+    private func setupRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+
+        addCommand(center.playCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onPlay?() }
+            return .success
+        }
+        addCommand(center.pauseCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onPause?() }
+            return .success
+        }
+        addCommand(center.togglePlayPauseCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onTogglePlayPause?() }
+            return .success
+        }
+
+        center.skipForwardCommand.preferredIntervals = [15]
+        addCommand(center.skipForwardCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onSkip?(15) }
+            return .success
+        }
+
+        center.skipBackwardCommand.preferredIntervals = [15]
+        addCommand(center.skipBackwardCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onSkip?(-15) }
+            return .success
+        }
+
+        addCommand(center.changePlaybackPositionCommand) { @Sendable [weak self] event in
+            guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            let position = event.positionTime
+            Task { @MainActor in self?.onSeek?(position) }
+            return .success
+        }
+    }
+
+    private func addCommand(_ command: MPRemoteCommand, _ handler: @escaping @Sendable (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus) {
+        command.isEnabled = true
+        remoteTargets.append((command, command.addTarget(handler: handler)))
+    }
+
+    private func teardownRemoteControl() {
+        for (command, token) in remoteTargets { command.removeTarget(token) }
+        remoteTargets.removeAll()
+        for observer in audioObservers { NotificationCenter.default.removeObserver(observer) }
+        audioObservers.removeAll()
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+
+    // MARK: - Audio Session & Interruptions
+    
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .moviePlayback)
+        try? session.setSupportsMultichannelContent(true)
+        try? session.setActive(true)
+        applyPreferredChannels()
+    }
+
+    private func applyPreferredChannels() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setPreferredOutputNumberOfChannels(session.maximumOutputNumberOfChannels)
+    }
+
+    private func observeAudioSession() {
+        let notifications = NotificationCenter.default
+
+        audioObservers.append(notifications.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self, let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt, let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+
+            switch type {
+            case .began:
+                Task { @MainActor in
+                    self.resumeAfterInterruption = self.isPlaying
+                    if self.isPlaying { self.onPause?() }
+                }
+            case .ended:
+                let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt).map { AVAudioSession.InterruptionOptions(rawValue: $0) } ?? []
+                Task { @MainActor in
+                    guard self.resumeAfterInterruption, options.contains(.shouldResume) else { return }
+                    self.resumeAfterInterruption = false
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    self.onPlay?()
+                }
+            @unknown default: break
+            }
+        })
+
+        audioObservers.append(notifications.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self else { return }
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).flatMap { AVAudioSession.RouteChangeReason(rawValue: $0) }
+
+            Task { @MainActor in
+                self.applyPreferredChannels()
+                if reason == .oldDeviceUnavailable, self.isPlaying { self.onPause?() }
+            }
+        })
+    }
+}
