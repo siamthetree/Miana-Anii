@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: CYCLING SCALE BUTTON (TOUCH & FLICKER FIX)
+//  REFACTORED: FLICKER FIX, GESTURE ZONES & BOTTOM BAR UI
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -257,10 +257,12 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     
     @Published var subtitleDelay: Double = 0.0
 
-    private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
-
-    private var hideTask: Task<Void, Never>?
+    // Exposed so onHover can manage the timer
+    var hideTask: Task<Void, Never>?
+    var isWindowHovered: Bool = false
+    
     private var flashTask: Task<Void, Never>?
+    private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
 
     private var lastKnownDuration: Double = -1
     private var pendingSeekAttempts = 0
@@ -291,9 +293,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     func playNext() {
         guard let next = nextMedia else { return }
-        stop() // Safely halts and saves current media
+        stop() 
         
-        // Reset and prepare new episode
         self.media = next
         self.nextMedia = nil
         self.showUpNext = false
@@ -306,8 +307,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         self.hasScrobbledWatched = false
         self.isScrobbling = false
         
-        resolveNextMedia() // Checks if there's a 3rd episode coming up
-        start() // Kicks off native playback again
+        resolveNextMedia() 
+        start() 
     }
 
     func start() {
@@ -564,14 +565,17 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     func scheduleAutoHide() { 
         hideTask?.cancel()
-        guard isPlaying else { return }
+        
+        // Window Hover Protection: If the mouse is hovering over the window, DO NOT auto-hide.
+        guard isPlaying, !isWindowHovered else { return }
+        
         let intervalObject = UserDefaults.standard.object(forKey: "autoHideInterval")
         let interval = intervalObject != nil ? UserDefaults.standard.double(forKey: "autoHideInterval") : 10.0
         guard interval > 0 else { return }
         
         hideTask = Task { @MainActor [weak self] in 
             try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-            guard !Task.isCancelled, let self, self.isPlaying, !self.isScrubbing else { return }
+            guard !Task.isCancelled, let self, self.isPlaying, !self.isScrubbing, !self.isWindowHovered else { return }
             withAnimation(.easeOut(duration: 0.25)) { self.showControls = false } 
         }
     }
@@ -752,7 +756,7 @@ struct PlayerScreen: View {
     @StateObject private var vm: PlayerVM
     @State private var scrubValue: Double = 0
     @State private var showSubImporter = false
-    @State private var showSettingsSheet = false
+    @State private var showSubtitleSheet = false
     @State private var dragMode: DragMode = .none
     @State private var dragStartValue: Double = 0
     @State private var seekTarget: Double = 0
@@ -815,6 +819,16 @@ struct PlayerScreen: View {
                     .allowsHitTesting(false)
                 }
             }
+            .onHover { isHovering in
+                // Native Window tracking. Re-shows controls gracefully and halts auto-hide while hovering.
+                vm.isWindowHovered = isHovering
+                if isHovering {
+                    vm.showControls = true
+                    vm.hideTask?.cancel()
+                } else {
+                    vm.scheduleAutoHide()
+                }
+            }
         }
         .background(WindowChromeProbe(isWindowed: $isWindowed))
         .statusBarHidden(true).persistentSystemOverlays(.hidden)
@@ -822,8 +836,8 @@ struct PlayerScreen: View {
         .onDisappear { vm.stop(); UIApplication.shared.isIdleTimerDisabled = false }
         .alert("Playback Error", isPresented: Binding(get: { vm.errorMessage != nil }, set: { if !$0 { vm.errorMessage = nil } })) { Button("OK") { dismiss() } } message: { Text(vm.errorMessage ?? "") }
         .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) } }
-        .sheet(isPresented: $showSettingsSheet) {
-            PlayerSettingsSheet(vm: vm, showSubImporter: $showSubImporter)
+        .sheet(isPresented: $showSubtitleSheet) {
+            SubtitleSettingsSheet(vm: vm, showSubImporter: $showSubImporter)
                 .presentationDetents([.height(450), .large])
                 .presentationBackground(.ultraThinMaterial)
                 .presentationCornerRadius(32)
@@ -883,12 +897,12 @@ struct PlayerScreen: View {
                     .padding(.vertical, 8)
                     .background(.black.opacity(subtitleBackground), in: RoundedRectangle(cornerRadius: 8))
                     .padding(.horizontal, 24)
-                    .id(cue)
+                    .drawingGroup() // FLICKER FIX: Hardware accelerates text box rendering
+                    .animation(.none, value: cue) // FLICKER FIX: Stops automatic geometry interpolation
             }
         }
         .padding(.bottom, max(0, (vm.showControls ? 140 : 44) + subtitleYOffset))
         .animation(.easeInOut(duration: 0.2), value: vm.showControls)
-        .animation(nil, value: vm.cueText)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
@@ -934,12 +948,6 @@ struct PlayerScreen: View {
                     Image(systemName: "pip.enter").font(.title3).frame(width: 44, height: 44)
                 }
                 .accessibilityLabel("Picture in Picture")
-                .glassControl(in: Circle())
-
-                Button { showSettingsSheet = true } label: { 
-                    Image(systemName: "gearshape.fill").font(.title3).frame(width: 44, height: 44) 
-                }
-                .accessibilityLabel("Playback Settings")
                 .glassControl(in: Circle())
             }
             .glassGroup(spacing: 10)
@@ -990,23 +998,62 @@ struct PlayerScreen: View {
             }.font(.footnote).foregroundStyle(.white)
 
             HStack(spacing: 26) {
+                
+                // 1. Audio Button (Bottom Left)
+                Menu {
+                    if vm.usesVLC {
+                        if !vm.vlcAudioTracks.isEmpty {
+                            ForEach(vm.vlcAudioTracks) { track in
+                                Button { vm.selectVLCAudio(track) } label: { HStack { Text(track.name); if vm.vlcAudioIndex == track.index { Image(systemName: "checkmark") } } }
+                            }
+                        } else { Text("No Audio Tracks") }
+                    } else {
+                        if !vm.audioOptions.isEmpty {
+                            ForEach(vm.audioOptions, id: \.self) { o in 
+                                Button { vm.selectAudio(o) } label: { HStack { Text(o.displayName); if vm.currentAudioOption == o { Image(systemName: "checkmark") } } } 
+                            }
+                        } else { Text("No Audio Tracks") }
+                    }
+                } label: {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 20))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Audio Tracks")
+
+                Spacer()
+
+                // 2. Playback Speed
                 Menu { ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Button(String(format: "%.2gx", r)) { vm.setRate(r) } } } label: { Label(String(format: "%.2gx", vm.rate), systemImage: "speedometer") }
                     .accessibilityLabel("Playback speed")
                     .accessibilityValue(String(format: "%.2gx", vm.rate))
 
-                // The fix: Direct cycling button instead of an overlapping gesture-killing Menu!
+                // 3. Video Scale Mode
                 Button {
                     vm.cycleScaleMode()
                 } label: {
                     Image(systemName: vm.scaleMode.icon)
                         .font(.system(size: 20))
-                        .frame(width: 44, height: 44) // Massive touch target
-                        .contentShape(Rectangle()) // Confirms hit testing across the whole frame
-                        .contentTransition(.symbolEffect(.replace)) // Smoothly morphs the icon
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                        .contentTransition(.symbolEffect(.replace))
                 }
                 .accessibilityLabel("Cycle Video Size")
 
                 Spacer()
+                
+                // 4. Subtitles Button (Bottom Right)
+                Button {
+                    showSubtitleSheet = true
+                } label: {
+                    Image(systemName: "captions.bubble")
+                        .font(.system(size: 20))
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .accessibilityLabel("Subtitle Settings")
+
             }.font(.subheadline).foregroundStyle(.white)
         }
         .padding(.horizontal, 18)
@@ -1020,6 +1067,10 @@ struct PlayerScreen: View {
     private func panGesture(geo: GeometryProxy) -> some Gesture {
         DragGesture(minimumDistance: 15)
             .onChanged { value in
+                
+                // GESTURE FIX: Restrict drags exactly to the video center. Ignores top/bottom bars completely!
+                guard value.startLocation.y > 120 && value.startLocation.y < (geo.size.height - 150) else { return }
+                
                 if dragMode == .none {
                     if abs(value.translation.width) > abs(value.translation.height) { 
                         dragMode = .seek
@@ -1063,9 +1114,9 @@ struct PlayerScreen: View {
     }
 }
 
-// MARK: - Sleek Settings Sheet
+// MARK: - Subtitles Settings Sheet
 
-struct PlayerSettingsSheet: View {
+struct SubtitleSettingsSheet: View {
     @ObservedObject var vm: PlayerVM
     @Binding var showSubImporter: Bool
     @Environment(\.dismiss) var dismiss
@@ -1079,37 +1130,13 @@ struct PlayerSettingsSheet: View {
         ScrollView {
             VStack(spacing: 24) {
                 
-                // MARK: Video
+                // MARK: Tracks Selection
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("Video").font(.headline).foregroundStyle(.secondary)
-                    
-                    settingRow(title: "Size Mode", systemImage: vm.scaleMode.icon) {
-                        Menu(vm.scaleMode.rawValue) {
-                            ForEach(VideoScaleMode.allCases) { mode in
-                                Button(mode.rawValue) { vm.setScaleMode(mode) }
-                            }
-                        }.foregroundStyle(.white)
-                    }
-                }
-                
-                Divider().background(Color.white.opacity(0.2))
-
-                // MARK: Tracks
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("Tracks").font(.headline).foregroundStyle(.secondary)
+                    Text("Select Subtitles").font(.headline).foregroundStyle(.secondary)
                     
                     if vm.usesVLC {
-                        if !vm.vlcAudioTracks.isEmpty {
-                            settingRow(title: "Audio", systemImage: "waveform") {
-                                Menu(vm.vlcAudioTracks.first(where: { $0.index == vm.vlcAudioIndex })?.name ?? "Select") {
-                                    ForEach(vm.vlcAudioTracks) { track in
-                                        Button(track.name) { vm.selectVLCAudio(track) }
-                                    }
-                                }
-                            }
-                        }
                         if !vm.vlcSubtitleTracks.isEmpty {
-                            settingRow(title: "Subtitles", systemImage: "captions.bubble") {
+                            settingRow(title: "Embedded Tracks", systemImage: "captions.bubble") {
                                 Menu(vm.vlcSubtitleIndex < 0 ? "Off" : (vm.vlcSubtitleTracks.first(where: { $0.index == vm.vlcSubtitleIndex })?.name ?? "Select")) {
                                     Button("Off") { vm.selectVLCSubtitle(nil) }
                                     ForEach(vm.vlcSubtitleTracks) { track in
@@ -1119,15 +1146,8 @@ struct PlayerSettingsSheet: View {
                             }
                         }
                     } else {
-                        if !vm.audioOptions.isEmpty {
-                            settingRow(title: "Audio", systemImage: "waveform") {
-                                Menu(vm.currentAudioOption?.displayName ?? "Select") {
-                                    ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } }
-                                }
-                            }
-                        }
                         if !vm.legibleOptions.isEmpty {
-                            settingRow(title: "Subtitles", systemImage: "captions.bubble") {
+                            settingRow(title: "Embedded Tracks", systemImage: "captions.bubble") {
                                 Menu(vm.currentLegibleOption?.displayName ?? "Off") {
                                     Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
                                     ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
@@ -1143,7 +1163,7 @@ struct PlayerSettingsSheet: View {
                 
                 Divider().background(Color.white.opacity(0.2))
                 
-                // MARK: Sync & Layout
+                // MARK: Sync & Layout Formatting
                 VStack(alignment: .leading, spacing: 14) {
                     Text("Subtitles Formatting").font(.headline).foregroundStyle(.secondary)
                     
