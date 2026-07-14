@@ -1,13 +1,15 @@
 // ==========================================================
-//  BUG 2  -  ONE DISK WRITE, NOT SIXTY  (file 2 of 3)
+//  BUG 3  -  GROUP ONCE, NOT EIGHT TIMES A FRAME  (5 of 5)
 //
 //  File:  Sources/Library/LibraryView.swift
-//  Replace the entire file. Supersedes BUG-1a.
+//  Replace the entire file. Supersedes BUG-2b.
 //
-//  The series menu passes the whole array now instead of looping. It
-//  also gains Mark Series as Unwatched, which it never had: you could
-//  mark a show watched and had no way back short of doing it episode by
-//  episode.
+//  Reads store.entries rather than grouping for itself.
+//
+//  One deliberate exception: selecting a single media source still
+//  regroups that source's own files. Filtering the already-grouped
+//  entries would split a show whose episodes span two sources, and that
+//  regrouping only runs while a source is actually selected.
 // ==========================================================
 
 import Foundation
@@ -184,7 +186,7 @@ struct LibraryView: View {
 
     private var libraryList: some View {
         let active = activeFilter
-        let grouped = store.items.groupedIntoEntries()
+        let grouped = store.entries
         let visible = entries(for: active, in: grouped)
         let upNext = (active == .all && searchText.isEmpty) ? Self.continueWatching(in: grouped) : []
 
@@ -380,6 +382,9 @@ struct LibraryView: View {
         case .series:
             return grouped.filter { if case .series = $0 { return true } else { return false } }
         case .source(let id):
+            // Filtering the already-grouped entries would split a show whose
+            // episodes span two sources. Regrouping the source's own files is
+            // correct, and only happens while a source is actually selected.
             return store.items.filter { $0.folderID == id }.groupedIntoEntries()
         }
     }
