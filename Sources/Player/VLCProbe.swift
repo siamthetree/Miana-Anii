@@ -51,7 +51,8 @@ enum VLCProbe {
         // Local parse only. No network fetch, no cover art, no user interaction.
         // If a future MobileVLCKit turns VLCMediaParsingOptions into an
         // NS_OPTIONS type, this becomes .parseLocal and .fetchLocal.
-        _ = media.parse(withOptions: VLCMediaParsingOptions(VLCMediaParseLocal | VLCMediaFetchLocal))
+_ = media.parse(withOptions: [.parseLocal, .fetchLocal])
+
 
         let parsed: VLCTime? = media.lengthWait(until: Date().addingTimeInterval(10))
         let milliseconds = Double(parsed?.intValue ?? 0)
