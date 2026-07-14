@@ -1,21 +1,23 @@
 // ==========================================================
-//  BUG 4  -  STOP WRITING TO THE USER'S DRIVE  (file 2 of 2)
+//  BUG 6  -  SUBTITLE LOOKUP SCANNED EVERY CUE, EVERY TICK
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
-//  Replace the entire file. Supersedes IMP-7a.
+//  Replace the entire file. Supersedes BUG-4b.
 //
-//  loadSubtitleFile(copySidecar: true) wrote the .srt to
-//  store.url(for: media). For a media source that path is on your own
-//  drive. So loading a subtitle dropped a file into your media folder:
-//  uninvited, silent if the volume was read only, and enough to wake the
-//  folder watcher and trigger a rescan.
+//  SRTParser.cue did cues.first(where:) on every clock tick. Four ticks a
+//  second, against a two hour film's two thousand cues, is a great many
+//  string comparisons thrown away.
 //
-//  Subtitles you load now live in the app's own Subtitles directory,
-//  keyed by item id. Nothing is written outside the app.
+//  Playback moves forward, so the cue we want is almost always the one we
+//  showed last, or the one after it. updateCue keeps a cursor and walks
+//  from there. Typically a step or two.
 //
-//  On open, the player prefers a subtitle you loaded yourself, since you
-//  chose it. Failing that it reads an .srt already sitting next to the
-//  video, exactly as before. Reading was never the problem.
+//  The cursor walks backwards as readily as forwards, so a seek needs no
+//  special handling: it finds its way from wherever it was. It resets to
+//  zero only when the cue list itself is replaced.
+//
+//  cueText is only assigned when it actually changes, so an unchanged cue
+//  no longer publishes a redraw four times a second.
 // ==========================================================
 
 import Foundation
@@ -43,6 +45,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var nowPlayingArtwork: MPMediaItemArtwork?
     private var resumeAfterInterruption = false
     private var lastNowPlayingDuration: Double = -1
+    private var cueCursor = 0
     private var didAutoSelectSubtitle = false
     private var hasScrobbledWatched = false
     private var isScrobbling = false
@@ -81,7 +84,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                     guard let self, !self.isScrubbing else { return }
                     self.current = time.seconds
                     if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
-                    self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: time.seconds, in: self.cues) : nil
+                    self.updateCue(at: time.seconds)
                     if self.duration != self.lastNowPlayingDuration { self.updateNowPlaying() }
                     self.periodicSave()
                     self.checkWatchedThreshold()
@@ -135,7 +138,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             let ms = self.vlcPlayer.time.value?.doubleValue ?? 0
             self.current = ms / 1000.0
             if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }
-            self.cueText = (self.subtitlesOn && self.hasExternalCues) ? SRTParser.cue(at: self.current, in: self.cues) : nil
+            self.updateCue(at: self.current)
             if self.duration != self.lastNowPlayingDuration { self.updateNowPlaying() }
             self.periodicSave()
             self.checkWatchedThreshold() 
@@ -240,6 +243,32 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     func flash(_ text: String) { flashText = text; flashTask?.cancel(); let work = DispatchWorkItem { [weak self] in self?.flashText = nil }; flashTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work) }
 
+    /// Playback moves forward, so the cue we want is almost always the one we
+    /// showed last or the one after it. Remembering where we were turns a linear
+    /// scan of every cue, on every clock tick, into a step or two.
+    ///
+    /// Four ticks a second against a two hour film's two thousand cues is a lot of
+    /// string comparisons to throw away.
+    private func updateCue(at time: Double) {
+        guard subtitlesOn, hasExternalCues, !cues.isEmpty else {
+            if cueText != nil { cueText = nil }
+            return
+        }
+
+        // A seek can land anywhere; walk backwards until we are not past the cue.
+        while cueCursor > 0 && time < cues[cueCursor].start {
+            cueCursor -= 1
+        }
+        // Skip anything that has already ended.
+        while cueCursor < cues.count - 1 && time > cues[cueCursor].end {
+            cueCursor += 1
+        }
+
+        let cue = cues[cueCursor]
+        let text = (time >= cue.start && time <= cue.end) ? cue.text : nil
+        if text != cueText { cueText = text }
+    }
+
     /// One you loaded in the player wins, since you chose it. Otherwise an .srt
     /// already sitting next to the video, which is only ever read.
     private func loadSidecarSubtitles(for mediaURL: URL) {
@@ -267,6 +296,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         guard !parsed.isEmpty else { flash("Couldn't read subtitles"); return }
 
         cues = parsed
+        cueCursor = 0
         hasExternalCues = true
         subtitlesOn = true
         flash("Subtitles loaded")
