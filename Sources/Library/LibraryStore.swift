@@ -16,13 +16,7 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     @Published private(set) var folders: [WatchedFolder] = []
     @Published private(set) var isScanning = false
-
-    /// Sources that resolved but whose files cannot be reached: an unmounted drive,
-    /// an iCloud folder that has not come back. Their items are kept, not pruned,
-    /// so this is the only way the interface can admit something is wrong.
     @Published private(set) var unreachableFolders: Set<UUID> = []
-
-    /// done and total while a metadata refresh runs, nil when idle.
     @Published private(set) var refreshProgress: (done: Int, total: Int)?
 
     @Published private(set) var entries: [LibraryEntry] = []
@@ -41,7 +35,6 @@ final class LibraryStore: ObservableObject {
     private var folderURLs: [UUID: URL] = [:]
     private let watcher = FolderWatcher()
     private var debouncedScan: Task<Void, Never>?
-
     private var scanRequested = false
     private var watchedDirectories: [UUID: [URL]] = [:]
     
@@ -98,8 +91,6 @@ final class LibraryStore: ObservableObject {
         regroup()
         guard let data = try? JSONEncoder().encode(items) else { return }
         let targetURL = indexURL
-        
-        // CONCURRENCY FIX: Push the disk-write off the main UI thread
         Task.detached(priority: .background) {
             try? data.write(to: targetURL, options: .atomic)
         }
@@ -140,10 +131,6 @@ final class LibraryStore: ObservableObject {
         subsDir.appendingPathComponent(item.id.uuidString + ".srt")
     }
 
-    func sidecarSubtitleURL(for item: MediaItem) -> URL {
-        url(for: item).deletingPathExtension().appendingPathExtension("srt")
-    }
-
     func isOffline(_ item: MediaItem) -> Bool {
         guard let folderID = item.folderID else { return false }
         return folderURLs[folderID] == nil
@@ -182,13 +169,11 @@ final class LibraryStore: ObservableObject {
               url.startAccessingSecurityScopedResource() else { return }
 
         folderURLs[folder.id] = url
-
         if stale, let refreshed = try? url.bookmarkData(),
            let index = folders.firstIndex(where: { $0.id == folder.id }) {
             folders[index].bookmark = refreshed
             saveFolders()
         }
-
         rewatchIfNeeded(folder.id, root: url)
     }
 
@@ -225,7 +210,6 @@ final class LibraryStore: ObservableObject {
         watchedDirectories[folder.id] = nil
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
         folderURLs[folder.id] = nil
-
         for item in items where item.folderID == folder.id {
             try? fm.removeItem(at: thumbURL(for: item))
             try? fm.removeItem(at: savedSubtitleURL(for: item))
@@ -248,7 +232,6 @@ final class LibraryStore: ObservableObject {
     func scanFolders() async {
         guard !folders.isEmpty else { return }
         guard !isScanning else { scanRequested = true; return }
-
         isScanning = true
         defer { isScanning = false }
 
@@ -263,29 +246,19 @@ final class LibraryStore: ObservableObject {
 
     private func scanFoldersOnce() async -> Bool {
         var sawUnsettledFile = false
-
         for folder in folders {
             guard let root = folderURLs[folder.id] else { continue }
-
             let files = mediaFiles(under: root)
-
             if files.isEmpty && items.contains(where: { $0.folderID == folder.id }) { continue }
-
             for file in files {
                 let relative = Self.relativePath(of: file, from: root)
                 if items.contains(where: { $0.folderID == folder.id && $0.relativePath == relative }) { continue }
-
                 if let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
-                   Date().timeIntervalSince(modified) < 3 {
-                    sawUnsettledFile = true
-                    continue
-                }
+                   Date().timeIntervalSince(modified) < 3 { sawUnsettledFile = true; continue }
                 await ingest(fileURL: file, folderID: folder.id, relativePath: relative)
             }
-
             rewatchIfNeeded(folder.id, root: root)
         }
-
         return sawUnsettledFile
     }
 
@@ -320,41 +293,9 @@ final class LibraryStore: ObservableObject {
         return String(filePath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
     }
 
-    // MARK: - Importing copies
-
-    func importFiles(_ urls: [URL]) async {
-        for url in urls { await importFile(url) }
-        save()
-    }
-
-    func importFile(_ src: URL) async {
-        let secured = src.startAccessingSecurityScopedResource()
-        defer { if secured { src.stopAccessingSecurityScopedResource() } }
-
-        let ext = src.pathExtension.lowercased()
-        if MediaKinds.subtitles.contains(ext) {
-            let dest = mediaDir.appendingPathComponent(src.lastPathComponent)
-            try? fm.removeItem(at: dest)
-            try? fm.copyItem(at: src, to: dest)
-            return
-        }
-        guard MediaKinds.media.contains(ext) else { return }
-
-        let dest = uniqueDestination(for: src.lastPathComponent)
-        do {
-            let from = src, to = dest
-            try await Task.detached(priority: .userInitiated) { try FileManager.default.copyItem(at: from, to: to) }.value
-        } catch { return }
-
-        if src.path.contains("/Inbox/") { try? fm.removeItem(at: src) }
-        await ingest(fileURL: dest)
-        save()
-    }
-
-    private func ingest(fileURL: URL, folderID: UUID? = nil, relativePath: String? = nil) async {
+    func ingest(fileURL: URL, folderID: UUID? = nil, relativePath: String? = nil) async {
         let rawTitle = (fileURL.lastPathComponent as NSString).deletingPathExtension
         let prettyTitle = Self.prettyTitle(from: rawTitle)
-
         var item = MediaItem(title: prettyTitle, fileName: fileURL.lastPathComponent)
         item.folderID = folderID
         item.relativePath = relativePath
@@ -381,48 +322,11 @@ final class LibraryStore: ObservableObject {
                 await VLCProbe.writeThumbnail(for: fileURL, position: 0.12, to: destination)
             }
         }
-
         items.insert(item, at: 0)
     }
 
-    // MARK: - Scanning
-
-    func rescan() async {
-        var changed = false
-
-        if let loose = try? fm.contentsOfDirectory(at: documentsURL, includingPropertiesForKeys: nil) {
-            for f in loose {
-                let ext = f.pathExtension.lowercased()
-                if MediaKinds.subtitles.contains(ext) {
-                    let dest = mediaDir.appendingPathComponent(f.lastPathComponent)
-                    try? fm.removeItem(at: dest); try? fm.moveItem(at: f, to: dest)
-                } else if MediaKinds.media.contains(ext) {
-                    let dest = uniqueDestination(for: f.lastPathComponent)
-                    try? fm.moveItem(at: f, to: dest)
-                }
-            }
-        }
-
-        if let files = try? fm.contentsOfDirectory(at: mediaDir, includingPropertiesForKeys: nil) {
-            for f in files {
-                guard MediaKinds.media.contains(f.pathExtension.lowercased()) else { continue }
-                guard !items.contains(where: { $0.folderID == nil && $0.fileName == f.lastPathComponent }) else { continue }
-                await ingest(fileURL: f)
-                changed = true
-            }
-        }
-
-        await scanFolders()
-        await backfillDurations()
-
-        let before = items.count
-        pruneMissing()
-        if changed || items.count != before { save() }
-    }
-
-    private func pruneMissing() {
+    func pruneMissing() {
         var missing: [UUID: (gone: Int, total: Int)] = [:]
-
         for item in items {
             guard let folderID = item.folderID, !isOffline(item) else { continue }
             var tally = missing[folderID] ?? (0, 0)
@@ -431,27 +335,20 @@ final class LibraryStore: ObservableObject {
             missing[folderID] = tally
         }
 
-        let unreachable = Set(missing.compactMap { id, tally in
-            (tally.total > 1 && tally.gone == tally.total) ? id : nil
-        })
-
+        let unreachable = Set(missing.compactMap { id, tally in (tally.total > 1 && tally.gone == tally.total) ? id : nil })
         let failedToResolve = folders.map(\.id).filter { folderURLs[$0] == nil }
         let combined = unreachable.union(failedToResolve)
         if combined != unreachableFolders { unreachableFolders = combined }
 
         items.removeAll { item in
-            if let folderID = item.folderID {
-                if isOffline(item) || unreachable.contains(folderID) { return false }
-            }
+            if let folderID = item.folderID { if isOffline(item) || unreachable.contains(folderID) { return false } }
             return !fm.fileExists(atPath: url(for: item).path)
         }
     }
 
     func refreshMetadata() async {
         guard refreshProgress == nil else { return }
-
         await TMDBCache.shared.clear()
-
         let snapshot = items
         guard !snapshot.isEmpty else { return }
         refreshProgress = (0, snapshot.count)
@@ -466,141 +363,44 @@ final class LibraryStore: ObservableObject {
                 guard next < snapshot.count else { return }
                 let item = snapshot[next]
                 next += 1
-
                 let fileName = item.fileName
                 let clean = Self.prettyTitle(from: (fileName as NSString).deletingPathExtension)
                 let id = item.id
-                group.addTask {
-                    (id, await MetadataService.fetchMetadata(for: fileName, cleanTitle: clean))
-                }
+                group.addTask { (id, await MetadataService.fetchMetadata(for: fileName, cleanTitle: clean)) }
             }
-
             for _ in 0..<concurrency { enqueue() }
-
             while let (id, meta) = await group.next() {
                 done += 1
                 refreshProgress = (done, snapshot.count)
-                if let meta, let index = items.firstIndex(where: { $0.id == id }) {
-                    items[index].metadata = meta
-                }
+                if let meta, let index = items.firstIndex(where: { $0.id == id }) { items[index].metadata = meta }
                 enqueue()
             }
         }
-
         save()
-    }
-
-    // MARK: - Mutations
-
-    func updateProgress(id: UUID, position: Double, duration: Double) {
-        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
-        items[i].lastPosition = max(0, position)
-        if duration > 0, duration.isFinite { items[i].duration = duration }
-        items[i].lastPlayed = Date()
-        save()
-    }
-
-    func backfillDurations() async {
-        let pending = items.filter { $0.duration <= 0 }
-        guard !pending.isEmpty else { return }
-
-        for item in pending {
-            guard !isOffline(item) else { continue }
-            let fileURL = url(for: item)
-            guard fm.fileExists(atPath: fileURL.path) else { continue }
-
-            let seconds = await Task.detached(priority: .utility) { VLCProbe.duration(of: fileURL) }.value
-            guard seconds > 0, let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
-            items[index].duration = seconds
-        }
-        save()
-    }
-
-    func resetProgress(_ item: MediaItem) {
-        resetProgress([item])
-    }
-
-    func resetProgress(_ batch: [MediaItem]) {
-        var touched = false
-        for item in batch {
-            guard let i = items.firstIndex(where: { $0.id == item.id }) else { continue }
-            items[i].lastPosition = 0
-            touched = true
-        }
-        if touched { save() }
-    }
-
-    func markWatched(_ item: MediaItem) {
-        markWatched([item])
-    }
-
-    func markWatched(_ batch: [MediaItem]) {
-        let now = Date()
-        var touched = false
-        for item in batch {
-            guard let i = items.firstIndex(where: { $0.id == item.id }), items[i].duration > 0 else { continue }
-            items[i].lastPosition = items[i].duration
-            items[i].lastPlayed = now
-            touched = true
-        }
-        if touched { save() }
-    }
-
-    func rename(_ item: MediaItem, to newTitle: String) {
-        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let i = items.firstIndex(where: { $0.id == item.id }) else { return }
-        items[i].title = trimmed; save()
     }
 
     func delete(_ item: MediaItem) {
-        let target = url(for: item)
-        let thumb = thumbURL(for: item)
-        let sub = savedSubtitleURL(for: item)
-        let isExt = item.isExternal
-        let offline = isOffline(item)
-
         items.removeAll { $0.id == item.id }
         save()
-
-        // CONCURRENCY FIX: Hand the heavy unlinking to the file system in the background
+        let target = url(for: item), thumb = thumbURL(for: item), sub = savedSubtitleURL(for: item), isExt = item.isExternal
         Task.detached(priority: .userInitiated) {
             let localFm = FileManager.default
-            if !offline {
-                try? localFm.removeItem(at: target)
-                if !isExt {
-                    try? localFm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt"))
-                }
-            }
-            try? localFm.removeItem(at: thumb)
-            try? localFm.removeItem(at: sub)
+            if !isExt { try? localFm.removeItem(at: target); try? localFm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt")) }
+            try? localFm.removeItem(at: thumb); try? localFm.removeItem(at: sub)
         }
-    }
-
-    func clearProgress() {
-        for i in items.indices { items[i].lastPosition = 0; items[i].lastPlayed = nil }
-        save()
     }
 
     func deleteAll() {
         for item in items {
             if item.folderID == nil { try? fm.removeItem(at: url(for: item)) }
-            try? fm.removeItem(at: thumbURL(for: item))
-            try? fm.removeItem(at: savedSubtitleURL(for: item))
+            try? fm.removeItem(at: thumbURL(for: item)); try? fm.removeItem(at: savedSubtitleURL(for: item))
         }
-        watcher.stopAll()
-        watchedDirectories.removeAll()
+        watcher.stopAll(); watchedDirectories.removeAll()
         for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }
-        folderURLs.removeAll()
-        folders.removeAll()
-        items.removeAll()
-        saveFolders()
-        save()
+        folderURLs.removeAll(); folders.removeAll(); items.removeAll(); saveFolders(); save()
     }
 
-    
-    func storageString() -> String {
-        return "Calculating…" 
-    }
+    func storageString() -> String { "Calculating…" }
 
     func calculateStorageAsync() async -> String {
         let path = mediaDir
@@ -608,24 +408,15 @@ final class LibraryStore: ObservableObject {
             var total: Int64 = 0
             let localFm = FileManager.default
             if let enumerator = localFm.enumerator(at: path, includingPropertiesForKeys: [.fileSizeKey]) {
-                
-                // SWIFT 6 FIX: Use while-let instead of for-in to safely iterate in an async context
                 while let f = enumerator.nextObject() as? URL {
-                    if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { 
-                        total += Int64(size) 
-                    }
+                    if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += Int64(size) }
                 }
-                
             }
             return total
         }.value
         return ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
     }
 
-
-    // MARK: - Helpers
-
-    // SWIFT 6 FIX: Safely marked nonisolated to clear the Swift 6 GitHub Actions error
     nonisolated static func prettyTitle(from raw: String) -> String {
         var s = raw.replacingOccurrences(of: "_", with: " ")
         if !s.contains(" ") { s = s.replacingOccurrences(of: ".", with: " ") }
@@ -635,9 +426,7 @@ final class LibraryStore: ObservableObject {
         for m in markers { if let r = lower.range(of: m) { cut = min(cut, lower.distance(from: lower.startIndex, to: r.lowerBound)) } }
         if cut < s.count { s = String(s.prefix(cut)) }
         s = s.trimmingCharacters(in: CharacterSet(charactersIn: " -._[]()"))
-
-        let pattern = "(?i)s\\d{1,2}e\\d{1,2}.*"
-        if let regex = try? NSRegularExpression(pattern: pattern) {
+        if let regex = try? NSRegularExpression(pattern: "(?i)s\\d{1,2}e\\d{1,2}.*") {
             s = regex.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return s.isEmpty ? raw : s
@@ -657,11 +446,4 @@ final class LibraryStore: ObservableObject {
             try? data.write(to: dest, options: .atomic)
         }.value
     }
-}
-
-func formatTime(_ t: Double) -> String {
-    guard t.isFinite, t >= 0 else { return "0:00" }
-    let total = Int(t.rounded())
-    let h = total / 3600, m = (total % 3600) / 60, s = total % 60
-    return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
 }
