@@ -1,37 +1,7 @@
 // ==========================================================
 //  IMPROVEMENT 1  -  MKV DURATION AND THUMBNAILS  (file 1 of 2)
 //
-//  File to CREATE:  Sources/Player/VLCProbe.swift
-//  On GitHub: open Sources/Player, "Add file" > "Create new file",
-//  name it VLCProbe.swift, paste this in, commit.
-//
-//  THE BUG
-//  -------
-//  ingest() asked AVURLAsset for the duration of every file. AVFoundation
-//  cannot open Matroska, AVI, WebM or MPEG-TS, so every .mkv landed in the
-//  library with duration = 0. Follow that thread:
-//
-//    - Continue Watching filters on duration > 0, so mkv never appeared
-//    - isWatched is progress >= 0.95, and progress divides by duration,
-//      so an mkv could never be marked watched
-//    - the Trakt check-in guards on duration > 0, so it never fired
-//    - the duration pill on the card stayed blank
-//
-//  Every one of those is the same missing number.
-//
-//  The frame grab failed for the same reason. AVAssetImageGenerator
-//  returned nil, so the card fell back to the film icon unless TMDB had
-//  matched a poster.
-//
-//  THE FIX
-//  -------
-//  VLC already ships in this app and reads all of it. Ask VLC instead when
-//  AVFoundation cannot help.
-//
-//  Note the deliberate "let parsed: VLCTime?" and "let cgImage: CGImage?"
-//  lines. MobileVLCKit's headers carry no nullability annotations, so those
-//  values arrive as implicitly unwrapped optionals. Binding them through an
-//  explicit optional type compiles whether or not that ever changes.
+//  File:  Sources/Player/VLCProbe.swift
 // ==========================================================
 
 import Foundation
@@ -108,12 +78,12 @@ private final class VLCFrameGrabber: NSObject, VLCMediaThumbnailerDelegate {
         }
     }
 
-    nonisolated func mediaThumbnailerDidTimeOut(_ mediaThumbnailer: VLCMediaThumbnailer?) {
+    nonisolated func mediaThumbnailerDidTimeOut(_ mediaThumbnailer: VLCMediaThumbnailer) {
         Task { @MainActor [weak self] in self?.finish(nil) }
     }
 
-    nonisolated func mediaThumbnailer(_ mediaThumbnailer: VLCMediaThumbnailer?, didFinishThumbnail thumbnail: CGImage?) {
-        let image = thumbnail.map { UIImage(cgImage: $0) }
+    nonisolated func mediaThumbnailer(_ mediaThumbnailer: VLCMediaThumbnailer, didFinishThumbnail thumbnail: CGImage) {
+        let image = UIImage(cgImage: thumbnail)
         Task { @MainActor [weak self] in self?.finish(image) }
     }
 
