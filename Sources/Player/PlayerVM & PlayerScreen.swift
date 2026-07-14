@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: OSD TEXT PLACEMENT & ANIMATION FIX
+//  REFACTORED: VIDEO SCALING (FIT, FILL/CROP, STRETCH)
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -15,6 +15,32 @@ import UIKit
 import UniformTypeIdentifiers
 import MobileVLCKit
 import CoreMedia
+
+// MARK: - Video Scale Modes
+
+enum VideoScaleMode: String, CaseIterable, Identifiable {
+    case fit = "Fit Screen"
+    case fill = "Fill (Crop)"
+    case stretch = "Stretch to Fill"
+    
+    var id: String { rawValue }
+    
+    var avGravity: AVLayerVideoGravity {
+        switch self {
+        case .fit: return .resizeAspect
+        case .fill: return .resizeAspectFill
+        case .stretch: return .resize
+        }
+    }
+    
+    var icon: String {
+        switch self {
+        case .fit: return "arrow.down.right.and.arrow.up.left"
+        case .fill: return "arrow.up.left.and.arrow.down.right"
+        case .stretch: return "rectangle.expand.vertical"
+        }
+    }
+}
 
 // MARK: - System Media Coordinator
 
@@ -213,7 +239,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     
     private let systemMedia = SystemMediaCoordinator()
 
-    @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var fillScreen = false; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
+    @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var scaleMode: VideoScaleMode = .fit; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
     
     @Published var audioOptions: [AVMediaSelectionOption] = []
     @Published var legibleOptions: [AVMediaSelectionOption] = []
@@ -449,6 +475,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func skip(_ seconds: Double) { seek(to: current + seconds); flash(seconds >= 0 ? "+\(Int(seconds))s" : "\(Int(seconds))s") }
     func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)); syncSystemState() }
     func setVolume(_ value: Double) { volumeLevel = min(max(value, 0), 1); if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }; flash("Volume \(Int(volumeLevel * 100))%") }
+    func setScaleMode(_ mode: VideoScaleMode) { scaleMode = mode; flash(mode.rawValue) }
     
     func adjustSubtitleDelay(by seconds: Double) {
         subtitleDelay = ((subtitleDelay + seconds) * 10).rounded() / 10
@@ -474,7 +501,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func flash(_ text: String) { 
-        // Smooth fade out for previous text if spamming
         withAnimation(.easeInOut(duration: 0.15)) { flashText = text }
         flashTask?.cancel()
         flashTask = Task { @MainActor [weak self] in 
@@ -678,9 +704,9 @@ struct PlayerScreen: View {
                 Color.black.ignoresSafeArea()
 
                 if vm.media.isEngineSupported { 
-                    PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect).ignoresSafeArea() 
+                    PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.scaleMode.avGravity).ignoresSafeArea() 
                 } else { 
-                    VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() 
+                    VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() // Scale Mode handled internally by VLC Layer if supported
                 }
 
                 Color.black.opacity(0.001)
@@ -696,8 +722,6 @@ struct PlayerScreen: View {
 
                 subtitleOverlay
                 
-                // Moved controls above the OSDBadge in the ZStack
-                // This ensures OSD (volume, skipping text) is NEVER hidden behind buttons!
                 controls
                     .opacity(vm.showControls ? 1 : 0)
                     .animation(.easeInOut(duration: 0.25), value: vm.showControls)
@@ -706,7 +730,7 @@ struct PlayerScreen: View {
                 if let flash = vm.flashText { 
                     VStack {
                         OSDBadge(text: flash)
-                            .padding(.top, 96) // Push perfectly under the top bar
+                            .padding(.top, 96)
                         Spacer()
                     }
                     .transition(.opacity.combined(with: .scale(scale: 0.95)))
@@ -722,7 +746,7 @@ struct PlayerScreen: View {
         .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) } }
         .sheet(isPresented: $showSettingsSheet) {
             PlayerSettingsSheet(vm: vm, showSubImporter: $showSubImporter)
-                .presentationDetents([.height(380), .large])
+                .presentationDetents([.height(450), .large])
                 .presentationBackground(.ultraThinMaterial)
                 .presentationCornerRadius(32)
         }
@@ -854,8 +878,18 @@ struct PlayerScreen: View {
                     .accessibilityLabel("Playback speed")
                     .accessibilityValue(String(format: "%.2gx", vm.rate))
 
-                Button { vm.fillScreen.toggle() } label: { Image(systemName: vm.fillScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }
-                    .accessibilityLabel(vm.fillScreen ? "Fit video to screen" : "Fill screen with video")
+                Menu {
+                    ForEach(VideoScaleMode.allCases) { mode in
+                        Button {
+                            vm.setScaleMode(mode)
+                        } label: {
+                            HStack { Text(mode.rawValue); Spacer(); if vm.scaleMode == mode { Image(systemName: "checkmark") } }
+                        }
+                    }
+                } label: {
+                    Image(systemName: vm.scaleMode.icon)
+                }
+                .accessibilityLabel("Video Size")
 
                 Spacer()
             }.font(.subheadline).foregroundStyle(.white)
@@ -930,6 +964,21 @@ struct PlayerSettingsSheet: View {
         ScrollView {
             VStack(spacing: 24) {
                 
+                // MARK: Video
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("Video").font(.headline).foregroundStyle(.secondary)
+                    
+                    settingRow(title: "Size Mode", systemImage: vm.scaleMode.icon) {
+                        Menu(vm.scaleMode.rawValue) {
+                            ForEach(VideoScaleMode.allCases) { mode in
+                                Button(mode.rawValue) { vm.setScaleMode(mode) }
+                            }
+                        }.foregroundStyle(.white)
+                    }
+                }
+                
+                Divider().background(Color.white.opacity(0.2))
+
                 // MARK: Tracks
                 VStack(alignment: .leading, spacing: 14) {
                     Text("Tracks").font(.headline).foregroundStyle(.secondary)
