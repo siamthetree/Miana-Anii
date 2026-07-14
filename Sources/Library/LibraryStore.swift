@@ -1,17 +1,17 @@
 // ==========================================================
-//  BUG 3  -  GROUP ONCE, NOT EIGHT TIMES A FRAME  (2 of 4)
+//  BUG 4  -  STOP WRITING TO THE USER'S DRIVE  (file 1 of 2)
 //
 //  File:  Sources/Library/LibraryStore.swift
-//  Replace the entire file. Supersedes BUG-2a.
+//  Replace the entire file. Supersedes BUG-3b.
 //
-//  The store now publishes `entries`, the grouped library, and keeps a
-//  seriesIndex dictionary beside it. Both are rebuilt in save(), which
-//  every mutating path already ends in.
+//  Adds a Subtitles directory alongside Media and Thumbnails, and two
+//  accessors: savedSubtitleURL, which is inside the app and keyed by item
+//  id, and sidecarSubtitleURL, which is next to the video and only ever
+//  read.
 //
-//  Not a didSet on items, which would read better and behave worse:
-//  mutating one element of an array fires didSet, so the batched update
-//  from BUG 2 would have regrouped once per episode. Exactly the bug it
-//  was meant to fix.
+//  delete(), deleteAll() and removeFolder() now clean up the saved
+//  subtitle too, and delete() no longer tries to remove an .srt next to a
+//  media source file, because it never put one there.
 // ==========================================================
 
 import Foundation
@@ -39,6 +39,7 @@ final class LibraryStore: ObservableObject {
     let documentsURL: URL
     let mediaDir: URL
     let thumbsDir: URL
+    let subsDir: URL
     private let indexURL: URL
     private let foldersURL: URL
 
@@ -52,10 +53,12 @@ final class LibraryStore: ObservableObject {
         documentsURL = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
         mediaDir = documentsURL.appendingPathComponent("Media", isDirectory: true)
         thumbsDir = documentsURL.appendingPathComponent("Thumbnails", isDirectory: true)
+        subsDir = documentsURL.appendingPathComponent("Subtitles", isDirectory: true)
         indexURL = documentsURL.appendingPathComponent("library.json")
         foldersURL = documentsURL.appendingPathComponent("folders.json")
         try? fm.createDirectory(at: mediaDir, withIntermediateDirectories: true)
         try? fm.createDirectory(at: thumbsDir, withIntermediateDirectories: true)
+        try? fm.createDirectory(at: subsDir, withIntermediateDirectories: true)
         load()
         loadFolders()
         activateFolders()
@@ -109,6 +112,18 @@ final class LibraryStore: ObservableObject {
 
     func thumbURL(for item: MediaItem) -> URL {
         thumbsDir.appendingPathComponent(item.id.uuidString + ".jpg")
+    }
+
+    /// Where a subtitle you loaded in the player is kept. Inside the app, never
+    /// beside your file: a media source is your own drive, and this app has no
+    /// business writing to it.
+    func savedSubtitleURL(for item: MediaItem) -> URL {
+        subsDir.appendingPathComponent(item.id.uuidString + ".srt")
+    }
+
+    /// An .srt already sitting next to the video, which we only ever read.
+    func sidecarSubtitleURL(for item: MediaItem) -> URL {
+        url(for: item).deletingPathExtension().appendingPathExtension("srt")
     }
 
     /// True when the item's watched folder is unreachable right now.
@@ -187,6 +202,7 @@ final class LibraryStore: ObservableObject {
 
         for item in items where item.folderID == folder.id {
             try? fm.removeItem(at: thumbURL(for: item))
+            try? fm.removeItem(at: savedSubtitleURL(for: item))
         }
         items.removeAll { $0.folderID == folder.id }
         folders.removeAll { $0.id == folder.id }
@@ -447,9 +463,14 @@ final class LibraryStore: ObservableObject {
         if !isOffline(item) {
             let target = url(for: item)
             try? fm.removeItem(at: target)
-            try? fm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt"))
+            // Only ever a sidecar we put in Media ourselves. A media source lives
+            // on the user's drive and we do not write .srt files there.
+            if !item.isExternal {
+                try? fm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt"))
+            }
         }
         try? fm.removeItem(at: thumbURL(for: item))
+        try? fm.removeItem(at: savedSubtitleURL(for: item))
         items.removeAll { $0.id == item.id }
         save()
     }
@@ -465,6 +486,7 @@ final class LibraryStore: ObservableObject {
         for item in items {
             if item.folderID == nil { try? fm.removeItem(at: url(for: item)) }
             try? fm.removeItem(at: thumbURL(for: item))
+            try? fm.removeItem(at: savedSubtitleURL(for: item))
         }
         watcher.stopAll()
         for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }
