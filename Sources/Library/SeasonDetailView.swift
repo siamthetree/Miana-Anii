@@ -8,6 +8,7 @@ struct SeasonDetailView: View {
     let close: () -> Void
 
     @EnvironmentObject private var store: LibraryStore
+    @State private var deleting: MediaItem?
 
     private var series: Series? { store.items.series(withID: seriesID) }
     private var season: Season? { series?.seasons.first(where: { $0.number == seasonNumber }) }
@@ -27,6 +28,23 @@ struct SeasonDetailView: View {
         .toolbar {
             ToolbarItem(placement: .navigationBarTrailing) { Button("Done") { close() } }
         }
+        .confirmationDialog(deleting.map(deletePrompt) ?? "",
+                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            titleVisibility: .visible) {
+            Button("Delete File", role: .destructive) {
+                if let item = deleting { store.delete(item) }
+                deleting = nil
+            }
+            Button("Cancel", role: .cancel) { deleting = nil }
+        }
+    }
+
+    private func deletePrompt(_ item: MediaItem) -> String {
+        let title = item.displayEpisodeTitle
+        if item.isExternal {
+            return "Delete “\(title)” from your media source? This removes the file from disk."
+        }
+        return "Delete “\(title)”? This removes the file from this iPad."
     }
 
     // MARK: - Header
@@ -79,7 +97,6 @@ struct SeasonDetailView: View {
         }
     }
 
-    // MARK: - Episodes
 
     private func episodeList(_ season: Season) -> some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -110,11 +127,10 @@ struct SeasonDetailView: View {
         } else if item.duration > 0 {
             Button { store.markWatched(item) } label: { Label("Mark as Watched", systemImage: "eye") }
         }
-        Button(role: .destructive) { store.delete(item) } label: { Label("Delete", systemImage: "trash") }
+        Button(role: .destructive) { deleting = item } label: { Label("Delete", systemImage: "trash") }
     }
 }
 
-// MARK: - Episode row
 
 struct EpisodeRow: View {
     let item: MediaItem
@@ -202,7 +218,6 @@ struct EpisodeRow: View {
     }
 }
 
-// MARK: - Episode detail
 
 struct EpisodeDetailView: View {
     let itemID: UUID
@@ -210,6 +225,7 @@ struct EpisodeDetailView: View {
 
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.dismiss) private var dismiss
+    @State private var deletingEpisode: MediaItem?
 
     private var item: MediaItem? { store.items.first(where: { $0.id == itemID }) }
 
@@ -277,7 +293,7 @@ struct EpisodeDetailView: View {
                             Button("Mark as Watched") { store.markWatched(item) }
                         }
                         Spacer()
-                        Button("Delete", role: .destructive) { store.delete(item); dismiss() }
+                        Button("Delete", role: .destructive) { deletingEpisode = item }
                     }
                     .font(.subheadline.weight(.medium))
                     .padding(.top, 4)
@@ -288,6 +304,20 @@ struct EpisodeDetailView: View {
         .background(Color(white: 0.06).ignoresSafeArea())
         .navigationTitle(item?.episodeCode ?? "Episode")
         .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog(deletingEpisode.map { episode in
+                                episode.isExternal
+                                ? "Delete “\(episode.displayEpisodeTitle)” from your media source? This removes the file from disk."
+                                : "Delete “\(episode.displayEpisodeTitle)”? This removes the file from this iPad."
+                            } ?? "",
+                            isPresented: Binding(get: { deletingEpisode != nil }, set: { if !$0 { deletingEpisode = nil } }),
+                            titleVisibility: .visible) {
+            Button("Delete File", role: .destructive) {
+                if let episode = deletingEpisode { store.delete(episode) }
+                deletingEpisode = nil
+                dismiss()
+            }
+            Button("Cancel", role: .cancel) { deletingEpisode = nil }
+        }
     }
 
     private var metaLine: String {
