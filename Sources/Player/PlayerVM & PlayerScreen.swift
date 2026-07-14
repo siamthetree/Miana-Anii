@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: BINGE MODE (AUTO-PLAY UP NEXT)
+//  REFACTORED: CYCLING SCALE BUTTON (TOUCH & FLICKER FIX)
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -319,7 +319,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         systemMedia.start(media: media, store: store)
         
         let url = store.url(for: media); let defaults = UserDefaults.standard
-        if defaults.object(forKey: "defaultRate") != nil { rate = defaults.double(forKey: "defaultRate") }; if rate <= 1 { rate = 1 } // Reset to 1x to be safe
+        if defaults.object(forKey: "defaultRate") != nil { rate = defaults.double(forKey: "defaultRate") }; if rate <= 1 { rate = 1 } 
         let autoResume = (defaults.object(forKey: "autoResume") as? Bool) ?? true
 
         let finished = media.duration > 0 && media.lastPosition >= media.duration * 0.95
@@ -344,7 +344,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                     self.scrobbleWatched()
                     if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
                     
-                    // BINGE MODE: Automatically start the next episode
                     if self.nextMedia != nil {
                         self.playNext()
                     } else {
@@ -367,7 +366,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                         self.syncSystemState() 
                     }
                     
-                    // Trigger Up Next Button
                     if self.duration > 0, self.nextMedia != nil {
                         let remaining = self.duration - self.current
                         let shouldShow = remaining <= 30 || (self.current / self.duration) >= 0.95
@@ -419,7 +417,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.scrobbleWatched()
                 if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
                 
-                // BINGE MODE: Automatically start the next episode
                 if self.nextMedia != nil {
                     self.playNext()
                 } else {
@@ -454,7 +451,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.syncSystemState() 
             }
             
-            // Trigger Up Next Button
             if self.duration > 0, self.nextMedia != nil {
                 let remaining = self.duration - self.current
                 let shouldShow = remaining <= 30 || (self.current / self.duration) >= 0.95
@@ -549,6 +545,13 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)); syncSystemState() }
     func setVolume(_ value: Double) { volumeLevel = min(max(value, 0), 1); if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }; flash("Volume \(Int(volumeLevel * 100))%") }
     func setScaleMode(_ mode: VideoScaleMode) { scaleMode = mode; flash(mode.rawValue) }
+    
+    func cycleScaleMode() {
+        let all = VideoScaleMode.allCases
+        if let idx = all.firstIndex(of: scaleMode) {
+            setScaleMode(all[(idx + 1) % all.count])
+        }
+    }
     
     func adjustSubtitleDelay(by seconds: Double) {
         subtitleDelay = ((subtitleDelay + seconds) * 10).rounded() / 10
@@ -991,18 +994,17 @@ struct PlayerScreen: View {
                     .accessibilityLabel("Playback speed")
                     .accessibilityValue(String(format: "%.2gx", vm.rate))
 
-                Menu {
-                    ForEach(VideoScaleMode.allCases) { mode in
-                        Button {
-                            vm.setScaleMode(mode)
-                        } label: {
-                            HStack { Text(mode.rawValue); Spacer(); if vm.scaleMode == mode { Image(systemName: "checkmark") } }
-                        }
-                    }
+                // The fix: Direct cycling button instead of an overlapping gesture-killing Menu!
+                Button {
+                    vm.cycleScaleMode()
                 } label: {
                     Image(systemName: vm.scaleMode.icon)
+                        .font(.system(size: 20))
+                        .frame(width: 44, height: 44) // Massive touch target
+                        .contentShape(Rectangle()) // Confirms hit testing across the whole frame
+                        .contentTransition(.symbolEffect(.replace)) // Smoothly morphs the icon
                 }
-                .accessibilityLabel("Video Size")
+                .accessibilityLabel("Cycle Video Size")
 
                 Spacer()
             }.font(.subheadline).foregroundStyle(.white)
