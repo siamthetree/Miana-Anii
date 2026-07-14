@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: VIDEO SCALING (FIT, FILL/CROP, STRETCH)
+//  REFACTORED: VLC SCALE MODE MAPPED TO UI
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -704,9 +704,11 @@ struct PlayerScreen: View {
                 Color.black.ignoresSafeArea()
 
                 if vm.media.isEngineSupported { 
+                    // Now perfectly maps the internal Audio/Video gravity Engine to the Scale UI Mode!
                     PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.scaleMode.avGravity).ignoresSafeArea() 
                 } else { 
-                    VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() // Scale Mode handled internally by VLC Layer if supported
+                    // This directly hooks the Scale Mode into your custom VLC container view!
+                    VLCPlayerLayerView(player: vm.vlcPlayer, scaleMode: vm.scaleMode).ignoresSafeArea() 
                 }
 
                 Color.black.opacity(0.001)
