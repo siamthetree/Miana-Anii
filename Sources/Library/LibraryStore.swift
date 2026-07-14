@@ -1,5 +1,5 @@
 // ==========================================================
-//  FINAL MERGED: BUG 10 + CONCURRENCY + SWIFT 6 COMPILER FIXES
+//  FINAL STABILIZED: BUG 10 + ACTOR DISK WRITER + SWIFT 6
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -10,6 +10,16 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 import AVFoundation
+
+/// A background actor dedicated to safely serializing all disk writes.
+/// This completely prevents the app from crashing when multiple detached tasks
+/// attempt to atomically overwrite library.json at the exact same millisecond.
+actor DiskWriter {
+    static let shared = DiskWriter()
+    func write(_ data: Data, to url: URL) {
+        try? data.write(to: url, options: .atomic)
+    }
+}
 
 @MainActor
 final class LibraryStore: ObservableObject {
@@ -90,7 +100,9 @@ final class LibraryStore: ObservableObject {
         regroup()
         guard let data = try? JSONEncoder().encode(items) else { return }
         let targetURL = self.indexURL
-        Task.detached(priority: .background) { try? data.write(to: targetURL, options: .atomic) }
+        
+        // CRASH FIX: Route through the DiskWriter actor to serialize file system access
+        Task { await DiskWriter.shared.write(data, to: targetURL) }
     }
 
     private func regroup() {
@@ -108,7 +120,10 @@ final class LibraryStore: ObservableObject {
 
     private func saveFolders() {
         guard let data = try? JSONEncoder().encode(folders) else { return }
-        try? data.write(to: foldersURL, options: .atomic)
+        let targetURL = self.foldersURL
+        
+        // CRASH FIX: Route through the DiskWriter actor
+        Task { await DiskWriter.shared.write(data, to: targetURL) }
     }
 
     // MARK: - Paths
@@ -181,8 +196,10 @@ final class LibraryStore: ObservableObject {
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
         folderURLs[folder.id] = nil
         for item in items where item.folderID == folder.id {
-            try? fm.removeItem(at: thumbURL(for: item))
-            try? fm.removeItem(at: savedSubtitleURL(for: item))
+            let t = thumbURL(for: item)
+            let s = savedSubtitleURL(for: item)
+            if fm.fileExists(atPath: t.path) { try? fm.removeItem(at: t) }
+            if fm.fileExists(atPath: s.path) { try? fm.removeItem(at: s) }
         }
         items.removeAll { $0.folderID == folder.id }
         folders.removeAll { $0.id == folder.id }
@@ -372,8 +389,6 @@ final class LibraryStore: ObservableObject {
     func backfillDurations() async {
         for item in items.filter({ $0.duration <= 0 }) {
             guard !isOffline(item), let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
-            
-            // SWIFT 6 FIX: Resolve the URL on the main thread before passing it to the detached task
             let targetURL = url(for: item)
             items[index].duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: targetURL) }.value
         }
@@ -393,25 +408,40 @@ final class LibraryStore: ObservableObject {
         Task.detached(priority: .userInitiated) {
             let localFm = FileManager.default
             if !offline {
-                try? localFm.removeItem(at: target)
-                if !isExt { try? localFm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt")) }
+                if localFm.fileExists(atPath: target.path) { try? localFm.removeItem(at: target) }
+                if !isExt { 
+                    let sidecar = target.deletingPathExtension().appendingPathExtension("srt")
+                    if localFm.fileExists(atPath: sidecar.path) { try? localFm.removeItem(at: sidecar) }
+                }
             }
-            try? localFm.removeItem(at: thumb); try? localFm.removeItem(at: sub)
+            if localFm.fileExists(atPath: thumb.path) { try? localFm.removeItem(at: thumb) }
+            if localFm.fileExists(atPath: sub.path) { try? localFm.removeItem(at: sub) }
         }
     }
     
     func clearProgress() { for i in items.indices { items[i].lastPosition = 0; items[i].lastPlayed = nil }; save() }
+    
     func deleteAll() {
-        for item in items { if item.folderID == nil { try? fm.removeItem(at: url(for: item)) }; try? fm.removeItem(at: thumbURL(for: item)); try? fm.removeItem(at: savedSubtitleURL(for: item)) }
-        watcher.stopAll(); watchedDirectories.removeAll(); for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }; folderURLs.removeAll(); folders.removeAll(); items.removeAll(); saveFolders(); save()
+        for item in items {
+            if item.folderID == nil { 
+                let target = url(for: item)
+                if fm.fileExists(atPath: target.path) { try? fm.removeItem(at: target) }
+            }
+            let thumb = thumbURL(for: item)
+            let sub = savedSubtitleURL(for: item)
+            if fm.fileExists(atPath: thumb.path) { try? fm.removeItem(at: thumb) }
+            if fm.fileExists(atPath: sub.path) { try? fm.removeItem(at: sub) }
+        }
+        watcher.stopAll(); watchedDirectories.removeAll()
+        for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }
+        folderURLs.removeAll(); folders.removeAll(); items.removeAll()
+        saveFolders(); save()
     }
 
     func storageString() -> String { "Calculating…" }
 
     func calculateStorageAsync() async -> String {
-        // SWIFT 6 FIX: Resolve the directory path on the main thread
         let targetPath = mediaDir
-        
         let totalBytes = await Task.detached(priority: .utility) {
             var total: Int64 = 0
             let localFm = FileManager.default
