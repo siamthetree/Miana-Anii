@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: VLC SCALE MODE MAPPED TO UI
+//  REFACTORED: BINGE MODE (AUTO-PLAY UP NEXT)
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -232,12 +232,16 @@ final class SystemMediaCoordinator {
 @MainActor
 final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let store: LibraryStore
-    let media: MediaItem
+    @Published private(set) var media: MediaItem
     let player = AVPlayer()
     let layerHolder = PlayerLayerHolder()
     let vlcPlayer = VLCMediaPlayer()
     
     private let systemMedia = SystemMediaCoordinator()
+
+    // Binge Mode State
+    @Published var nextMedia: MediaItem?
+    @Published var showUpNext: Bool = false
 
     @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var scaleMode: VideoScaleMode = .fit; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
     
@@ -267,7 +271,44 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     private static let watchedSecondsRemaining: Double = 180
 
-    init(media: MediaItem, store: LibraryStore) { self.media = media; self.store = store; super.init() }
+    init(media: MediaItem, store: LibraryStore) { 
+        self.media = media
+        self.store = store
+        super.init() 
+        self.resolveNextMedia()
+    }
+
+    private func resolveNextMedia() {
+        nextMedia = nil
+        guard media.isEpisode, let key = media.seriesKey else { return }
+        guard let show = store.items.series(withID: key) else { return }
+        
+        let orderedEpisodes = show.seasons.flatMap { $0.episodes }
+        if let idx = orderedEpisodes.firstIndex(where: { $0.id == media.id }), idx + 1 < orderedEpisodes.count {
+            nextMedia = orderedEpisodes[idx + 1]
+        }
+    }
+
+    func playNext() {
+        guard let next = nextMedia else { return }
+        stop() // Safely halts and saves current media
+        
+        // Reset and prepare new episode
+        self.media = next
+        self.nextMedia = nil
+        self.showUpNext = false
+        self.current = 0
+        self.duration = 0
+        self.cueText = nil
+        self.cues = []
+        self.hasExternalCues = false
+        self.pendingVLCSeek = nil
+        self.hasScrobbledWatched = false
+        self.isScrobbling = false
+        
+        resolveNextMedia() // Checks if there's a 3rd episode coming up
+        start() // Kicks off native playback again
+    }
 
     func start() {
         systemMedia.onPlay = { [weak self] in self?.play() }
@@ -278,7 +319,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         systemMedia.start(media: media, store: store)
         
         let url = store.url(for: media); let defaults = UserDefaults.standard
-        if defaults.object(forKey: "defaultRate") != nil { rate = defaults.double(forKey: "defaultRate") }; if rate <= 0 { rate = 1 }
+        if defaults.object(forKey: "defaultRate") != nil { rate = defaults.double(forKey: "defaultRate") }; if rate <= 1 { rate = 1 } // Reset to 1x to be safe
         let autoResume = (defaults.object(forKey: "autoResume") as? Bool) ?? true
 
         let finished = media.duration > 0 && media.lastPosition >= media.duration * 0.95
@@ -300,9 +341,16 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in 
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    self.isPlaying = false; self.showControls = true
+                    self.scrobbleWatched()
                     if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
-                    self.scrobbleWatched(); self.syncSystemState()
+                    
+                    // BINGE MODE: Automatically start the next episode
+                    if self.nextMedia != nil {
+                        self.playNext()
+                    } else {
+                        self.isPlaying = false; self.showControls = true
+                        self.syncSystemState()
+                    }
                 }
             }
             loadSelectionGroups(for: item)
@@ -317,6 +365,15 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                     if self.duration != self.lastKnownDuration { 
                         self.lastKnownDuration = self.duration
                         self.syncSystemState() 
+                    }
+                    
+                    // Trigger Up Next Button
+                    if self.duration > 0, self.nextMedia != nil {
+                        let remaining = self.duration - self.current
+                        let shouldShow = remaining <= 30 || (self.current / self.duration) >= 0.95
+                        if self.showUpNext != shouldShow {
+                            withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { self.showUpNext = shouldShow }
+                        }
                     }
                     
                     self.periodicSave()
@@ -359,9 +416,16 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.applyPendingVLCSeek()
             case .paused: self.isPlaying = false
             case .ended: 
-                self.isPlaying = false; self.showControls = true
-                if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
                 self.scrobbleWatched()
+                if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
+                
+                // BINGE MODE: Automatically start the next episode
+                if self.nextMedia != nil {
+                    self.playNext()
+                } else {
+                    self.isPlaying = false; self.showControls = true
+                    self.syncSystemState()
+                }
             case .error: self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
             default: break
             }
@@ -388,6 +452,15 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             if self.duration != self.lastKnownDuration { 
                 self.lastKnownDuration = self.duration
                 self.syncSystemState() 
+            }
+            
+            // Trigger Up Next Button
+            if self.duration > 0, self.nextMedia != nil {
+                let remaining = self.duration - self.current
+                let shouldShow = remaining <= 30 || (self.current / self.duration) >= 0.95
+                if self.showUpNext != shouldShow {
+                    withAnimation(.spring(response: 0.4, dampingFraction: 0.8)) { self.showUpNext = shouldShow }
+                }
             }
             
             self.periodicSave()
@@ -704,10 +777,8 @@ struct PlayerScreen: View {
                 Color.black.ignoresSafeArea()
 
                 if vm.media.isEngineSupported { 
-                    // Now perfectly maps the internal Audio/Video gravity Engine to the Scale UI Mode!
                     PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.scaleMode.avGravity).ignoresSafeArea() 
                 } else { 
-                    // This directly hooks the Scale Mode into your custom VLC container view!
                     VLCPlayerLayerView(player: vm.vlcPlayer, scaleMode: vm.scaleMode).ignoresSafeArea() 
                 }
 
@@ -728,6 +799,8 @@ struct PlayerScreen: View {
                     .opacity(vm.showControls ? 1 : 0)
                     .animation(.easeInOut(duration: 0.25), value: vm.showControls)
                     .allowsHitTesting(vm.showControls)
+                
+                upNextOverlay
 
                 if let flash = vm.flashText { 
                     VStack {
@@ -753,6 +826,44 @@ struct PlayerScreen: View {
                 .presentationCornerRadius(32)
         }
         .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Up Next Binge UI
+    
+    @ViewBuilder
+    private var upNextOverlay: some View {
+        if vm.showUpNext, let next = vm.nextMedia {
+            VStack {
+                Spacer()
+                HStack {
+                    Spacer()
+                    Button {
+                        vm.playNext()
+                    } label: {
+                        HStack(spacing: 16) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Up Next").font(.caption.weight(.heavy)).foregroundStyle(.white.opacity(0.7)).textCase(.uppercase)
+                                Text(next.isEpisode ? next.displayEpisodeTitle : next.title)
+                                    .font(.subheadline.bold())
+                                    .foregroundStyle(.white)
+                                    .lineLimit(1)
+                            }
+                            Image(systemName: "play.fill").font(.title2).foregroundStyle(.white)
+                        }
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 14)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .colorScheme(.dark)
+                        .overlay(Capsule().stroke(.white.opacity(0.2), lineWidth: 1))
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 32)
+                    .padding(.bottom, vm.showControls ? 160 : 44)
+                }
+            }
+            .transition(.move(edge: .trailing).combined(with: .opacity))
+            .zIndex(10)
+        }
     }
 
     private var subtitleOverlay: some View {
