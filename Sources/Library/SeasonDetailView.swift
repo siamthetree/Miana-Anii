@@ -1,12 +1,11 @@
 // ==========================================================
-//  BUG 2  -  ONE DISK WRITE, NOT SIXTY  (file 3 of 3)
+//  BUG 3  -  GROUP ONCE, NOT EIGHT TIMES A FRAME  (4 of 4)
 //
 //  File:  Sources/Library/SeasonDetailView.swift
-//  Replace the entire file. Supersedes BUG-1b.
+//  Replace the entire file. Supersedes BUG-2c.
 //
-//  The season screen had no bulk action at all. It now has one, next to
-//  the Episodes header, using the same batched call. One write for the
-//  season, not one per episode.
+//  Same lookup, same fix. `season` also stopped regrouping, because
+//  Series.seasons is stored now.
 // ==========================================================
 
 import Foundation
@@ -21,7 +20,7 @@ struct SeasonDetailView: View {
     @EnvironmentObject private var store: LibraryStore
     @State private var deleting: MediaItem?
 
-    private var series: Series? { store.items.series(withID: seriesID) }
+    private var series: Series? { store.series(withID: seriesID) }
     private var season: Season? { series?.seasons.first(where: { $0.number == seasonNumber }) }
 
     var body: some View {
