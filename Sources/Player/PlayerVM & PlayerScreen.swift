@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: SUBTITLE SIZE & BANGLA FONT CONTROLS
+//  REFACTORED: FLICKER FIX + SETTINGS SHEET + BANGLA FONTS
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -212,9 +212,18 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     
     private let systemMedia = SystemMediaCoordinator()
 
-    @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var fillScreen = false; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var audioOptions: [AVMediaSelectionOption] = []; @Published var legibleOptions: [AVMediaSelectionOption] = []; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
-    @Published var vlcSubtitleTracks: [PlayerTrack] = []; @Published var vlcAudioTracks: [PlayerTrack] = []
-    @Published var vlcSubtitleIndex: Int32 = -1; @Published var vlcAudioIndex: Int32 = -1
+    @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var fillScreen = false; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
+    
+    // Tracks
+    @Published var audioOptions: [AVMediaSelectionOption] = []
+    @Published var legibleOptions: [AVMediaSelectionOption] = []
+    @Published var currentAudioOption: AVMediaSelectionOption?
+    @Published var currentLegibleOption: AVMediaSelectionOption?
+    
+    @Published var vlcSubtitleTracks: [PlayerTrack] = []
+    @Published var vlcAudioTracks: [PlayerTrack] = []
+    @Published var vlcSubtitleIndex: Int32 = -1
+    @Published var vlcAudioIndex: Int32 = -1
     
     @Published var subtitleDelay: Double = 0.0
 
@@ -263,7 +272,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             }
             loadSelectionGroups(for: item)
 
-            timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main) { [weak self] time in 
+            // FLICKER FIX: Accelerated subtitle refresh rate from 0.5s down to 0.1s
+            timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] time in 
                 Task { @MainActor [weak self] in
                     guard let self, !self.isScrubbing else { return }
                     self.current = time.seconds
@@ -460,15 +470,10 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
 
         let adjustedTime = time - subtitleDelay
-
         if cueCursor > 0 && adjustedTime < cues[0].start { cueCursor = 0 }
 
-        while cueCursor > 0 && adjustedTime < cues[cueCursor].start {
-            cueCursor -= 1
-        }
-        while cueCursor < cues.count - 1 && adjustedTime > cues[cueCursor].end {
-            cueCursor += 1
-        }
+        while cueCursor > 0 && adjustedTime < cues[cueCursor].start { cueCursor -= 1 }
+        while cueCursor < cues.count - 1 && adjustedTime > cues[cueCursor].end { cueCursor += 1 }
 
         let cue = cues[cueCursor]
         let text = (adjustedTime >= cue.start && adjustedTime <= cue.end) ? cue.text : nil
@@ -514,23 +519,40 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
     }
     
-    private func loadSelectionGroups(for item: AVPlayerItem) { let asset = item.asset; Task { [weak self] in let chars = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []; let audio = chars.contains(.audible) ? try? await asset.loadMediaSelectionGroup(for: .audible) : nil; let legible = chars.contains(.legible) ? try? await asset.loadMediaSelectionGroup(for: .legible) : nil; guard let self else { return }; self.audioGroup = audio; self.legibleGroup = legible; self.audioOptions = audio?.options ?? []; self.legibleOptions = legible?.options ?? [] } }
+    private func loadSelectionGroups(for item: AVPlayerItem) { 
+        let asset = item.asset
+        Task { [weak self] in 
+            let chars = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []
+            let audio = chars.contains(.audible) ? try? await asset.loadMediaSelectionGroup(for: .audible) : nil
+            let legible = chars.contains(.legible) ? try? await asset.loadMediaSelectionGroup(for: .legible) : nil
+            
+            let curAudio = audio.flatMap { item.currentMediaSelection.selectedMediaOption(in: $0) }
+            let curLegible = legible.flatMap { item.currentMediaSelection.selectedMediaOption(in: $0) }
+            
+            await MainActor.run {
+                guard let self else { return }
+                self.audioGroup = audio
+                self.legibleGroup = legible
+                self.audioOptions = audio?.options ?? []
+                self.legibleOptions = legible?.options ?? []
+                self.currentAudioOption = curAudio
+                self.currentLegibleOption = curLegible
+            }
+        } 
+    }
     
     private func applyPendingVLCSeek() {
         guard let target = pendingVLCSeek else { return }
-
         if pendingSeekAttempts > 0, abs(current - target) < 2 {
             pendingVLCSeek = nil
             pendingSeekAttempts = 0
             return
         }
-
         guard pendingSeekAttempts < 3 else {
             pendingVLCSeek = nil
             pendingSeekAttempts = 0
             return
         }
-
         pendingSeekAttempts += 1
         vlcPlayer.time = VLCTime(int: Int32(target * 1000))
         current = target
@@ -578,8 +600,20 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         flash(track.name)
     }
 
-    func selectAudio(_ option: AVMediaSelectionOption) { guard let group = audioGroup else { return }; player.currentItem?.select(option, in: group); flash(option.displayName) }
-    func selectLegible(_ option: AVMediaSelectionOption?) { guard let group = legibleGroup else { return }; player.currentItem?.select(option, in: group); if let option { flash(option.displayName) } }
+    func selectAudio(_ option: AVMediaSelectionOption) { 
+        guard let group = audioGroup else { return }
+        player.currentItem?.select(option, in: group)
+        currentAudioOption = option
+        flash(option.displayName) 
+    }
+    
+    func selectLegible(_ option: AVMediaSelectionOption?) { 
+        guard let group = legibleGroup else { return }
+        player.currentItem?.select(option, in: group)
+        currentLegibleOption = option
+        if let option { flash(option.displayName) } else { flash("Subtitles off") }
+    }
+    
     func togglePiP() { guard media.isEngineSupported else { flash("PiP unavailable for this format"); return }; if pip == nil, AVPictureInPictureController.isPictureInPictureSupported(), let layer = layerHolder.playerLayer { pip = AVPictureInPictureController(playerLayer: layer) }; guard let pip else { flash("PiP unavailable"); return }; if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() } }
     private func periodicSave() { guard Date().timeIntervalSince(lastSave) > 4 else { return }; saveNow() }
     private func saveNow() { guard current > 0 || duration > 0 else { return }; lastSave = Date(); store.updateProgress(id: media.id, position: current, duration: duration) }
@@ -592,6 +626,7 @@ struct PlayerScreen: View {
     @StateObject private var vm: PlayerVM
     @State private var scrubValue: Double = 0
     @State private var showSubImporter = false
+    @State private var showSettingsSheet = false
     @State private var dragMode: DragMode = .none
     @State private var dragStartValue: Double = 0
     @State private var seekTarget: Double = 0
@@ -650,6 +685,10 @@ struct PlayerScreen: View {
         .onDisappear { vm.stop(); UIApplication.shared.isIdleTimerDisabled = false }
         .alert("Playback Error", isPresented: Binding(get: { vm.errorMessage != nil }, set: { if !$0 { vm.errorMessage = nil } })) { Button("OK") { dismiss() } } message: { Text(vm.errorMessage ?? "") }
         .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) } }
+        .sheet(isPresented: $showSettingsSheet) {
+            PlayerSettingsSheet(vm: vm, showSubImporter: $showSubImporter)
+                .presentationDetents([.medium, .large])
+        }
         .preferredColorScheme(.dark)
     }
 
@@ -667,10 +706,12 @@ struct PlayerScreen: View {
                     .padding(.vertical, 8)
                     .background(.black.opacity(subtitleBackground), in: RoundedRectangle(cornerRadius: 8))
                     .padding(.horizontal, 24)
+                    .id(cue) // FLICKER FIX: Forces SwiftUI to instantly swap text instead of interpolating geometry
             }
         }
         .padding(.bottom, max(0, (vm.showControls ? 140 : 44) + subtitleYOffset))
         .animation(.easeInOut(duration: 0.2), value: vm.showControls)
+        .animation(nil, value: vm.cueText) // FLICKER FIX: Prevents text updates from catching the control animation
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
@@ -718,7 +759,11 @@ struct PlayerScreen: View {
                 .accessibilityLabel("Picture in Picture")
                 .glassControl(in: Circle())
 
-                trackMenu
+                Button { showSettingsSheet = true } label: { 
+                    Image(systemName: "gearshape.fill").font(.title3).frame(width: 44, height: 44) 
+                }
+                .accessibilityLabel("Playback Settings")
+                .glassControl(in: Circle())
             }
             .glassGroup(spacing: 10)
         }
@@ -727,101 +772,6 @@ struct PlayerScreen: View {
         .padding(.top, 8)
         .padding(.leading, isWindowed ? 96 : 0)
         .animation(.easeInOut(duration: 0.2), value: isWindowed)
-    }
-
-    private var trackMenu: some View {
-        Menu {
-            if vm.usesVLC { vlcTrackSections } else { engineTrackSections }
-        } label: { Image(systemName: "captions.bubble").font(.title3).frame(width: 44, height: 44) }
-        .accessibilityLabel("Audio and subtitle tracks")
-        .glassControl(in: Circle())
-    }
-
-    @ViewBuilder
-    private var engineTrackSections: some View {
-        if !vm.audioOptions.isEmpty {
-            Menu("Audio Tracks") { 
-                ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } 
-            }
-        }
-        Menu("Subtitle Tracks") {
-            Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
-            ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
-        }
-        Section {
-            subtitleFileControls
-        }
-        subtitleSettingsSection
-    }
-
-    @ViewBuilder
-    private var vlcTrackSections: some View {
-        if !vm.vlcAudioTracks.isEmpty {
-            Menu("Audio Tracks") {
-                ForEach(vm.vlcAudioTracks) { track in
-                    Button { vm.selectVLCAudio(track) } label: { trackLabel(track.name, selected: track.index == vm.vlcAudioIndex) }
-                }
-            }
-        }
-        Menu("Subtitle Tracks") {
-            Button { vm.selectVLCSubtitle(nil) } label: { trackLabel("Off", selected: vm.vlcSubtitleIndex < 0) }
-            ForEach(vm.vlcSubtitleTracks) { track in
-                Button { vm.selectVLCSubtitle(track) } label: { trackLabel(track.name, selected: track.index == vm.vlcSubtitleIndex) }
-            }
-        }
-        Section {
-            subtitleFileControls
-        }
-        subtitleSettingsSection
-    }
-
-    @ViewBuilder
-    private func trackLabel(_ name: String, selected: Bool) -> some View {
-        if selected { Label(name, systemImage: "checkmark") } else { Text(name) }
-    }
-
-    @ViewBuilder
-    private var subtitleFileControls: some View {
-        Button("Load .srt file…") { showSubImporter = true }
-        if vm.hasExternalCues { Toggle("External subtitles", isOn: $vm.subtitlesOn) }
-    }
-    
-    @ViewBuilder
-    private var subtitleSettingsSection: some View {
-        Section("Settings") {
-            Menu("Sync Delay (\(String(format: "%+.1fs", vm.subtitleDelay)))") {
-                Button("+0.5s") { vm.adjustSubtitleDelay(by: 0.5) }
-                Button("+0.1s") { vm.adjustSubtitleDelay(by: 0.1) }
-                Button("Reset (0.0s)") { vm.adjustSubtitleDelay(by: -vm.subtitleDelay) }
-                Button("-0.1s") { vm.adjustSubtitleDelay(by: -0.1) }
-                Button("-0.5s") { vm.adjustSubtitleDelay(by: -0.5) }
-            }
-            Menu("Placement") {
-                Button("Move Up") { 
-                    guard vm.hasExternalCues else { vm.flash("External .srt only"); return }
-                    subtitleYOffset += 20; vm.flash("Subtitles Up") 
-                }
-                Button("Move Down") { 
-                    guard vm.hasExternalCues else { vm.flash("External .srt only"); return }
-                    subtitleYOffset -= 20; vm.flash("Subtitles Down") 
-                }
-                Button("Reset Position") { subtitleYOffset = 0; vm.flash("Position Reset") }
-            }
-            Menu("Size (\(Int(subtitleFontSize)))") {
-                Button("Increase (+2)") { subtitleFontSize += 2; vm.flash("Size: \(Int(subtitleFontSize))") }
-                Button("Decrease (-2)") { subtitleFontSize = max(10, subtitleFontSize - 2); vm.flash("Size: \(Int(subtitleFontSize))") }
-                Button("Reset (22)") { subtitleFontSize = 22.0; vm.flash("Size Reset") }
-            }
-            Menu("Font (\(subtitleFontName))") {
-                Toggle("Bold Text", isOn: $subtitleBold)
-                Divider()
-                Button("System Default") { subtitleFontName = "System"; vm.flash("Font: System") }
-                Button("Kohinoor Bangla") { subtitleFontName = "Kohinoor Bangla"; vm.flash("Font: Kohinoor") }
-                Button("Bangla Sangam MN") { subtitleFontName = "Bangla Sangam MN"; vm.flash("Font: Sangam MN") }
-                Button("Avenir") { subtitleFontName = "Avenir"; vm.flash("Font: Avenir") }
-                Button("Helvetica") { subtitleFontName = "Helvetica"; vm.flash("Font: Helvetica") }
-            }
-        }
     }
 
     private var centerButtons: some View {
@@ -926,6 +876,123 @@ struct PlayerScreen: View {
             }
     }
 }
+
+// MARK: - Native Settings Sheet (Fixes Scroll Bug)
+
+struct PlayerSettingsSheet: View {
+    @ObservedObject var vm: PlayerVM
+    @Binding var showSubImporter: Bool
+    @Environment(\.dismiss) var dismiss
+
+    @AppStorage("subtitleYOffset") private var subtitleYOffset: Double = 0.0
+    @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
+    @AppStorage("subtitleFontName") private var subtitleFontName = "System"
+    @AppStorage("subtitleBold") private var subtitleBold = true
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if vm.usesVLC {
+                    if !vm.vlcAudioTracks.isEmpty {
+                        Section("Audio Tracks") {
+                            ForEach(vm.vlcAudioTracks) { track in
+                                Button { vm.selectVLCAudio(track) } label: {
+                                    HStack { Text(track.name); Spacer(); if vm.vlcAudioIndex == track.index { Image(systemName: "checkmark") } }
+                                }.foregroundStyle(.primary)
+                            }
+                        }
+                    }
+                    if !vm.vlcSubtitleTracks.isEmpty {
+                        Section("Embedded Subtitles") {
+                            Button { vm.selectVLCSubtitle(nil) } label: {
+                                HStack { Text("Off"); Spacer(); if vm.vlcSubtitleIndex < 0 { Image(systemName: "checkmark") } }
+                            }.foregroundStyle(.primary)
+                            ForEach(vm.vlcSubtitleTracks) { track in
+                                Button { vm.selectVLCSubtitle(track) } label: {
+                                    HStack { Text(track.name); Spacer(); if vm.vlcSubtitleIndex == track.index { Image(systemName: "checkmark") } }
+                                }.foregroundStyle(.primary)
+                            }
+                        }
+                    }
+                } else {
+                    if !vm.audioOptions.isEmpty {
+                        Section("Audio Tracks") {
+                            ForEach(vm.audioOptions, id: \.self) { o in
+                                Button { vm.selectAudio(o) } label: {
+                                    HStack { Text(o.displayName); Spacer(); if vm.currentAudioOption == o { Image(systemName: "checkmark") } }
+                                }.foregroundStyle(.primary)
+                            }
+                        }
+                    }
+                    if !vm.legibleOptions.isEmpty {
+                        Section("Embedded Subtitles") {
+                            Button { vm.selectLegible(nil); vm.subtitlesOn = false } label: {
+                                HStack { Text("Off"); Spacer(); if vm.currentLegibleOption == nil { Image(systemName: "checkmark") } }
+                            }.foregroundStyle(.primary)
+                            ForEach(vm.legibleOptions, id: \.self) { o in
+                                Button { vm.selectLegible(o); vm.subtitlesOn = true } label: {
+                                    HStack { Text(o.displayName); Spacer(); if vm.currentLegibleOption == o { Image(systemName: "checkmark") } }
+                                }.foregroundStyle(.primary)
+                            }
+                        }
+                    }
+                }
+
+                Section("External Subtitles (.srt)") {
+                    Button("Load .srt file…") { dismiss(); showSubImporter = true }
+                    if vm.hasExternalCues { 
+                        Toggle("Show External Subtitles", isOn: $vm.subtitlesOn)
+                    }
+                }
+
+                Section("Subtitle Synchronization") {
+                    HStack {
+                        Text("Delay")
+                        Spacer()
+                        Button("-0.5s") { vm.adjustSubtitleDelay(by: -0.5) }.buttonStyle(.bordered)
+                        Button("-0.1s") { vm.adjustSubtitleDelay(by: -0.1) }.buttonStyle(.bordered)
+                        Text(String(format: "%+.1fs", vm.subtitleDelay)).monospacedDigit().frame(width: 55, alignment: .center)
+                        Button("+0.1s") { vm.adjustSubtitleDelay(by: 0.1) }.buttonStyle(.bordered)
+                        Button("+0.5s") { vm.adjustSubtitleDelay(by: 0.5) }.buttonStyle(.bordered)
+                    }
+                }
+
+                Section("Appearance") {
+                    Stepper("Size (\(Int(subtitleFontSize)))", value: $subtitleFontSize, in: 10...60, step: 2)
+                    HStack {
+                        Text("Vertical Placement")
+                        Spacer()
+                        Button("Up") { 
+                            guard vm.hasExternalCues else { vm.flash("External .srt only"); return }
+                            subtitleYOffset += 10
+                        }.buttonStyle(.bordered)
+                        Button("Down") { 
+                            guard vm.hasExternalCues else { vm.flash("External .srt only"); return }
+                            subtitleYOffset -= 10
+                        }.buttonStyle(.bordered)
+                        Button("Reset") { subtitleYOffset = 0 }.buttonStyle(.bordered)
+                    }
+                    Picker("Font", selection: $subtitleFontName) {
+                        Text("System Default").tag("System")
+                        Text("Kohinoor Bangla").tag("Kohinoor Bangla")
+                        Text("Bangla Sangam MN").tag("Bangla Sangam MN")
+                        Text("Avenir").tag("Avenir")
+                        Text("Helvetica").tag("Helvetica")
+                    }
+                    Toggle("Bold Text", isOn: $subtitleBold)
+                }
+            }
+            .navigationTitle("Playback Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 
 struct OSDBadge: View {
     let text: String
