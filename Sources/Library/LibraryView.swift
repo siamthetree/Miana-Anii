@@ -1,5 +1,3 @@
-
-
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -21,7 +19,6 @@ enum LibraryRoute: Identifiable {
     }
 }
 
-/// What the sidebar is pointing at.
 enum LibraryFilter: Hashable {
     case all
     case movies
@@ -45,6 +42,7 @@ struct LibraryView: View {
 
     @State private var renaming: MediaItem?
     @State private var renameText = ""
+    @State private var deleting: MediaItem?
 
     private static let importTypes: [UTType] = {
         var types: [UTType] = [.movie, .video, .audiovisualContent, .audio, .mpeg4Movie, .quickTimeMovie, .avi, .mpeg, .mpeg2Video]
@@ -61,8 +59,7 @@ struct LibraryView: View {
             detailColumn
         }
         .navigationSplitViewStyle(.balanced)
-        // Deliberately on different views. Two fileImporters on one view and
-        // SwiftUI honours only the first, silently.
+      
         .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { Task { await store.addFolder(url) } }
         }
@@ -81,13 +78,22 @@ struct LibraryView: View {
             Button("Save") { if let item = renaming { store.rename(item, to: renameText) }; renaming = nil }
             Button("Cancel", role: .cancel) { renaming = nil }
         }
+        
+        .confirmationDialog(deleting.map(deletePrompt) ?? "",
+                            isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                            titleVisibility: .visible) {
+            Button("Delete File", role: .destructive) {
+                if let item = deleting { store.delete(item) }
+                deleting = nil
+            }
+            Button("Cancel", role: .cancel) { deleting = nil }
+        }
         .task { await store.rescan() }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { Task { await store.rescan() } }
         }
     }
 
-    // MARK: - Sidebar
 
     private var sidebar: some View {
         List(selection: $filter) {
@@ -129,8 +135,6 @@ struct LibraryView: View {
         Set(store.items.compactMap(\.seriesKey)).count
     }
 
-    // MARK: - Detail column
-
     private var detailColumn: some View {
         Group {
             if store.items.isEmpty { emptyState } else { libraryList }
@@ -153,7 +157,6 @@ struct LibraryView: View {
         }
     }
 
-    /// A source you removed while it was selected leaves a dangling filter.
     private var activeFilter: LibraryFilter {
         guard let filter else { return .all }
         if case .source(let id) = filter, !store.folders.contains(where: { $0.id == id }) { return .all }
@@ -246,8 +249,6 @@ struct LibraryView: View {
         }
     }
 
-    // MARK: - Menus
-
     @ViewBuilder
     private func contextButtons(for item: MediaItem) -> some View {
         Button { playing = item } label: { Label("Play", systemImage: "play.fill") }
@@ -258,7 +259,15 @@ struct LibraryView: View {
         } else if item.duration > 0 {
             Button { store.markWatched(item) } label: { Label("Mark as Watched", systemImage: "eye") }
         }
-        Button(role: .destructive) { store.delete(item) } label: { Label("Delete", systemImage: "trash") }
+        Button(role: .destructive) { deleting = item } label: { Label("Delete", systemImage: "trash") }
+    }
+
+    private func deletePrompt(_ item: MediaItem) -> String {
+        let title = item.metadata?.title ?? item.title
+        if item.isExternal {
+            return "Delete “\(title)” from your media source? This removes the file from disk. To stop watching a folder without touching its files, remove the source in Settings."
+        }
+        return "Delete “\(title)”? This removes the file from this iPad."
     }
 
     @ViewBuilder
@@ -282,41 +291,22 @@ struct LibraryView: View {
         .accessibilityValue(sort.rawValue)
     }
 
-        private var emptyState: some View { 
-        VStack(spacing: 32) { 
-            
-            // MARK: - Dedication
-            VStack(spacing: 8) {
-                Text("For Minar & Anika")
-                    .font(.title3)
-                    .fontWeight(.bold)
-                    .foregroundStyle(.primary) 
-                
-                Text("For the four years that shaped us, and the separate paths that await us.")
-                    .foregroundStyle(.secondary) 
-                    .multilineTextAlignment(.center)
+    private var emptyState: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "film.stack").font(.system(size: 64)).foregroundStyle(.purple)
+                .accessibilityHidden(true)
+            Text("Your library is empty").font(.title2.weight(.semibold))
+            Text("Import videos with the + button, share files to Mina Anii from any app, or drop them into On My iPad › Mina Anii using the Files app.")
+                .font(.subheadline).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 420)
+            Button { showImporter = true } label: {
+                Label("Import Media", systemImage: "plus").padding(.horizontal, 8)
             }
-            .padding(.horizontal, 20)
-            .frame(maxWidth: 420) 
-                
-            Button { 
-                showImporter = true 
-            } label: { 
-                Label("Import Media", systemImage: "plus")
-                    .padding(.horizontal, 8) 
-            }
-            .buttonStyle(.borderedProminent) 
+            .buttonStyle(.borderedProminent)
         }
-        .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity) 
+        .padding().frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-
-
-    // MARK: - Accessibility
-
-    /// A card is a poster, a duration pill, a progress bar and two lines of text.
-    /// VoiceOver would read all of it, in whatever order it found. One sentence
-    /// each instead.
+    
     private func spokenLabel(for item: MediaItem) -> String {
         var parts = [item.metadata?.title ?? item.title]
         if item.isEpisode, item.episodeNumber > 0 {
@@ -335,8 +325,6 @@ struct LibraryView: View {
         if show.unwatchedCount > 0 { parts.append("\(show.unwatchedCount) unwatched") }
         return parts.joined(separator: ", ")
     }
-
-    // MARK: - Data
 
     private func title(for filter: LibraryFilter) -> String {
         switch filter {
@@ -360,8 +348,6 @@ struct LibraryView: View {
         }
     }
 
-    /// Search stays inside whatever the sidebar is pointing at, and flattens
-    /// shows back into episodes, which is what you want when hunting one file.
     private func searchResults(in visible: [LibraryEntry]) -> [MediaItem] {
         let pool = visible.flatMap { entry -> [MediaItem] in
             switch entry {
@@ -378,8 +364,6 @@ struct LibraryView: View {
             .sorted { $0.dateAdded > $1.dateAdded }
     }
 
-    /// A movie you left half-finished, and for every show you have started,
-    /// either the episode you paused or the next one you have not seen.
     private static func continueWatching(in grouped: [LibraryEntry]) -> [MediaItem] {
         var candidates: [(item: MediaItem, watchedAt: Date)] = []
 
@@ -412,7 +396,6 @@ struct LibraryView: View {
     }
 }
 
-// MARK: - Series card
 
 struct SeriesCard: View {
     let series: Series
@@ -461,7 +444,6 @@ struct SeriesCard: View {
     }
 }
 
-/// A show has no local frame grab of its own, so this is poster or nothing.
 struct SeriesPoster: View {
     let posterURL: URL?
 
@@ -486,8 +468,6 @@ struct SeriesPoster: View {
         .clipped()
     }
 }
-
-// MARK: - Portrait card (single file: movie, or episode inside search results)
 
 struct MediaCard: View {
     let item: MediaItem
@@ -589,8 +569,6 @@ struct MediaCard: View {
     }
 }
 
-// MARK: - Continue Watching card (landscape, uses the backdrop)
-
 struct ContinueCard: View {
     let item: MediaItem
     let thumbURL: URL
@@ -647,11 +625,7 @@ struct ContinueCard: View {
     }
 }
 
-// MARK: - Artwork loader
 
-/// Draws a remote TMDB image when one exists, otherwise the locally
-/// generated frame grab. A landscape frame grab placed in a portrait
-/// frame is shown whole over a blurred copy of itself rather than cropped.
 struct ArtworkImage: View {
     let thumbURL: URL
     var remoteURL: URL? = nil
