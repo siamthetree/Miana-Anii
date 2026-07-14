@@ -1,4 +1,3 @@
-
 import Foundation
 import SwiftUI
 import UIKit
@@ -273,12 +272,27 @@ final class LibraryStore: ObservableObject {
             item.metadata = meta
         }
 
-        let asset = AVURLAsset(url: fileURL)
-        if let d = try? await asset.load(.duration), d.seconds.isFinite, d.seconds > 0 { item.duration = d.seconds }
-        if !item.isAudio {
-            let seconds = item.duration > 0 ? max(1.0, item.duration * 0.12) : 3.0
-            await Self.writeThumbnail(assetURL: fileURL, at: seconds, to: thumbURL(for: item))
+        // AVFoundation cannot open mkv, avi, webm or ts, and answers with a
+        // zero duration rather than an error. VLC reads all of them.
+        if item.isEngineSupported {
+            let asset = AVURLAsset(url: fileURL)
+            if let d = try? await asset.load(.duration), d.seconds.isFinite, d.seconds > 0 { item.duration = d.seconds }
         }
+        if item.duration <= 0 {
+            let probeURL = fileURL
+            item.duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: probeURL) }.value
+        }
+
+        if !item.isAudio {
+            let destination = thumbURL(for: item)
+            if item.isEngineSupported {
+                let seconds = item.duration > 0 ? max(1.0, item.duration * 0.12) : 3.0
+                await Self.writeThumbnail(assetURL: fileURL, at: seconds, to: destination)
+            } else {
+                await VLCProbe.writeThumbnail(for: fileURL, position: 0.12, to: destination)
+            }
+        }
+
         items.insert(item, at: 0)
     }
 
@@ -349,15 +363,37 @@ final class LibraryStore: ObservableObject {
     }
 
     func resetProgress(_ item: MediaItem) {
-        guard let i = items.firstIndex(where: { $0.id == item.id }) else { return }
-        items[i].lastPosition = 0; save()
+        resetProgress([item])
+    }
+
+    /// One disk write for the whole batch. save() re-encodes every item in the
+    /// library, so calling the single-item version in a loop meant one full
+    /// encode and one write per episode: sixty of each for a sixty episode show,
+    /// on the main actor, while the screen sat frozen.
+    func resetProgress(_ batch: [MediaItem]) {
+        var touched = false
+        for item in batch {
+            guard let i = items.firstIndex(where: { $0.id == item.id }) else { continue }
+            items[i].lastPosition = 0
+            touched = true
+        }
+        if touched { save() }
     }
 
     func markWatched(_ item: MediaItem) {
-        guard let i = items.firstIndex(where: { $0.id == item.id }), items[i].duration > 0 else { return }
-        items[i].lastPosition = items[i].duration
-        items[i].lastPlayed = Date()
-        save()
+        markWatched([item])
+    }
+
+    func markWatched(_ batch: [MediaItem]) {
+        let now = Date()
+        var touched = false
+        for item in batch {
+            guard let i = items.firstIndex(where: { $0.id == item.id }), items[i].duration > 0 else { continue }
+            items[i].lastPosition = items[i].duration
+            items[i].lastPlayed = now
+            touched = true
+        }
+        if touched { save() }
     }
 
     func rename(_ item: MediaItem, to newTitle: String) {
