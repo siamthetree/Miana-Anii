@@ -1,25 +1,13 @@
 // ==========================================================
-//  BUG 5  -  POSTERS REDOWNLOADED ON EVERY SCROLL
+//  BUG 5 + SWIFTDATA INTEGRATION
 //
 //  File:  Sources/App.swift
 //  Replace the entire file.
-//
-//  This is your App.swift with one init() added. It already has the TMDB
-//  block removed, the deletion you made back in Fix 4, so pasting this
-//  will not bring it back.
-//
-//  URLCache.shared defaults to 4 MB in memory and 20 MB on disk, sized
-//  for the odd API response. A grid of posters blows past that on the
-//  first screenful, so every AsyncImage was refetching its poster over
-//  the network each time it scrolled back into view.
-//
-//  64 MB in memory holds the visible grid. 512 MB on disk means a poster
-//  is fetched once and survives relaunches. TMDB serves these with proper
-//  cache headers, so URLCache honours them with no further work.
 // ==========================================================
 
 import Foundation
 import SwiftUI
+import SwiftData
 import AVFoundation
 import AVKit
 import Combine
@@ -34,20 +22,26 @@ import Security
 
 @main
 struct MinaAniiApp: App {
-    @StateObject private var store = LibraryStore()
+    let container: ModelContainer
+    @StateObject private var store: LibraryStore
 
     init() {
-        // The default shared cache is 4 MB in memory and 20 MB on disk, sized for
-        // the odd API response. A library of posters blows through that on the
-        // first screenful, so every AsyncImage refetched its poster over the
-        // network each time it scrolled back into view.
-        //
         // 64 MB in memory holds the visible grid. 512 MB on disk means a poster is
         // fetched once and then survives relaunches. TMDB serves these with cache
         // headers, so URLCache honours them without any work from us.
         URLCache.shared = URLCache(memoryCapacity: 64 * 1024 * 1024,
                                    diskCapacity: 512 * 1024 * 1024,
                                    diskPath: "artwork")
+                                   
+        // SwiftData Setup: Create the database for our two models
+        do {
+            container = try ModelContainer(for: MediaItem.self, WatchedFolder.self)
+        } catch {
+            fatalError("Failed to initialize SwiftData container: \(error)")
+        }
+        
+        // Pass the SwiftData context into our LibraryStore
+        _store = StateObject(wrappedValue: LibraryStore(context: container.mainContext))
     }
 
     var body: some Scene {
@@ -65,6 +59,7 @@ struct MinaAniiApp: App {
                     }
                 }
         }
+        .modelContainer(container) // Inject SwiftData into the SwiftUI Environment
     }
 }
 
