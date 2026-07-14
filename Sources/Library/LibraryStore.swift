@@ -1,5 +1,5 @@
 // ==========================================================
-//  FINAL STABILIZED: DISK WRITER + SWIFT 6 SENDABLE FIX
+//  FINAL STABILIZED: DISK WRITER + ASYNC STREAM OBSERVER
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -11,9 +11,6 @@ import UIKit
 import UniformTypeIdentifiers
 import AVFoundation
 
-/// A background actor dedicated to safely serializing all disk writes.
-/// This prevents the app from crashing when multiple background tasks
-/// attempt to overwrite library.json at the exact same millisecond.
 actor DiskWriter {
     static let shared = DiskWriter()
     func write(_ data: Data, to url: URL) {
@@ -44,11 +41,14 @@ final class LibraryStore: ObservableObject {
 
     private var folderURLs: [UUID: URL] = [:]
     private let watcher = FolderWatcher()
+    
+    // SWIFT 6 ARCHITECTURE: Track the AsyncStream tasks
+    private var watcherTasks: [UUID: Task<Void, Never>] = [:]
+    
     private var debouncedScan: Task<Void, Never>?
     private var scanRequested = false
     private var watchedDirectories: [UUID: [URL]] = [:]
     
-    // MARK: - Concurrency Queue
     private var importQueue: [URL] = []
     private var isProcessingQueue = false
 
@@ -67,20 +67,9 @@ final class LibraryStore: ObservableObject {
         activateFolders()
     }
     
-    // MARK: - Import Queue Bridge
-    
-    func importFiles(_ urls: [URL]) async {
-        for url in urls { enqueueImport(url: url) }
-    }
-
-    func importFile(_ url: URL) async {
-        enqueueImport(url: url)
-    }
-
-    func enqueueImport(url: URL) {
-        importQueue.append(url)
-        if !isProcessingQueue { processNextQueueItem() }
-    }
+    func importFiles(_ urls: [URL]) async { for url in urls { enqueueImport(url: url) } }
+    func importFile(_ url: URL) async { enqueueImport(url: url) }
+    func enqueueImport(url: URL) { importQueue.append(url); if !isProcessingQueue { processNextQueueItem() } }
 
     private func processNextQueueItem() {
         guard !importQueue.isEmpty else { isProcessingQueue = false; save(); return }
@@ -89,7 +78,6 @@ final class LibraryStore: ObservableObject {
         Task { await performImport(nextURL); processNextQueueItem() }
     }
 
-    // MARK: - Persistence
     private func load() {
         guard let data = try? Data(contentsOf: indexURL),
               let decoded = try? JSONDecoder().decode([MediaItem].self, from: data) else { return }
@@ -122,11 +110,8 @@ final class LibraryStore: ObservableObject {
         Task { await DiskWriter.shared.write(data, to: targetURL) }
     }
 
-    // MARK: - Paths
     func url(for item: MediaItem) -> URL {
-        if let folderID = item.folderID, let relative = item.relativePath, let root = folderURLs[folderID] {
-            return root.appendingPathComponent(relative)
-        }
+        if let folderID = item.folderID, let relative = item.relativePath, let root = folderURLs[folderID] { return root.appendingPathComponent(relative) }
         return mediaDir.appendingPathComponent(item.fileName)
     }
     func thumbURL(for item: MediaItem) -> URL { thumbsDir.appendingPathComponent(item.id.uuidString + ".jpg") }
@@ -152,7 +137,6 @@ final class LibraryStore: ObservableObject {
         return dest
     }
 
-    // MARK: - Folders
     private func activateFolders() { for folder in folders { activate(folder) } }
     private func activate(_ folder: WatchedFolder) {
         var stale = false
@@ -170,10 +154,16 @@ final class LibraryStore: ObservableObject {
         guard watchedDirectories[folderID] != current else { return }
         watchedDirectories[folderID] = current
         
-        // CRASH FIX: Added @Sendable to prevent Swift 6 from injecting a MainActor assertion check
-        // into this background-fired FolderWatcher closure.
-        watcher.watch(folderID: folderID, directories: current) { @Sendable [weak self] in
-            Task { @MainActor in self?.scheduleFolderScan() }
+        // SWIFT 6 ARCHITECTURE: Safely iterate the AsyncStream.
+        // No cross-actor closures, no crashes.
+        watcherTasks[folderID]?.cancel()
+        watcherTasks[folderID] = Task { [weak self] in
+            guard let self else { return }
+            let stream = await self.watcher.watch(folderID: folderID, directories: current)
+            for await _ in stream {
+                guard !Task.isCancelled else { break }
+                self.scheduleFolderScan()
+            }
         }
     }
 
@@ -190,7 +180,10 @@ final class LibraryStore: ObservableObject {
     }
 
     func removeFolder(_ folder: WatchedFolder) {
-        watcher.stop(folderID: folder.id)
+        watcherTasks[folder.id]?.cancel()
+        watcherTasks[folder.id] = nil
+        Task { await watcher.stop(folderID: folder.id) }
+        
         watchedDirectories[folder.id] = nil
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
         folderURLs[folder.id] = nil
@@ -301,8 +294,6 @@ final class LibraryStore: ObservableObject {
             let asset = AVURLAsset(url: fileURL)
             if let d = try? await asset.load(.duration), d.seconds > 0 { item.duration = d.seconds }
         }
-        
-        // COMPILER FIX: Directly call duration on MainActor
         if item.duration <= 0 { item.duration = await VLCProbe.duration(of: fileURL) }
 
         if !item.isAudio {
@@ -382,7 +373,6 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
-    // MARK: - Mutations
     func updateProgress(id: UUID, position: Double, duration: Double) {
         if let i = items.firstIndex(where: { $0.id == id }) { items[i].lastPosition = max(0, position); if duration > 0 { items[i].duration = duration }; items[i].lastPlayed = Date(); save() }
     }
@@ -391,8 +381,6 @@ final class LibraryStore: ObservableObject {
         for item in items.filter({ $0.duration <= 0 }) {
             guard !isOffline(item), let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
             let targetURL = url(for: item)
-            
-            // COMPILER FIX: Directly call duration on MainActor
             items[index].duration = await VLCProbe.duration(of: targetURL)
         }
         save()
@@ -435,7 +423,12 @@ final class LibraryStore: ObservableObject {
             if fm.fileExists(atPath: thumb.path) { try? fm.removeItem(at: thumb) }
             if fm.fileExists(atPath: sub.path) { try? fm.removeItem(at: sub) }
         }
-        watcher.stopAll(); watchedDirectories.removeAll()
+        
+        for task in watcherTasks.values { task.cancel() }
+        watcherTasks.removeAll()
+        Task { await watcher.stopAll() }
+        
+        watchedDirectories.removeAll()
         for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }
         folderURLs.removeAll(); folders.removeAll(); items.removeAll()
         saveFolders(); save()
