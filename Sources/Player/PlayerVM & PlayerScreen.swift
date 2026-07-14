@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: HIGH-PRECISION GESTURE SCRUBBING
+//  REFACTORED: COREMEDIA IMPORT ADDED
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -14,6 +14,7 @@ import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
 import MobileVLCKit
+import CoreMedia
 
 // MARK: - System Media Coordinator
 
