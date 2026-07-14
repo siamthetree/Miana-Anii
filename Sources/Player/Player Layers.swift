@@ -1,4 +1,3 @@
-
 import Foundation
 import SwiftUI
 import AVFoundation
@@ -16,7 +15,10 @@ final class PlayerContainerView: UIView {
 }
 
 struct PlayerLayerView: UIViewRepresentable {
-    let player: AVPlayer; let holder: PlayerLayerHolder; let gravity: AVLayerVideoGravity
+    let player: AVPlayer
+    let holder: PlayerLayerHolder
+    let gravity: AVLayerVideoGravity
+    
     func makeUIView(context: Context) -> PlayerContainerView {
         let view = PlayerContainerView()
         view.backgroundColor = .black
@@ -25,14 +27,76 @@ struct PlayerLayerView: UIViewRepresentable {
         holder.playerLayer = view.playerLayer
         return view
     }
-    func updateUIView(_ uiView: PlayerContainerView, context: Context) { uiView.playerLayer.videoGravity = gravity }
+    
+    func updateUIView(_ uiView: PlayerContainerView, context: Context) {
+        uiView.playerLayer.videoGravity = gravity
+    }
 }
+
+// MARK: - VLC Scale Implementation
 
 struct VLCPlayerLayerView: UIViewRepresentable {
     let player: VLCMediaPlayer
-    func makeUIView(context: Context) -> UIView { let view = UIView(); view.backgroundColor = .black; player.drawable = view; return view }
-    func updateUIView(_ uiView: UIView, context: Context) {}
+    let scaleMode: VideoScaleMode
+    
+    func makeUIView(context: Context) -> VLCVideoContainerView {
+        let view = VLCVideoContainerView()
+        view.backgroundColor = .black
+        view.player = player
+        player.drawable = view
+        return view
+    }
+    
+    func updateUIView(_ uiView: VLCVideoContainerView, context: Context) {
+        uiView.scaleMode = scaleMode
+    }
 }
+
+final class VLCVideoContainerView: UIView {
+    weak var player: VLCMediaPlayer?
+    
+    var scaleMode: VideoScaleMode = .fit {
+        didSet {
+            if oldValue != scaleMode { applyScale() }
+        }
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        applyScale()
+    }
+
+    private func applyScale() {
+        guard let player = player else { return }
+        
+        // Calculate the exact screen ratio for precise VLC scaling/cropping
+        let width = Int(bounds.width)
+        let height = Int(bounds.height)
+        
+        // Ensure layout has actually been calculated before forcing a ratio
+        guard width > 0 && height > 0 else { return }
+        
+        let ratioString = "\(width):\(height)"
+        
+        switch scaleMode {
+        case .fit:
+            player.videoCropGeometry = nil
+            player.videoAspectRatio = nil
+            
+        case .fill:
+            // Crop the video overflow to fill the screen bounds completely
+            player.videoCropGeometry = UnsafeMutablePointer<Int8>(mutating: (ratioString as NSString).utf8String)
+            player.videoAspectRatio = nil
+            
+        case .stretch:
+            // Stretch the video geometry to force it to screen bounds (ignores aspect ratio)
+            player.videoAspectRatio = UnsafeMutablePointer<Int8>(mutating: (ratioString as NSString).utf8String)
+            player.videoCropGeometry = nil
+        }
+    }
+}
+
+// MARK: - Route Picker & Window Probes
 
 struct RoutePickerView: UIViewRepresentable {
     func makeUIView(context: Context) -> AVRoutePickerView {
@@ -44,8 +108,6 @@ struct RoutePickerView: UIViewRepresentable {
     }
     func updateUIView(_ uiView: AVRoutePickerView, context: Context) {}
 }
-
-// MARK: - Window chrome detection
 
 struct WindowChromeProbe: UIViewRepresentable {
     @Binding var isWindowed: Bool
