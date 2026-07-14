@@ -1,3 +1,19 @@
+// ==========================================================
+//  BUG 3  -  GROUP ONCE, NOT EIGHT TIMES A FRAME  (2 of 4)
+//
+//  File:  Sources/Library/LibraryStore.swift
+//  Replace the entire file. Supersedes BUG-2a.
+//
+//  The store now publishes `entries`, the grouped library, and keeps a
+//  seriesIndex dictionary beside it. Both are rebuilt in save(), which
+//  every mutating path already ends in.
+//
+//  Not a didSet on items, which would read better and behave worse:
+//  mutating one element of an array fires didSet, so the batched update
+//  from BUG 2 would have regrouped once per episode. Exactly the bug it
+//  was meant to fix.
+// ==========================================================
+
 import Foundation
 import SwiftUI
 import UIKit
@@ -9,6 +25,15 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     @Published private(set) var folders: [WatchedFolder] = []
     @Published private(set) var isScanning = false
+
+    /// The library, collapsed into movies and shows. Rebuilt once whenever items
+    /// changes, not on every read. The detail views used to call
+    /// groupedIntoEntries() from inside their view bodies, several times per
+    /// frame, each call regrouping every item in the library.
+    @Published private(set) var entries: [LibraryEntry] = []
+    private var seriesIndex: [String: Series] = [:]
+
+    func series(withID id: String) -> Series? { seriesIndex[id] }
 
     private let fm = FileManager.default
     let documentsURL: URL
@@ -42,11 +67,24 @@ final class LibraryStore: ObservableObject {
         guard let data = try? Data(contentsOf: indexURL),
               let decoded = try? JSONDecoder().decode([MediaItem].self, from: data) else { return }
         items = decoded
+        regroup()
     }
 
+    /// Every path that mutates items ends here, which makes this the one honest
+    /// place to rebuild the grouping. A didSet on items would look tidier and be
+    /// worse: mutating one element of an array fires it, so a batch update would
+    /// regroup once per element.
     func save() {
+        regroup()
         guard let data = try? JSONEncoder().encode(items) else { return }
         try? data.write(to: indexURL, options: .atomic)
+    }
+
+    private func regroup() {
+        entries = items.groupedIntoEntries()
+        seriesIndex = entries.reduce(into: [:]) { index, entry in
+            if case .series(let show) = entry { index[show.id] = show }
+        }
     }
 
     private func loadFolders() {
