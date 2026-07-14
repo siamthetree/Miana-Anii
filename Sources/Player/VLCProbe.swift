@@ -49,12 +49,8 @@ enum VLCProbe {
         let media = VLCMedia(url: url)
 
         // Local parse only. No network fetch, no cover art, no user interaction.
-        // If a future MobileVLCKit turns VLCMediaParsingOptions into an
-        // NS_OPTIONS type, this becomes .parseLocal and .fetchLocal.
-_ = media.parse(options: [.fetchLocal])
-
-
-
+        // Swift 6 / Modern MobileVLCKit drops the zero-value .parseLocal and uses parse(options:)
+        _ = media.parse(options: [.fetchLocal])
 
         let parsed: VLCTime? = media.lengthWait(until: Date().addingTimeInterval(10))
         let milliseconds = Double(parsed?.intValue ?? 0)
@@ -112,13 +108,12 @@ private final class VLCFrameGrabber: NSObject, VLCMediaThumbnailerDelegate {
         }
     }
 
-    nonisolated func mediaThumbnailerDidTimeOut(_ mediaThumbnailer: VLCMediaThumbnailer!) {
+    nonisolated func mediaThumbnailerDidTimeOut(_ mediaThumbnailer: VLCMediaThumbnailer?) {
         Task { @MainActor [weak self] in self?.finish(nil) }
     }
 
-    nonisolated func mediaThumbnailer(_ mediaThumbnailer: VLCMediaThumbnailer!, didFinishThumbnail thumbnail: CGImage!) {
-        let cgImage: CGImage? = thumbnail
-        let image = cgImage.map { UIImage(cgImage: $0) }
+    nonisolated func mediaThumbnailer(_ mediaThumbnailer: VLCMediaThumbnailer?, didFinishThumbnail thumbnail: CGImage?) {
+        let image = thumbnail.map { UIImage(cgImage: $0) }
         Task { @MainActor [weak self] in self?.finish(image) }
     }
 
