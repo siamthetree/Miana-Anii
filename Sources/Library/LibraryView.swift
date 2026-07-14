@@ -1,3 +1,15 @@
+// ==========================================================
+//  BUG 2  -  ONE DISK WRITE, NOT SIXTY  (file 2 of 3)
+//
+//  File:  Sources/Library/LibraryView.swift
+//  Replace the entire file. Supersedes BUG-1a.
+//
+//  The series menu passes the whole array now instead of looping. It
+//  also gains Mark Series as Unwatched, which it never had: you could
+//  mark a show watched and had no way back short of doing it episode by
+//  episode.
+// ==========================================================
+
 import Foundation
 import SwiftUI
 import UniformTypeIdentifiers
@@ -19,6 +31,7 @@ enum LibraryRoute: Identifiable {
     }
 }
 
+/// What the sidebar is pointing at.
 enum LibraryFilter: Hashable {
     case all
     case movies
@@ -59,7 +72,8 @@ struct LibraryView: View {
             detailColumn
         }
         .navigationSplitViewStyle(.balanced)
-      
+        // Deliberately on different views. Two fileImporters on one view and
+        // SwiftUI honours only the first, silently.
         .fileImporter(isPresented: $showFolderPicker, allowedContentTypes: [.folder]) { result in
             if case .success(let url) = result { Task { await store.addFolder(url) } }
         }
@@ -78,7 +92,8 @@ struct LibraryView: View {
             Button("Save") { if let item = renaming { store.rename(item, to: renameText) }; renaming = nil }
             Button("Cancel", role: .cancel) { renaming = nil }
         }
-        
+        // Delete removes the file from disk, and for a media source that is your
+        // own file on your own drive. Asking first is the least it can do.
         .confirmationDialog(deleting.map(deletePrompt) ?? "",
                             isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
                             titleVisibility: .visible) {
@@ -94,6 +109,7 @@ struct LibraryView: View {
         }
     }
 
+    // MARK: - Sidebar
 
     private var sidebar: some View {
         List(selection: $filter) {
@@ -135,6 +151,8 @@ struct LibraryView: View {
         Set(store.items.compactMap(\.seriesKey)).count
     }
 
+    // MARK: - Detail column
+
     private var detailColumn: some View {
         Group {
             if store.items.isEmpty { emptyState } else { libraryList }
@@ -157,6 +175,7 @@ struct LibraryView: View {
         }
     }
 
+    /// A source you removed while it was selected leaves a dangling filter.
     private var activeFilter: LibraryFilter {
         guard let filter else { return .all }
         if case .source(let id) = filter, !store.folders.contains(where: { $0.id == id }) { return .all }
@@ -249,6 +268,8 @@ struct LibraryView: View {
         }
     }
 
+    // MARK: - Menus
+
     @ViewBuilder
     private func contextButtons(for item: MediaItem) -> some View {
         Button { playing = item } label: { Label("Play", systemImage: "play.fill") }
@@ -262,6 +283,9 @@ struct LibraryView: View {
         Button(role: .destructive) { deleting = item } label: { Label("Delete", systemImage: "trash") }
     }
 
+    /// Named for what it does, not where the item happens to live. Nothing in this
+    /// app removes a file from the library while leaving it on disk: the next scan
+    /// would find it and add it straight back.
     private func deletePrompt(_ item: MediaItem) -> String {
         let title = item.metadata?.title ?? item.title
         if item.isExternal {
@@ -278,8 +302,13 @@ struct LibraryView: View {
             }
         }
         Button { route = .series(show) } label: { Label("Show Episodes", systemImage: "list.bullet") }
-        Button { for episode in show.episodes { store.markWatched(episode) } } label: {
+        Button { store.markWatched(show.episodes) } label: {
             Label("Mark Series as Watched", systemImage: "eye")
+        }
+        if show.unwatchedCount < show.episodeCount {
+            Button { store.resetProgress(show.episodes) } label: {
+                Label("Mark Series as Unwatched", systemImage: "eye.slash")
+            }
         }
     }
 
@@ -306,7 +335,12 @@ struct LibraryView: View {
         }
         .padding().frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-    
+
+    // MARK: - Accessibility
+
+    /// A card is a poster, a duration pill, a progress bar and two lines of text.
+    /// VoiceOver would read all of it, in whatever order it found. One sentence
+    /// each instead.
     private func spokenLabel(for item: MediaItem) -> String {
         var parts = [item.metadata?.title ?? item.title]
         if item.isEpisode, item.episodeNumber > 0 {
@@ -325,6 +359,8 @@ struct LibraryView: View {
         if show.unwatchedCount > 0 { parts.append("\(show.unwatchedCount) unwatched") }
         return parts.joined(separator: ", ")
     }
+
+    // MARK: - Data
 
     private func title(for filter: LibraryFilter) -> String {
         switch filter {
@@ -348,6 +384,8 @@ struct LibraryView: View {
         }
     }
 
+    /// Search stays inside whatever the sidebar is pointing at, and flattens
+    /// shows back into episodes, which is what you want when hunting one file.
     private func searchResults(in visible: [LibraryEntry]) -> [MediaItem] {
         let pool = visible.flatMap { entry -> [MediaItem] in
             switch entry {
@@ -364,6 +402,8 @@ struct LibraryView: View {
             .sorted { $0.dateAdded > $1.dateAdded }
     }
 
+    /// A movie you left half-finished, and for every show you have started,
+    /// either the episode you paused or the next one you have not seen.
     private static func continueWatching(in grouped: [LibraryEntry]) -> [MediaItem] {
         var candidates: [(item: MediaItem, watchedAt: Date)] = []
 
@@ -396,6 +436,7 @@ struct LibraryView: View {
     }
 }
 
+// MARK: - Series card
 
 struct SeriesCard: View {
     let series: Series
@@ -444,6 +485,7 @@ struct SeriesCard: View {
     }
 }
 
+/// A show has no local frame grab of its own, so this is poster or nothing.
 struct SeriesPoster: View {
     let posterURL: URL?
 
@@ -468,6 +510,8 @@ struct SeriesPoster: View {
         .clipped()
     }
 }
+
+// MARK: - Portrait card (single file: movie, or episode inside search results)
 
 struct MediaCard: View {
     let item: MediaItem
@@ -569,6 +613,8 @@ struct MediaCard: View {
     }
 }
 
+// MARK: - Continue Watching card (landscape, uses the backdrop)
+
 struct ContinueCard: View {
     let item: MediaItem
     let thumbURL: URL
@@ -625,7 +671,11 @@ struct ContinueCard: View {
     }
 }
 
+// MARK: - Artwork loader
 
+/// Draws a remote TMDB image when one exists, otherwise the locally
+/// generated frame grab. A landscape frame grab placed in a portrait
+/// frame is shown whole over a blurred copy of itself rather than cropped.
 struct ArtworkImage: View {
     let thumbURL: URL
     var remoteURL: URL? = nil
