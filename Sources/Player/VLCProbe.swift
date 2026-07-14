@@ -51,7 +51,7 @@ enum VLCProbe {
         // Local parse only. No network fetch, no cover art, no user interaction.
         // If a future MobileVLCKit turns VLCMediaParsingOptions into an
         // NS_OPTIONS type, this becomes .parseLocal and .fetchLocal.
-_ = media.parseWithOptions([.parseLocal, .fetchLocal])
+_ = media.parse(options: [.parseLocal, .fetchLocal])
 
 
 
