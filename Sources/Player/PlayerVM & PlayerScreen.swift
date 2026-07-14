@@ -1,4 +1,22 @@
-
+// ==========================================================
+//  BUG 4  -  STOP WRITING TO THE USER'S DRIVE  (file 2 of 2)
+//
+//  File:  Sources/Player/PlayerVM & PlayerScreen.swift
+//  Replace the entire file. Supersedes IMP-7a.
+//
+//  loadSubtitleFile(copySidecar: true) wrote the .srt to
+//  store.url(for: media). For a media source that path is on your own
+//  drive. So loading a subtitle dropped a file into your media folder:
+//  uninvited, silent if the volume was read only, and enough to wake the
+//  folder watcher and trigger a rescan.
+//
+//  Subtitles you load now live in the app's own Subtitles directory,
+//  keyed by item id. Nothing is written outside the app.
+//
+//  On open, the player prefers a subtitle you loaded yourself, since you
+//  chose it. Failing that it reads an .srt already sitting next to the
+//  video, exactly as before. Reading was never the problem.
+// ==========================================================
 
 import Foundation
 import SwiftUI
@@ -222,8 +240,39 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     func flash(_ text: String) { flashText = text; flashTask?.cancel(); let work = DispatchWorkItem { [weak self] in self?.flashText = nil }; flashTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work) }
 
-    private func loadSidecarSubtitles(for mediaURL: URL) { let srt = mediaURL.deletingPathExtension().appendingPathExtension("srt"); guard FileManager.default.fileExists(atPath: srt.path) else { return }; loadSubtitleFile(srt, copySidecar: false) }
-    func loadSubtitleFile(_ url: URL, copySidecar: Bool = true) { let secured = url.startAccessingSecurityScopedResource(); defer { if secured { url.stopAccessingSecurityScopedResource() } }; guard let data = try? Data(contentsOf: url) else { return }; let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""; let parsed = SRTParser.parse(text); guard !parsed.isEmpty else { flash("Couldn't read subtitles"); return }; cues = parsed; hasExternalCues = true; subtitlesOn = true; flash("Subtitles loaded"); if copySidecar { let dest = store.url(for: media).deletingPathExtension().appendingPathExtension("srt"); try? data.write(to: dest, options: .atomic) } }
+    /// One you loaded in the player wins, since you chose it. Otherwise an .srt
+    /// already sitting next to the video, which is only ever read.
+    private func loadSidecarSubtitles(for mediaURL: URL) {
+        let saved = store.savedSubtitleURL(for: media)
+        if FileManager.default.fileExists(atPath: saved.path) {
+            loadSubtitleFile(saved, persist: false)
+            return
+        }
+        let sidecar = mediaURL.deletingPathExtension().appendingPathExtension("srt")
+        if FileManager.default.fileExists(atPath: sidecar.path) {
+            loadSubtitleFile(sidecar, persist: false)
+        }
+    }
+    /// persist: true keeps the subtitle for next time, in the app's own Subtitles
+    /// directory. It used to write it next to the video, which for a media source
+    /// meant dropping a file onto the user's own drive: uninvited, silent if the
+    /// volume was read only, and enough to wake the folder watcher.
+    func loadSubtitleFile(_ url: URL, persist: Bool = true) {
+        let secured = url.startAccessingSecurityScopedResource()
+        defer { if secured { url.stopAccessingSecurityScopedResource() } }
+
+        guard let data = try? Data(contentsOf: url) else { flash("Couldn't read subtitles"); return }
+        let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+        let parsed = SRTParser.parse(text)
+        guard !parsed.isEmpty else { flash("Couldn't read subtitles"); return }
+
+        cues = parsed
+        hasExternalCues = true
+        subtitlesOn = true
+        flash("Subtitles loaded")
+
+        if persist { try? data.write(to: store.savedSubtitleURL(for: media), options: .atomic) }
+    }
     private func loadSelectionGroups(for item: AVPlayerItem) { let asset = item.asset; Task { [weak self] in let chars = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []; let audio = chars.contains(.audible) ? try? await asset.loadMediaSelectionGroup(for: .audible) : nil; let legible = chars.contains(.legible) ? try? await asset.loadMediaSelectionGroup(for: .legible) : nil; guard let self else { return }; self.audioGroup = audio; self.legibleGroup = legible; self.audioOptions = audio?.options ?? []; self.legibleOptions = legible?.options ?? [] } }
     // MARK: - Lock screen, headphones and interruptions
 
