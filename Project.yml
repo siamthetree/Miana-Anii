@@ -37,6 +37,8 @@ targets:
         CFBundleVersion: "1"
         UILaunchScreen: {}
         UIFileSharingEnabled: true
+
+
         LSSupportsOpeningDocumentsInPlace: true
         ITSAppUsesNonExemptEncryption: false
         UIBackgroundModes:
