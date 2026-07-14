@@ -59,7 +59,6 @@ final class LibraryStore: ObservableObject {
     
     // MARK: - Import Queue Bridge
     
-    // This bridges the App.swift and LibraryView calls directly into the safe background queue
     func importFiles(_ urls: [URL]) async {
         for url in urls { enqueueImport(url: url) }
     }
@@ -373,7 +372,10 @@ final class LibraryStore: ObservableObject {
     func backfillDurations() async {
         for item in items.filter({ $0.duration <= 0 }) {
             guard !isOffline(item), let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
-            items[index].duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: self.url(for: item)) }.value
+            
+            // SWIFT 6 FIX: Resolve the URL on the main thread before passing it to the detached task
+            let targetURL = url(for: item)
+            items[index].duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: targetURL) }.value
         }
         save()
     }
@@ -407,10 +409,13 @@ final class LibraryStore: ObservableObject {
     func storageString() -> String { "Calculating…" }
 
     func calculateStorageAsync() async -> String {
+        // SWIFT 6 FIX: Resolve the directory path on the main thread
+        let targetPath = mediaDir
+        
         let totalBytes = await Task.detached(priority: .utility) {
             var total: Int64 = 0
             let localFm = FileManager.default
-            if let enumerator = localFm.enumerator(at: self.mediaDir, includingPropertiesForKeys: [.fileSizeKey]) {
+            if let enumerator = localFm.enumerator(at: targetPath, includingPropertiesForKeys: [.fileSizeKey]) {
                 while let f = enumerator.nextObject() as? URL {
                     if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += Int64(size) }
                 }
