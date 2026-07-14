@@ -1,23 +1,32 @@
 // ==========================================================
-//  BUG 6  -  SUBTITLE LOOKUP SCANNED EVERY CUE, EVERY TICK
+//  BUG 8  -  RESUME NEVER FIRED FOR MEDIA SOURCES  (1 of 2)
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
-//  Replace the entire file. Supersedes BUG-4b.
+//  Replace the entire file. Supersedes BUG-6.
 //
-//  SRTParser.cue did cues.first(where:) on every clock tick. Four ticks a
-//  second, against a two hour film's two thousand cues, is a great many
-//  string comparisons thrown away.
+//  THE BUG
+//  start() computed:
 //
-//  Playback moves forward, so the cue we want is almost always the one we
-//  showed last, or the one after it. updateCue keeps a cursor and walks
-//  from there. Typically a step or two.
+//    shouldResume = autoResume
+//                && media.lastPosition > 15
+//                && media.duration > 0            <-- this
+//                && media.lastPosition < media.duration * 0.95
 //
-//  The cursor walks backwards as readily as forwards, so a seek needs no
-//  special handling: it finds its way from wherever it was. It resets to
-//  zero only when the cue list itself is replaced.
+//  The duration is only needed to answer "were you basically at the end".
+//  It was required outright. AVFoundation cannot read a Matroska duration,
+//  so every mkv sat at duration 0, and a media source is exactly where mkv
+//  lives. shouldResume was false every time, forever. The file opened, the
+//  position was saved correctly, and nothing ever seeked to it.
 //
-//  cueText is only assigned when it actually changes, so an unchanged cue
-//  no longer publishes a redraw four times a second.
+//  Unknown duration now means "not at the end". Worst case you resume a
+//  file you had actually finished, and the player is offering you a Resume
+//  button anyway, so you already knew.
+//
+//  AND A SECOND ONE, WHICH WOULD HAVE BITTEN YOU NEXT
+//  VLC accepts a seek issued the instant it reports .playing and then
+//  quietly ignores it, because its demuxer is not ready. So even a correct
+//  resume could drop you at 0:00. applyPendingVLCSeek sets the time, then
+//  checks on the next tick whether it took, and retries up to three times.
 // ==========================================================
 
 import Foundation
@@ -45,6 +54,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private var nowPlayingArtwork: MPMediaItemArtwork?
     private var resumeAfterInterruption = false
     private var lastNowPlayingDuration: Double = -1
+    private var pendingSeekAttempts = 0
     private var cueCursor = 0
     private var didAutoSelectSubtitle = false
     private var hasScrobbledWatched = false
@@ -63,7 +73,18 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         let url = store.url(for: media); let defaults = UserDefaults.standard
         if defaults.object(forKey: "defaultRate") != nil { rate = defaults.double(forKey: "defaultRate") }; if rate <= 0 { rate = 1 }
         let autoResume = (defaults.object(forKey: "autoResume") as? Bool) ?? true
-        let shouldResume = autoResume && media.lastPosition > 15 && media.duration > 0 && media.lastPosition < media.duration * 0.95
+
+        // The duration is only needed to answer "were you basically at the end".
+        // It used to be required outright, so an item whose duration we never
+        // learned could not resume at all. AVFoundation cannot read a Matroska
+        // duration, so every mkv sat at duration 0, and media sources are exactly
+        // where mkv lives. Playback worked; resume was never even attempted.
+        //
+        // Unknown duration now means "not at the end", which is the useful guess:
+        // the worst case is resuming a file you had actually finished, and the
+        // player is showing you a Resume button anyway.
+        let finished = media.duration > 0 && media.lastPosition >= media.duration * 0.95
+        let shouldResume = autoResume && media.lastPosition > 15 && !finished
 
         if media.isEngineSupported {
             let item = AVPlayerItem(url: url); player.replaceCurrentItem(with: item); player.allowsExternalPlayback = true; player.volume = Float(volumeLevel)
@@ -122,7 +143,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     nonisolated func mediaPlayerStateChanged(_ aNotification: Notification) {
         Task { @MainActor in
             switch self.vlcPlayer.state {
-            case .playing: self.isPlaying = true; if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }; if let target = self.pendingVLCSeek { self.vlcPlayer.time = VLCTime(int: Int32(target * 1000)); self.current = target; self.pendingVLCSeek = nil }
+            case .playing: self.isPlaying = true; if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }; self.applyPendingVLCSeek()
             case .paused: self.isPlaying = false
             case .ended: self.isPlaying = false; self.showControls = true; if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }; self.scrobbleWatched()
             case .error: self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
@@ -138,6 +159,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             let ms = self.vlcPlayer.time.value?.doubleValue ?? 0
             self.current = ms / 1000.0
             if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }
+            self.applyPendingVLCSeek()
             self.updateCue(at: self.current)
             if self.duration != self.lastNowPlayingDuration { self.updateNowPlaying() }
             self.periodicSave()
@@ -304,6 +326,31 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if persist { try? data.write(to: store.savedSubtitleURL(for: media), options: .atomic) }
     }
     private func loadSelectionGroups(for item: AVPlayerItem) { let asset = item.asset; Task { [weak self] in let chars = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []; let audio = chars.contains(.audible) ? try? await asset.loadMediaSelectionGroup(for: .audible) : nil; let legible = chars.contains(.legible) ? try? await asset.loadMediaSelectionGroup(for: .legible) : nil; guard let self else { return }; self.audioGroup = audio; self.legibleGroup = legible; self.audioOptions = audio?.options ?? []; self.legibleOptions = legible?.options ?? [] } }
+    /// VLC will happily accept a seek before its demuxer is ready and then quietly
+    /// ignore it, which is why resuming an mkv could drop you at 0:00 even when the
+    /// position was right. So we set the time, and on the next tick check whether it
+    /// took. Three attempts, then leave it alone rather than fight the player.
+    private func applyPendingVLCSeek() {
+        guard let target = pendingVLCSeek else { return }
+
+        // Did the last attempt land? Anything within two seconds is close enough.
+        if pendingSeekAttempts > 0, abs(current - target) < 2 {
+            pendingVLCSeek = nil
+            pendingSeekAttempts = 0
+            return
+        }
+
+        guard pendingSeekAttempts < 3 else {
+            pendingVLCSeek = nil
+            pendingSeekAttempts = 0
+            return
+        }
+
+        pendingSeekAttempts += 1
+        vlcPlayer.time = VLCTime(int: Int32(target * 1000))
+        current = target
+    }
+
     // MARK: - Lock screen, headphones and interruptions
 
     /// UIBackgroundModes already lets audio survive the screen locking, but
