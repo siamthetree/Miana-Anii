@@ -1,5 +1,5 @@
 // ==========================================================
-//  LIQUID GLASS + MODERN TASKS + SWIFT 6 SENDABLE FIX
+//  REFACTORED: SYSTEM MEDIA COORDINATOR EXTRACTED
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -17,7 +17,14 @@ import MobileVLCKit
 
 @MainActor
 final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
-    let store: LibraryStore; let media: MediaItem; let player = AVPlayer(); let layerHolder = PlayerLayerHolder(); let vlcPlayer = VLCMediaPlayer()
+    let store: LibraryStore
+    let media: MediaItem
+    let player = AVPlayer()
+    let layerHolder = PlayerLayerHolder()
+    let vlcPlayer = VLCMediaPlayer()
+    
+    // NEW: The dedicated system hardware & lock screen coordinator
+    private let systemMedia = SystemMediaCoordinator()
 
     @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var fillScreen = false; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var audioOptions: [AVMediaSelectionOption] = []; @Published var legibleOptions: [AVMediaSelectionOption] = []; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
     @Published var vlcSubtitleTracks: [PlayerTrack] = []; @Published var vlcAudioTracks: [PlayerTrack] = []
@@ -25,31 +32,29 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
 
-    // SWIFT 6 ARCHITECTURE: Replaced legacy DispatchWorkItems with Tasks
     private var hideTask: Task<Void, Never>?
     private var flashTask: Task<Void, Never>?
 
-    private var remoteTargets: [(MPRemoteCommand, Any)] = []
-    private var audioObservers: [NSObjectProtocol] = []
-    private var nowPlayingArtwork: MPMediaItemArtwork?
-    private var resumeAfterInterruption = false
-    private var lastNowPlayingDuration: Double = -1
+    private var lastKnownDuration: Double = -1
     private var pendingSeekAttempts = 0
     private var cueCursor = 0
     private var didAutoSelectSubtitle = false
     private var hasScrobbledWatched = false
     private var isScrobbling = false
 
-    /// Trakt checks the title in as watched once this much time is left.
     private static let watchedSecondsRemaining: Double = 180
 
     init(media: MediaItem, store: LibraryStore) { self.media = media; self.store = store; super.init() }
 
     func start() {
-        configureAudioSession()
-        setupRemoteCommands()
-        observeAudioSession()
-        Task { @MainActor [weak self] in await self?.loadArtwork() }
+        // Wire up System Coordinator
+        systemMedia.onPlay = { [weak self] in self?.play() }
+        systemMedia.onPause = { [weak self] in self?.pause() }
+        systemMedia.onTogglePlayPause = { [weak self] in self?.isPlaying == true ? self?.pause() : self?.play() }
+        systemMedia.onSkip = { [weak self] sec in self?.skip(sec) }
+        systemMedia.onSeek = { [weak self] pos in self?.seek(to: pos) }
+        systemMedia.start(media: media, store: store)
+        
         let url = store.url(for: media); let defaults = UserDefaults.standard
         if defaults.object(forKey: "defaultRate") != nil { rate = defaults.double(forKey: "defaultRate") }; if rate <= 0 { rate = 1 }
         let autoResume = (defaults.object(forKey: "autoResume") as? Bool) ?? true
@@ -59,14 +64,14 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
         if media.isEngineSupported {
             let item = AVPlayerItem(url: url); player.replaceCurrentItem(with: item); player.allowsExternalPlayback = true; player.volume = Float(volumeLevel)
-            statusCancellable = item.publisher(for: \.status).receive(on: DispatchQueue.main).sink { [weak self] status in guard let self else { return }; if status == .readyToPlay, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d } }
+            statusCancellable = item.publisher(for: \.status).receive(on: DispatchQueue.main).sink { [weak self] status in guard let self else { return }; if status == .readyToPlay, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d; self.syncSystemState() } }
             
             endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in 
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.isPlaying = false; self.showControls = true
                     if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
-                    self.scrobbleWatched()
+                    self.scrobbleWatched(); self.syncSystemState()
                 }
             }
             loadSelectionGroups(for: item)
@@ -77,7 +82,12 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                     self.current = time.seconds
                     if self.duration <= 0, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 { self.duration = d }
                     self.updateCue(at: time.seconds)
-                    if self.duration != self.lastNowPlayingDuration { self.updateNowPlaying() }
+                    
+                    if self.duration != self.lastKnownDuration { 
+                        self.lastKnownDuration = self.duration
+                        self.syncSystemState() 
+                    }
+                    
                     self.periodicSave()
                     self.checkWatchedThreshold()
                 }
@@ -105,8 +115,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         statusCancellable = nil; if let observer = timeObserver { player.removeTimeObserver(observer); timeObserver = nil }; if let end = endObserver { NotificationCenter.default.removeObserver(end); endObserver = nil }
         hideTask?.cancel(); flashTask?.cancel()
         if media.isEngineSupported { player.pause(); player.replaceCurrentItem(with: nil) } else { vlcPlayer.stop(); vlcPlayer.delegate = nil }
-        teardownRemoteControl()
-        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        systemMedia.stop()
     }
 
     nonisolated func mediaPlayerStateChanged(_ aNotification: Notification) {
@@ -126,6 +135,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             default: break
             }
             self.refreshVLCTracks()
+            self.syncSystemState()
         }
     }
 
@@ -143,16 +153,25 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             
             self.applyPendingVLCSeek()
             self.updateCue(at: self.current)
-            if self.duration != self.lastNowPlayingDuration { self.updateNowPlaying() }
+            
+            if self.duration != self.lastKnownDuration { 
+                self.lastKnownDuration = self.duration
+                self.syncSystemState() 
+            }
+            
             self.periodicSave()
             self.checkWatchedThreshold() 
         }
     }
 
+    private func syncSystemState() {
+        systemMedia.updateState(current: current, duration: duration, rate: rate, isPlaying: isPlaying)
+    }
+
     // MARK: - Trakt
 
     private var scrobbleProgress: Double {
-        guard duration > 0 else { return media.progress }
+        guard duration > 0 else { return media.lastPosition > 0 ? media.lastPosition / 10000 : 0 } // Fallback
         return min(max(current / duration, 0), 1)
     }
 
@@ -195,7 +214,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         isPlaying = true
         scheduleAutoHide()
         scrobbleStart()
-        updateNowPlaying()
+        syncSystemState()
     }
 
     func pause() {
@@ -203,21 +222,17 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         isPlaying = false; saveNow()
         hideTask?.cancel()
         scrobblePause()
-        updateNowPlaying()
+        syncSystemState()
     }
 
     func toggleControls() { 
         showControls.toggle()
-        if showControls { 
-            scheduleAutoHide() 
-        } else {
-            hideTask?.cancel()
-        } 
+        if showControls { scheduleAutoHide() } else { hideTask?.cancel() } 
     }
 
-    func seek(to target: Double) { let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target); if media.isEngineSupported { player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) } else { vlcPlayer.time = VLCTime(int: Int32(clamped * 1000)) }; current = clamped; scheduleAutoHide(); updateNowPlaying() }
+    func seek(to target: Double) { let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target); if media.isEngineSupported { player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) } else { vlcPlayer.time = VLCTime(int: Int32(clamped * 1000)) }; current = clamped; scheduleAutoHide(); syncSystemState() }
     func skip(_ seconds: Double) { seek(to: current + seconds); flash(seconds >= 0 ? "+\(Int(seconds))s" : "\(Int(seconds))s") }
-    func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)); updateNowPlaying() }
+    func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)); syncSystemState() }
     func setVolume(_ value: Double) { volumeLevel = min(max(value, 0), 1); if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }; flash("Volume \(Int(volumeLevel * 100))%") }
 
     func scheduleAutoHide() { 
@@ -321,160 +336,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         pendingSeekAttempts += 1
         vlcPlayer.time = VLCTime(int: Int32(target * 1000))
         current = target
-    }
-
-    // MARK: - Lock screen, headphones and interruptions
-
-    private func setupRemoteCommands() {
-        let center = MPRemoteCommandCenter.shared()
-
-        addCommand(center.playCommand) { @Sendable [weak self] _ in
-            guard let self else { return .commandFailed }
-            Task { @MainActor in self.play() }
-            return .success
-        }
-        addCommand(center.pauseCommand) { @Sendable [weak self] _ in
-            guard let self else { return .commandFailed }
-            Task { @MainActor in self.pause() }
-            return .success
-        }
-        addCommand(center.togglePlayPauseCommand) { @Sendable [weak self] _ in
-            guard let self else { return .commandFailed }
-            Task { @MainActor in if self.isPlaying { self.pause() } else { self.play() } }
-            return .success
-        }
-
-        center.skipForwardCommand.preferredIntervals = [15]
-        addCommand(center.skipForwardCommand) { @Sendable [weak self] _ in
-            guard let self else { return .commandFailed }
-            Task { @MainActor in self.skip(15) }
-            return .success
-        }
-
-        center.skipBackwardCommand.preferredIntervals = [15]
-        addCommand(center.skipBackwardCommand) { @Sendable [weak self] _ in
-            guard let self else { return .commandFailed }
-            Task { @MainActor in self.skip(-15) }
-            return .success
-        }
-
-        addCommand(center.changePlaybackPositionCommand) { @Sendable [weak self] event in
-            guard let self, let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
-            let position = event.positionTime
-            Task { @MainActor in self.seek(to: position) }
-            return .success
-        }
-    }
-
-    private func addCommand(_ command: MPRemoteCommand,
-                            _ handler: @escaping @Sendable (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus) {
-        command.isEnabled = true
-        remoteTargets.append((command, command.addTarget(handler: handler)))
-    }
-
-    private func observeAudioSession() {
-        let notifications = NotificationCenter.default
-
-        audioObservers.append(notifications.addObserver(forName: AVAudioSession.interruptionNotification,
-                                                        object: nil, queue: .main) { [weak self] note in
-            guard let self,
-                  let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
-
-            switch type {
-            case .began:
-                Task { @MainActor in
-                    self.resumeAfterInterruption = self.isPlaying
-                    if self.isPlaying { self.pause() }
-                }
-            case .ended:
-                let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt)
-                    .map { AVAudioSession.InterruptionOptions(rawValue: $0) } ?? []
-                Task { @MainActor in
-                    guard self.resumeAfterInterruption, options.contains(.shouldResume) else { return }
-                    self.resumeAfterInterruption = false
-                    try? AVAudioSession.sharedInstance().setActive(true)
-                    self.play()
-                }
-            @unknown default:
-                break
-            }
-        })
-
-        audioObservers.append(notifications.addObserver(forName: AVAudioSession.routeChangeNotification,
-                                                        object: nil, queue: .main) { [weak self] note in
-            guard let self else { return }
-            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt)
-                .flatMap { AVAudioSession.RouteChangeReason(rawValue: $0) }
-
-            Task { @MainActor in
-                self.applyPreferredChannels()
-                if reason == .oldDeviceUnavailable, self.isPlaying { self.pause() }
-            }
-        })
-    }
-
-    private func configureAudioSession() {
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback)
-        try? session.setSupportsMultichannelContent(true)
-        try? session.setActive(true)
-        applyPreferredChannels()
-    }
-
-    private func applyPreferredChannels() {
-        let session = AVAudioSession.sharedInstance()
-        try? session.setPreferredOutputNumberOfChannels(session.maximumOutputNumberOfChannels)
-    }
-
-    private func teardownRemoteControl() {
-        for (command, token) in remoteTargets { command.removeTarget(token) }
-        remoteTargets.removeAll()
-        for observer in audioObservers { NotificationCenter.default.removeObserver(observer) }
-        audioObservers.removeAll()
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
-    }
-
-    private func updateNowPlaying() {
-        lastNowPlayingDuration = duration
-
-        var info: [String: Any] = [:]
-        info[MPMediaItemPropertyTitle] = nowPlayingTitle
-        info[MPMediaItemPropertyArtist] = nowPlayingSubtitle
-        info[MPNowPlayingInfoPropertyMediaType] = (media.isAudio ? MPNowPlayingInfoMediaType.audio : MPNowPlayingInfoMediaType.video).rawValue
-        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = current
-        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? rate : 0.0
-        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
-        if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
-        if let nowPlayingArtwork { info[MPMediaItemPropertyArtwork] = nowPlayingArtwork }
-
-        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
-    }
-
-    private var nowPlayingTitle: String {
-        media.isEpisode ? media.displayEpisodeTitle : (media.metadata?.title ?? media.title)
-    }
-
-    private var nowPlayingSubtitle: String {
-        if media.isEpisode, let show = media.metadata?.title, !show.isEmpty {
-            return media.episodeNumber > 0 ? "\(show) • \(media.episodeCode)" : show
-        }
-        if let year = media.metadata?.releaseYear, !year.isEmpty { return year }
-        return media.fileExtension.uppercased()
-    }
-
-    private func loadArtwork() async {
-        let path = store.thumbURL(for: media).path
-        var image: UIImage? = await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
-
-        if image == nil, let poster = media.metadata?.posterURL,
-           let response = try? await URLSession.shared.data(from: poster) {
-            image = UIImage(data: response.0)
-        }
-        guard let image else { return }
-
-        nowPlayingArtwork = MPMediaItemArtwork(boundsSize: image.size) { @Sendable _ in image }
-        updateNowPlaying()
     }
 
     // MARK: - VLC tracks
