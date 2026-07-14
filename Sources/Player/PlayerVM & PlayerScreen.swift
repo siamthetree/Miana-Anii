@@ -1,5 +1,5 @@
 // ==========================================================
-//  LIQUID GLASS + CONCURRENCY + SWIFT 6 TUPLE FIX
+//  LIQUID GLASS + CONCURRENCY + VLC CRASH PROTECTIONS
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -108,9 +108,19 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     nonisolated func mediaPlayerStateChanged(_ aNotification: Notification) {
         Task { @MainActor in
             switch self.vlcPlayer.state {
-            case .playing: self.isPlaying = true; if let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }; self.applyPendingVLCSeek()
+            case .playing: 
+                self.isPlaying = true
+                
+                // VLC CRASH FIX: Cast to explicit Optional to prevent implicit unwrap of nil
+                let length: VLCTime? = self.vlcPlayer.media?.length
+                if let dur = length?.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }
+                
+                self.applyPendingVLCSeek()
             case .paused: self.isPlaying = false
-            case .ended: self.isPlaying = false; self.showControls = true; if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }; self.scrobbleWatched()
+            case .ended: 
+                self.isPlaying = false; self.showControls = true
+                if self.duration > 0 { self.store.updateProgress(id: self.media.id, position: self.duration, duration: self.duration) }
+                self.scrobbleWatched()
             case .error: self.errorMessage = "VLC encountered an error reading this file. It may be corrupted."
             default: break
             }
@@ -121,9 +131,18 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification) {
         Task { @MainActor in 
             guard !self.isScrubbing else { return }
-            let ms = self.vlcPlayer.time.value?.doubleValue ?? 0
+            
+            // VLC CRASH FIX: Safely bind the implicitly unwrapped optional first
+            let time: VLCTime? = self.vlcPlayer.time
+            let ms = time?.value?.doubleValue ?? 0
             self.current = ms / 1000.0
-            if self.duration <= 0, let dur = self.vlcPlayer.media?.length.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }
+            
+            if self.duration <= 0 {
+                // VLC CRASH FIX: Safely bind the media length to an explicit Optional
+                let length: VLCTime? = self.vlcPlayer.media?.length
+                if let dur = length?.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }
+            }
+            
             self.applyPendingVLCSeek()
             self.updateCue(at: self.current)
             if self.duration != self.lastNowPlayingDuration { self.updateNowPlaying() }
@@ -274,7 +293,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             }
         }
 
-        // CONCURRENCY FIX: Push subtitle saving off the main thread
         if persist {
             let targetURL = store.savedSubtitleURL(for: media)
             Task.detached(priority: .utility) {
@@ -445,7 +463,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         return media.fileExtension.uppercased()
     }
 
-    // SWIFT 6 COMPILER FIX: Do not use tuple unwrapping `let (data, _)` with Optionals
     private func loadArtwork() async {
         let path = store.thumbURL(for: media).path
         var image: UIImage? = await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
