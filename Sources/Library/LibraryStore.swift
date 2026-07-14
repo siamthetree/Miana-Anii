@@ -1,5 +1,5 @@
 // ==========================================================
-//  FINAL STABILIZED: ALL FIXES MERGED
+//  FINAL STABILIZED: DISK WRITER FIX
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -12,8 +12,8 @@ import UniformTypeIdentifiers
 import AVFoundation
 
 /// A background actor dedicated to safely serializing all disk writes.
-/// This completely prevents the app from crashing when multiple detached tasks
-/// attempt to atomically overwrite library.json at the exact same millisecond.
+/// This prevents the app from crashing when multiple background tasks
+/// attempt to overwrite library.json at the exact same millisecond.
 actor DiskWriter {
     static let shared = DiskWriter()
     func write(_ data: Data, to url: URL) {
@@ -101,7 +101,7 @@ final class LibraryStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(items) else { return }
         let targetURL = self.indexURL
         
-        // CRASH FIX: Route through the DiskWriter actor
+        // CRASH FIX: Actually route this through the DiskWriter actor
         Task { await DiskWriter.shared.write(data, to: targetURL) }
     }
 
@@ -122,7 +122,7 @@ final class LibraryStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(folders) else { return }
         let targetURL = self.foldersURL
         
-        // CRASH FIX: Route through the DiskWriter actor
+        // CRASH FIX: Route folders JSON through the DiskWriter actor too
         Task { await DiskWriter.shared.write(data, to: targetURL) }
     }
 
@@ -302,9 +302,7 @@ final class LibraryStore: ObservableObject {
             let asset = AVURLAsset(url: fileURL)
             if let d = try? await asset.load(.duration), d.seconds > 0 { item.duration = d.seconds }
         }
-        
-        // VLC CRASH FIX: Direct async call on MainActor instead of Task.detached
-        if item.duration <= 0 { item.duration = await VLCProbe.duration(of: fileURL) }
+        if item.duration <= 0 { item.duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: fileURL) }.value }
 
         if !item.isAudio {
             let dest = thumbURL(for: item)
@@ -392,9 +390,7 @@ final class LibraryStore: ObservableObject {
         for item in items.filter({ $0.duration <= 0 }) {
             guard !isOffline(item), let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
             let targetURL = url(for: item)
-            
-            // VLC CRASH FIX: Direct async call on MainActor instead of Task.detached
-            items[index].duration = await VLCProbe.duration(of: targetURL)
+            items[index].duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: targetURL) }.value
         }
         save()
     }
@@ -445,9 +441,7 @@ final class LibraryStore: ObservableObject {
     func storageString() -> String { "Calculating…" }
 
     func calculateStorageAsync() async -> String {
-        // SWIFT 6 FIX: Resolve the directory path on the main thread
         let targetPath = mediaDir
-        
         let totalBytes = await Task.detached(priority: .utility) {
             var total: Int64 = 0
             let localFm = FileManager.default
