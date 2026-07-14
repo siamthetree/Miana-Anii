@@ -1,5 +1,5 @@
 // ==========================================================
-//  LIQUID GLASS + CONCURRENCY + VLC CRASH PROTECTIONS
+//  LIQUID GLASS + CONCURRENCY + VLC CRASH PROTECTIONS + SWIFT 6 SENDABLE FIX
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -110,11 +110,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             switch self.vlcPlayer.state {
             case .playing: 
                 self.isPlaying = true
-                
-                // VLC CRASH FIX: Cast to explicit Optional to prevent implicit unwrap of nil
                 let length: VLCTime? = self.vlcPlayer.media?.length
                 if let dur = length?.value?.doubleValue, dur > 0, self.duration <= 0 { self.duration = dur / 1000.0 }
-                
                 self.applyPendingVLCSeek()
             case .paused: self.isPlaying = false
             case .ended: 
@@ -131,14 +128,11 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     nonisolated func mediaPlayerTimeChanged(_ aNotification: Notification) {
         Task { @MainActor in 
             guard !self.isScrubbing else { return }
-            
-            // VLC CRASH FIX: Safely bind the implicitly unwrapped optional first
             let time: VLCTime? = self.vlcPlayer.time
             let ms = time?.value?.doubleValue ?? 0
             self.current = ms / 1000.0
             
             if self.duration <= 0 {
-                // VLC CRASH FIX: Safely bind the media length to an explicit Optional
                 let length: VLCTime? = self.vlcPlayer.media?.length
                 if let dur = length?.value?.doubleValue, dur > 0 { self.duration = dur / 1000.0 }
             }
@@ -225,12 +219,9 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func scheduleAutoHide() { 
         hideTask?.cancel()
         guard isPlaying else { return }
-
         let intervalObject = UserDefaults.standard.object(forKey: "autoHideInterval")
         let interval = intervalObject != nil ? UserDefaults.standard.double(forKey: "autoHideInterval") : 10.0
-
         guard interval > 0 else { return }
-
         let work = DispatchWorkItem { [weak self] in 
             guard let self, self.isPlaying, !self.isScrubbing else { return }
             withAnimation(.easeOut(duration: 0.25)) { self.showControls = false } 
@@ -278,11 +269,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         guard let data = try? Data(contentsOf: url) else { flash("Couldn't read subtitles"); return }
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
         
-        // CONCURRENCY FIX: Push the heavy parsing off the Main Actor
         Task.detached(priority: .userInitiated) {
             let parsed = SRTParser.parse(text)
-            
-            // Return to the Main Actor to update the UI
             await MainActor.run {
                 guard !parsed.isEmpty else { self.flash("Couldn't read subtitles"); return }
                 self.cues = parsed
@@ -328,37 +316,38 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private func setupRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
 
-        addCommand(center.playCommand) { [weak self] _ in
+        // SWIFT 6 FIX: Added @Sendable to all remote command closures so they don't trip MainActor assertions
+        addCommand(center.playCommand) { @Sendable [weak self] _ in
             guard let self else { return .commandFailed }
             Task { @MainActor in self.play() }
             return .success
         }
-        addCommand(center.pauseCommand) { [weak self] _ in
+        addCommand(center.pauseCommand) { @Sendable [weak self] _ in
             guard let self else { return .commandFailed }
             Task { @MainActor in self.pause() }
             return .success
         }
-        addCommand(center.togglePlayPauseCommand) { [weak self] _ in
+        addCommand(center.togglePlayPauseCommand) { @Sendable [weak self] _ in
             guard let self else { return .commandFailed }
             Task { @MainActor in if self.isPlaying { self.pause() } else { self.play() } }
             return .success
         }
 
         center.skipForwardCommand.preferredIntervals = [15]
-        addCommand(center.skipForwardCommand) { [weak self] _ in
+        addCommand(center.skipForwardCommand) { @Sendable [weak self] _ in
             guard let self else { return .commandFailed }
             Task { @MainActor in self.skip(15) }
             return .success
         }
 
         center.skipBackwardCommand.preferredIntervals = [15]
-        addCommand(center.skipBackwardCommand) { [weak self] _ in
+        addCommand(center.skipBackwardCommand) { @Sendable [weak self] _ in
             guard let self else { return .commandFailed }
             Task { @MainActor in self.skip(-15) }
             return .success
         }
 
-        addCommand(center.changePlaybackPositionCommand) { [weak self] event in
+        addCommand(center.changePlaybackPositionCommand) { @Sendable [weak self] event in
             guard let self, let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
             let position = event.positionTime
             Task { @MainActor in self.seek(to: position) }
@@ -367,7 +356,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     private func addCommand(_ command: MPRemoteCommand,
-                            _ handler: @escaping (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus) {
+                            _ handler: @escaping @Sendable (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus) {
         command.isEnabled = true
         remoteTargets.append((command, command.addTarget(handler: handler)))
     }
@@ -473,7 +462,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
         guard let image else { return }
 
-        nowPlayingArtwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        // SWIFT 6 FIX: @Sendable prevents MainActor checking inside this system-called background closure
+        nowPlayingArtwork = MPMediaItemArtwork(boundsSize: image.size) { @Sendable _ in image }
         updateNowPlaying()
     }
 
