@@ -1,11 +1,8 @@
 // ==========================================================
-//  BUG 7  -  SIXTY IDENTICAL TMDB CALLS  (file 3 of 3)
+//  BUG 10 + ASYNC STORAGE FIX
 //
 //  File:  Sources/Library/SettingsView.swift
-//  Replace the entire file. Supersedes IMP-7b.
-//
-//  The button read "Refreshing…" and then nothing, for as long as it took,
-//  with no way to tell a slow refresh from a dead one. It counts now.
+//  Replace the entire file.
 // ==========================================================
 
 import SwiftUI
@@ -92,11 +89,20 @@ struct SettingsView: View {
                         Text("No sources yet").foregroundStyle(.secondary)
                     } else {
                         ForEach(store.folders) { folder in
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(folder.name)
-                                Text("\(store.itemCount(in: folder)) items")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(folder.name)
+                                    Text("\(store.itemCount(in: folder)) items")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if store.isUnreachable(folder) {
+                                    Label("Unavailable", systemImage: "exclamationmark.triangle.fill")
+                                        .font(.caption.weight(.medium))
+                                        .foregroundStyle(.orange)
+                                        .labelStyle(.titleAndIcon)
+                                }
                             }
                         }
                         .onDelete { offsets in
@@ -118,7 +124,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Media Sources")
                 } footer: {
-                    Text("A media source is a folder the app keeps an eye on. Drop new media into it and the library picks it up on its own. Files stay where they are, nothing is copied. Swipe a source away to remove it, which leaves every file untouched.")
+                    Text("A media source is a folder the app keeps an eye on. Drop new media into it and the library picks it up on its own. Files stay where they are, nothing is copied. Swipe a source away to remove it, which leaves every file untouched.\n\nAn unavailable source is one the app cannot currently read, usually a drive that is unplugged. Its titles stay in your library, with their watch history, and start working again when it comes back.")
                 }
 
                 Section("Trakt.tv") {
@@ -132,9 +138,15 @@ struct SettingsView: View {
 
                 Section("Library") {
                     LabeledContent("Storage used", value: storageText)
+                    
+                    // ASYNC FIX: Moved to async calculation
                     Button("Rescan for new files") {
-                        Task { await store.rescan(); storageText = store.storageString() }
+                        Task { 
+                            await store.rescan()
+                            storageText = await store.calculateStorageAsync() 
+                        }
                     }
+                    
                     Button(refreshLabel) {
                         refreshing = true
                         Task { await store.refreshMetadata(); refreshing = false }
@@ -163,9 +175,14 @@ struct SettingsView: View {
             }
             .confirmationDialog("Delete all imported media and remove every media source? Files inside a source folder are left alone.",
                                 isPresented: $confirmWipe, titleVisibility: .visible) {
-                Button("Delete Everything", role: .destructive) { store.deleteAll(); storageText = store.storageString() }
+                // ASYNC FIX: Moved to async calculation
+                Button("Delete Everything", role: .destructive) { 
+                    store.deleteAll()
+                    Task { storageText = await store.calculateStorageAsync() }
+                }
             }
-            .task { storageText = store.storageString() }
+            // ASYNC FIX: Moved to async calculation
+            .task { storageText = await store.calculateStorageAsync() }
         }
     }
 }
