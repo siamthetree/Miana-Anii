@@ -1,32 +1,8 @@
 // ==========================================================
-//  BUG 8  -  RESUME NEVER FIRED FOR MEDIA SOURCES  (1 of 2)
+//  BUG 8  +  SUBTITLE CONCURRENCY FIX
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
-//  Replace the entire file. Supersedes BUG-6.
-//
-//  THE BUG
-//  start() computed:
-//
-//    shouldResume = autoResume
-//                && media.lastPosition > 15
-//                && media.duration > 0            <-- this
-//                && media.lastPosition < media.duration * 0.95
-//
-//  The duration is only needed to answer "were you basically at the end".
-//  It was required outright. AVFoundation cannot read a Matroska duration,
-//  so every mkv sat at duration 0, and a media source is exactly where mkv
-//  lives. shouldResume was false every time, forever. The file opened, the
-//  position was saved correctly, and nothing ever seeked to it.
-//
-//  Unknown duration now means "not at the end". Worst case you resume a
-//  file you had actually finished, and the player is offering you a Resume
-//  button anyway, so you already knew.
-//
-//  AND A SECOND ONE, WHICH WOULD HAVE BITTEN YOU NEXT
-//  VLC accepts a seek issued the instant it reports .playing and then
-//  quietly ignores it, because its demuxer is not ready. So even a correct
-//  resume could drop you at 0:00. applyPendingVLCSeek sets the time, then
-//  checks on the next tick whether it took, and retries up to three times.
+//  Replace the entire file.
 // ==========================================================
 
 import Foundation
@@ -74,15 +50,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if defaults.object(forKey: "defaultRate") != nil { rate = defaults.double(forKey: "defaultRate") }; if rate <= 0 { rate = 1 }
         let autoResume = (defaults.object(forKey: "autoResume") as? Bool) ?? true
 
-        // The duration is only needed to answer "were you basically at the end".
-        // It used to be required outright, so an item whose duration we never
-        // learned could not resume at all. AVFoundation cannot read a Matroska
-        // duration, so every mkv sat at duration 0, and media sources are exactly
-        // where mkv lives. Playback worked; resume was never even attempted.
-        //
-        // Unknown duration now means "not at the end", which is the useful guess:
-        // the worst case is resuming a file you had actually finished, and the
-        // player is showing you a Resume button anyway.
         let finished = media.duration > 0 && media.lastPosition >= media.duration * 0.95
         let shouldResume = autoResume && media.lastPosition > 15 && !finished
 
@@ -119,8 +86,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
         loadSidecarSubtitles(for: url); play(); scheduleAutoHide()
 
-        // VLC does not publish its elementary streams the instant playback
-        // begins. State changes usually cover it; this catches the rest.
         if !media.isEngineSupported {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -169,13 +134,11 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     // MARK: - Trakt
 
-    /// Falls back to the stored progress before the engine reports a duration.
     private var scrobbleProgress: Double {
         guard duration > 0 else { return media.progress }
         return min(max(current / duration, 0), 1)
     }
 
-    /// Opens a scrobble. Silent once the title has been checked in.
     private func scrobbleStart() {
         guard !hasScrobbledWatched else { return }
         isScrobbling = true
@@ -188,8 +151,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         TraktService.shared.scrobble(item: media, progress: scrobbleProgress, action: .pause)
     }
 
-    /// Checks the title in as watched. Reports 100 percent so Trakt writes it
-    /// to history regardless of the account's scrobble threshold.
     private func scrobbleWatched() {
         guard !hasScrobbledWatched else { return }
         hasScrobbledWatched = true
@@ -197,16 +158,12 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         TraktService.shared.scrobble(item: media, progress: 1.0, action: .stop)
     }
 
-    /// Closing the player early. Reports the real position, so Trakt keeps it
-    /// in progress rather than marking it watched.
     private func scrobbleAbandon() {
         guard !hasScrobbledWatched, isScrobbling else { return }
         isScrobbling = false
         TraktService.shared.scrobble(item: media, progress: scrobbleProgress, action: .stop)
     }
 
-    /// Three minutes from the end, check in. Under six minutes long the three
-    /// minute rule would fire near the start, so use 90 percent instead.
     private func checkWatchedThreshold() {
         guard !hasScrobbledWatched, duration > 0, current > 0 else { return }
         let remaining = duration - current
@@ -265,23 +222,15 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     func flash(_ text: String) { flashText = text; flashTask?.cancel(); let work = DispatchWorkItem { [weak self] in self?.flashText = nil }; flashTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work) }
 
-    /// Playback moves forward, so the cue we want is almost always the one we
-    /// showed last or the one after it. Remembering where we were turns a linear
-    /// scan of every cue, on every clock tick, into a step or two.
-    ///
-    /// Four ticks a second against a two hour film's two thousand cues is a lot of
-    /// string comparisons to throw away.
     private func updateCue(at time: Double) {
         guard subtitlesOn, hasExternalCues, !cues.isEmpty else {
             if cueText != nil { cueText = nil }
             return
         }
 
-        // A seek can land anywhere; walk backwards until we are not past the cue.
         while cueCursor > 0 && time < cues[cueCursor].start {
             cueCursor -= 1
         }
-        // Skip anything that has already ended.
         while cueCursor < cues.count - 1 && time > cues[cueCursor].end {
             cueCursor += 1
         }
@@ -291,8 +240,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if text != cueText { cueText = text }
     }
 
-    /// One you loaded in the player wins, since you chose it. Otherwise an .srt
-    /// already sitting next to the video, which is only ever read.
     private func loadSidecarSubtitles(for mediaURL: URL) {
         let saved = store.savedSubtitleURL(for: media)
         if FileManager.default.fileExists(atPath: saved.path) {
@@ -304,36 +251,43 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             loadSubtitleFile(sidecar, persist: false)
         }
     }
-    /// persist: true keeps the subtitle for next time, in the app's own Subtitles
-    /// directory. It used to write it next to the video, which for a media source
-    /// meant dropping a file onto the user's own drive: uninvited, silent if the
-    /// volume was read only, and enough to wake the folder watcher.
+    
     func loadSubtitleFile(_ url: URL, persist: Bool = true) {
         let secured = url.startAccessingSecurityScopedResource()
         defer { if secured { url.stopAccessingSecurityScopedResource() } }
 
         guard let data = try? Data(contentsOf: url) else { flash("Couldn't read subtitles"); return }
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
-        let parsed = SRTParser.parse(text)
-        guard !parsed.isEmpty else { flash("Couldn't read subtitles"); return }
+        
+        // CONCURRENCY FIX: Push the heavy parsing off the Main Actor
+        Task.detached(priority: .userInitiated) {
+            let parsed = SRTParser.parse(text)
+            
+            // Return to the Main Actor to update the UI
+            await MainActor.run {
+                guard !parsed.isEmpty else { self.flash("Couldn't read subtitles"); return }
+                self.cues = parsed
+                self.cueCursor = 0
+                self.hasExternalCues = true
+                self.subtitlesOn = true
+                self.flash("Subtitles loaded")
+            }
+        }
 
-        cues = parsed
-        cueCursor = 0
-        hasExternalCues = true
-        subtitlesOn = true
-        flash("Subtitles loaded")
-
-        if persist { try? data.write(to: store.savedSubtitleURL(for: media), options: .atomic) }
+        // CONCURRENCY FIX: Push subtitle saving off the main thread
+        if persist {
+            let targetURL = store.savedSubtitleURL(for: media)
+            Task.detached(priority: .utility) {
+                try? data.write(to: targetURL, options: .atomic)
+            }
+        }
     }
+    
     private func loadSelectionGroups(for item: AVPlayerItem) { let asset = item.asset; Task { [weak self] in let chars = (try? await asset.load(.availableMediaCharacteristicsWithMediaSelectionOptions)) ?? []; let audio = chars.contains(.audible) ? try? await asset.loadMediaSelectionGroup(for: .audible) : nil; let legible = chars.contains(.legible) ? try? await asset.loadMediaSelectionGroup(for: .legible) : nil; guard let self else { return }; self.audioGroup = audio; self.legibleGroup = legible; self.audioOptions = audio?.options ?? []; self.legibleOptions = legible?.options ?? [] } }
-    /// VLC will happily accept a seek before its demuxer is ready and then quietly
-    /// ignore it, which is why resuming an mkv could drop you at 0:00 even when the
-    /// position was right. So we set the time, and on the next tick check whether it
-    /// took. Three attempts, then leave it alone rather than fight the player.
+    
     private func applyPendingVLCSeek() {
         guard let target = pendingVLCSeek else { return }
 
-        // Did the last attempt land? Anything within two seconds is close enough.
         if pendingSeekAttempts > 0, abs(current - target) < 2 {
             pendingVLCSeek = nil
             pendingSeekAttempts = 0
@@ -353,9 +307,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     // MARK: - Lock screen, headphones and interruptions
 
-    /// UIBackgroundModes already lets audio survive the screen locking, but
-    /// nothing was telling iOS what was playing or listening for the buttons
-    /// on the lock screen and on headphones. This does both.
     private func setupRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
 
@@ -397,9 +348,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
     }
 
-    /// The guard-let-self dance is deliberate. A weak capture is a variable owned
-    /// by this closure, and the Task inside runs concurrently, so it cannot read
-    /// it. Pinning it to a local constant first is what makes this compile.
     private func addCommand(_ command: MPRemoteCommand,
                             _ handler: @escaping (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus) {
         command.isEnabled = true
@@ -409,7 +357,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private func observeAudioSession() {
         let notifications = NotificationCenter.default
 
-        // A phone call, a Siri request, another app grabbing the session.
         audioObservers.append(notifications.addObserver(forName: AVAudioSession.interruptionNotification,
                                                         object: nil, queue: .main) { [weak self] note in
             guard let self,
@@ -436,10 +383,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             }
         })
 
-        // Two jobs. Pause when the old output disappears, so pulling headphones
-        // out does not dump the audio onto the iPad speaker at whatever volume it
-        // happened to be at. And re-ask for the channel count, because plugging
-        // into a receiver mid-film is exactly when more than two become available.
         audioObservers.append(notifications.addObserver(forName: AVAudioSession.routeChangeNotification,
                                                         object: nil, queue: .main) { [weak self] note in
             guard let self else { return }
@@ -453,10 +396,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         })
     }
 
-    /// .moviePlayback already asks for spatialisation on AirPods. What was missing
-    /// is the declaration that this app has multichannel content to spatialise:
-    /// without it, AirPlay and HDMI stay stereo and a 5.1 mix is folded down
-    /// before it ever leaves the device.
     private func configureAudioSession() {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .moviePlayback)
@@ -465,8 +404,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         applyPreferredChannels()
     }
 
-    /// Ask the current route for everything it has. Two on the built-in speaker,
-    /// more over USB-C to HDMI or a digital receiver.
     private func applyPreferredChannels() {
         let session = AVAudioSession.sharedInstance()
         try? session.setPreferredOutputNumberOfChannels(session.maximumOutputNumberOfChannels)
@@ -480,8 +417,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
     }
 
-    /// iOS extrapolates the elapsed time from the rate, so this only needs to
-    /// run when something other than the clock changes.
     private func updateNowPlaying() {
         lastNowPlayingDuration = duration
 
@@ -510,7 +445,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         return media.fileExtension.uppercased()
     }
 
-    /// Local frame grab first, since it works offline. TMDB poster as a fallback.
     private func loadArtwork() async {
         let path = store.thumbURL(for: media).path
         var image: UIImage? = await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
@@ -529,10 +463,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     var usesVLC: Bool { !media.isEngineSupported }
 
-    /// AVFoundation exposes embedded tracks through AVMediaSelectionGroup, which
-    /// only ever gets loaded on the AVPlayer path. Files that fall through to VLC
-    /// had no track list at all, so an mkv with embedded subtitles showed nothing
-    /// and the menu offered only "Load .srt file". These are the VLC equivalents.
     private func refreshVLCTracks() {
         guard usesVLC else { return }
 
@@ -541,16 +471,12 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         vlcSubtitleIndex = vlcPlayer.currentVideoSubTitleIndex
         vlcAudioIndex = vlcPlayer.currentAudioTrackIndex
 
-        // VLC leaves subtitles off unless a track matches the preferred language.
-        // Turn the first one on once, so a subtitled file plays subtitled.
         if !didAutoSelectSubtitle, vlcSubtitleIndex < 0, let first = vlcSubtitleTracks.first {
             didAutoSelectSubtitle = true
             selectVLCSubtitle(first)
         }
     }
 
-    /// VLC hands back two parallel arrays and includes its own "Disable" entry
-    /// at index -1, which we drop in favour of our own Off button.
     private static func trackList(indexes: [Any]?, names: [Any]?) -> [PlayerTrack] {
         let numbers = (indexes as? [NSNumber]) ?? []
         let titles = (names as? [String]) ?? []
@@ -647,8 +573,6 @@ struct PlayerScreen: View {
         .preferredColorScheme(.dark)
     }
 
-    /// Styles the external .srt overlay. VLC draws embedded subtitle tracks into
-    /// the video itself, well below SwiftUI, so none of this reaches them.
     private var subtitleOverlay: some View {
         VStack {
             Spacer()
@@ -823,7 +747,6 @@ struct OSDBadge: View {
 // SUBTITLE PARSING LOGIC
 // -----------------------------------------------------------
 
-/// One embedded elementary stream reported by VLC.
 struct PlayerTrack: Identifiable, Hashable {
     let index: Int32
     let name: String
