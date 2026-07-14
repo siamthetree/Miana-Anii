@@ -1,17 +1,19 @@
 // ==========================================================
-//  BUG 4  -  STOP WRITING TO THE USER'S DRIVE  (file 1 of 2)
+//  BUG 7  -  SIXTY IDENTICAL TMDB CALLS  (file 2 of 3)
 //
 //  File:  Sources/Library/LibraryStore.swift
-//  Replace the entire file. Supersedes BUG-3b.
+//  Replace the entire file. Supersedes BUG-4a.
 //
-//  Adds a Subtitles directory alongside Media and Thumbnails, and two
-//  accessors: savedSubtitleURL, which is inside the app and keyed by item
-//  id, and sidecarSubtitleURL, which is next to the video and only ever
-//  read.
+//  refreshMetadata() walked the library one file at a time, awaiting each
+//  round trip before starting the next. Four at a time now, through a
+//  task group.
 //
-//  delete(), deleteAll() and removeFolder() now clean up the saved
-//  subtitle too, and delete() no longer tries to remove an .srt next to a
-//  media source file, because it never put one there.
+//  Four, not forty. TMDB rate limits, and a refresh has no business
+//  saturating your connection while you are watching something.
+//
+//  Results are applied where group.next() returns, which is on the main
+//  actor, so mutating items stays safe. And refreshProgress publishes
+//  done and total, so the button can say where it has got to.
 // ==========================================================
 
 import Foundation
@@ -25,6 +27,9 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     @Published private(set) var folders: [WatchedFolder] = []
     @Published private(set) var isScanning = false
+
+    /// done and total while a metadata refresh runs, nil when idle.
+    @Published private(set) var refreshProgress: (done: Int, total: Int)?
 
     /// The library, collapsed into movies and shows. Rebuilt once whenever items
     /// changes, not on every read. The detail views used to call
@@ -394,15 +399,55 @@ final class LibraryStore: ObservableObject {
     }
 
     /// Re-queries TMDB for every item and rewrites its metadata in place.
+    ///
+    /// This used to run one file at a time, each doing its own search and detail
+    /// call, so sixty episodes of one show meant sixty identical searches and
+    /// sixty identical detail fetches, in series. TMDBCache collapses the
+    /// duplicates; the task group stops them queueing behind each other.
+    ///
+    /// Four at a time, not forty. TMDB rate limits, and a refresh has no business
+    /// saturating someone's connection while they are watching something.
     func refreshMetadata() async {
+        guard refreshProgress == nil else { return }
+
+        await TMDBCache.shared.clear()
+
         let snapshot = items
-        for item in snapshot {
-            let raw = (item.fileName as NSString).deletingPathExtension
-            let clean = Self.prettyTitle(from: raw)
-            guard let meta = await MetadataService.fetchMetadata(for: item.fileName, cleanTitle: clean) else { continue }
-            guard let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
-            items[index].metadata = meta
+        guard !snapshot.isEmpty else { return }
+        refreshProgress = (0, snapshot.count)
+        defer { refreshProgress = nil }
+
+        let concurrency = 4
+        var next = 0
+        var done = 0
+
+        await withTaskGroup(of: (UUID, MediaMetadata?).self) { group in
+            func enqueue() {
+                guard next < snapshot.count else { return }
+                let item = snapshot[next]
+                next += 1
+
+                let fileName = item.fileName
+                let clean = Self.prettyTitle(from: (fileName as NSString).deletingPathExtension)
+                let id = item.id
+                group.addTask {
+                    (id, await MetadataService.fetchMetadata(for: fileName, cleanTitle: clean))
+                }
+            }
+
+            for _ in 0..<concurrency { enqueue() }
+
+            // Results land here on the main actor, so mutating items is safe.
+            while let (id, meta) = await group.next() {
+                done += 1
+                refreshProgress = (done, snapshot.count)
+                if let meta, let index = items.firstIndex(where: { $0.id == id }) {
+                    items[index].metadata = meta
+                }
+                enqueue()
+            }
         }
+
         save()
     }
 
