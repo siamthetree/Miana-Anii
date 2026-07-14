@@ -1,3 +1,14 @@
+// ==========================================================
+//  BUG 2  -  ONE DISK WRITE, NOT SIXTY  (file 3 of 3)
+//
+//  File:  Sources/Library/SeasonDetailView.swift
+//  Replace the entire file. Supersedes BUG-1b.
+//
+//  The season screen had no bulk action at all. It now has one, next to
+//  the Episodes header, using the same batched call. One write for the
+//  season, not one per episode.
+// ==========================================================
+
 import Foundation
 import SwiftUI
 
@@ -97,10 +108,27 @@ struct SeasonDetailView: View {
         }
     }
 
+    // MARK: - Episodes
 
     private func episodeList(_ season: Season) -> some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Episodes").font(.title3.weight(.bold)).foregroundStyle(.white)
+            HStack {
+                Text("Episodes").font(.title3.weight(.bold)).foregroundStyle(.white)
+                Spacer()
+                Menu {
+                    Button { store.markWatched(season.episodes) } label: {
+                        Label("Mark Season as Watched", systemImage: "eye")
+                    }
+                    if season.unwatchedCount < season.episodes.count {
+                        Button { store.resetProgress(season.episodes) } label: {
+                            Label("Mark Season as Unwatched", systemImage: "eye.slash")
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle").font(.title3).foregroundStyle(.white)
+                }
+                .accessibilityLabel("Season actions")
+            }
 
             VStack(spacing: 0) {
                 ForEach(season.episodes) { episode in
@@ -131,6 +159,7 @@ struct SeasonDetailView: View {
     }
 }
 
+// MARK: - Episode row
 
 struct EpisodeRow: View {
     let item: MediaItem
@@ -218,6 +247,7 @@ struct EpisodeRow: View {
     }
 }
 
+// MARK: - Episode detail
 
 struct EpisodeDetailView: View {
     let itemID: UUID
