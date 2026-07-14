@@ -1,4 +1,12 @@
-
+// ==========================================================
+//  BUG 7  -  SIXTY IDENTICAL TMDB CALLS  (file 3 of 3)
+//
+//  File:  Sources/Library/SettingsView.swift
+//  Replace the entire file. Supersedes IMP-7b.
+//
+//  The button read "Refreshing…" and then nothing, for as long as it took,
+//  with no way to tell a slow refresh from a dead one. It counts now.
+// ==========================================================
 
 import SwiftUI
 import UniformTypeIdentifiers
@@ -21,6 +29,14 @@ struct SettingsView: View {
     @State private var confirmWipe = false
     @State private var refreshing = false
     @State private var showFolderPicker = false
+
+    /// "Refreshing 12 of 87" beats a spinner that might have died ten minutes ago.
+    private var refreshLabel: String {
+        guard let progress = store.refreshProgress else {
+            return refreshing ? "Refreshing…" : "Refresh metadata"
+        }
+        return "Refreshing \(progress.done) of \(progress.total)…"
+    }
 
     var body: some View {
         NavigationStack {
@@ -119,7 +135,7 @@ struct SettingsView: View {
                     Button("Rescan for new files") {
                         Task { await store.rescan(); storageText = store.storageString() }
                     }
-                    Button(refreshing ? "Refreshing…" : "Refresh metadata") {
+                    Button(refreshLabel) {
                         refreshing = true
                         Task { await store.refreshMetadata(); refreshing = false }
                     }
