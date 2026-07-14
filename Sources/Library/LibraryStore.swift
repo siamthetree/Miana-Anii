@@ -1,19 +1,8 @@
 // ==========================================================
-//  BUG 7  -  SIXTY IDENTICAL TMDB CALLS  (file 2 of 3)
+//  BUG 7 + CONCURRENCY FIXES (Combined)
 //
 //  File:  Sources/Library/LibraryStore.swift
-//  Replace the entire file. Supersedes BUG-4a.
-//
-//  refreshMetadata() walked the library one file at a time, awaiting each
-//  round trip before starting the next. Four at a time now, through a
-//  task group.
-//
-//  Four, not forty. TMDB rate limits, and a refresh has no business
-//  saturating your connection while you are watching something.
-//
-//  Results are applied where group.next() returns, which is on the main
-//  actor, so mutating items stays safe. And refreshProgress publishes
-//  done and total, so the button can say where it has got to.
+//  Replace the entire file.
 // ==========================================================
 
 import Foundation
@@ -32,9 +21,7 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var refreshProgress: (done: Int, total: Int)?
 
     /// The library, collapsed into movies and shows. Rebuilt once whenever items
-    /// changes, not on every read. The detail views used to call
-    /// groupedIntoEntries() from inside their view bodies, several times per
-    /// frame, each call regrouping every item in the library.
+    /// changes, not on every read.
     @Published private(set) var entries: [LibraryEntry] = []
     private var seriesIndex: [String: Series] = [:]
 
@@ -48,11 +35,14 @@ final class LibraryStore: ObservableObject {
     private let indexURL: URL
     private let foldersURL: URL
 
-    /// Resolved, access-started URL for each watched folder. Missing key means
-    /// the folder could not be reached this launch.
+    /// Resolved, access-started URL for each watched folder.
     private var folderURLs: [UUID: URL] = [:]
     private let watcher = FolderWatcher()
     private var debouncedScan: Task<Void, Never>?
+    
+    // MARK: - Concurrency Queue
+    private var importQueue: [URL] = []
+    private var isProcessingQueue = false
 
     init() {
         documentsURL = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
@@ -69,6 +59,27 @@ final class LibraryStore: ObservableObject {
         activateFolders()
     }
 
+    // MARK: - Sequential Import Queue
+    
+    func enqueueImport(url: URL) {
+        importQueue.append(url)
+        if !isProcessingQueue { processNextQueueItem() }
+    }
+
+    private func processNextQueueItem() {
+        guard !importQueue.isEmpty else {
+            isProcessingQueue = false
+            save()
+            return
+        }
+        isProcessingQueue = true
+        let nextURL = importQueue.removeFirst()
+        Task {
+            await importFile(nextURL)
+            processNextQueueItem()
+        }
+    }
+
     // MARK: - Persistence
 
     private func load() {
@@ -78,14 +89,15 @@ final class LibraryStore: ObservableObject {
         regroup()
     }
 
-    /// Every path that mutates items ends here, which makes this the one honest
-    /// place to rebuild the grouping. A didSet on items would look tidier and be
-    /// worse: mutating one element of an array fires it, so a batch update would
-    /// regroup once per element.
     func save() {
         regroup()
         guard let data = try? JSONEncoder().encode(items) else { return }
-        try? data.write(to: indexURL, options: .atomic)
+        let targetURL = indexURL
+        
+        // Push the disk-write off the main UI thread
+        Task.detached(priority: .background) {
+            try? data.write(to: targetURL, options: .atomic)
+        }
     }
 
     private func regroup() {
@@ -119,19 +131,14 @@ final class LibraryStore: ObservableObject {
         thumbsDir.appendingPathComponent(item.id.uuidString + ".jpg")
     }
 
-    /// Where a subtitle you loaded in the player is kept. Inside the app, never
-    /// beside your file: a media source is your own drive, and this app has no
-    /// business writing to it.
     func savedSubtitleURL(for item: MediaItem) -> URL {
         subsDir.appendingPathComponent(item.id.uuidString + ".srt")
     }
 
-    /// An .srt already sitting next to the video, which we only ever read.
     func sidecarSubtitleURL(for item: MediaItem) -> URL {
         url(for: item).deletingPathExtension().appendingPathExtension("srt")
     }
 
-    /// True when the item's watched folder is unreachable right now.
     func isOffline(_ item: MediaItem) -> Bool {
         guard let folderID = item.folderID else { return false }
         return folderURLs[folderID] == nil
@@ -156,8 +163,6 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - Watched folders
 
-    /// Resolves every stored bookmark, holds its security scope open, and
-    /// starts a kqueue watcher on it. Called once at launch.
     private func activateFolders() {
         for folder in folders { activate(folder) }
     }
@@ -198,8 +203,6 @@ final class LibraryStore: ObservableObject {
         await scanFolders()
     }
 
-    /// Forgets the folder and drops its library entries. Never touches the
-    /// files on disk.
     func removeFolder(_ folder: WatchedFolder) {
         watcher.stop(folderID: folder.id)
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
@@ -210,13 +213,10 @@ final class LibraryStore: ObservableObject {
             try? fm.removeItem(at: savedSubtitleURL(for: item))
         }
         items.removeAll { $0.folderID == folder.id }
-        folders.removeAll { $0.id == folder.id }
         saveFolders()
         save()
     }
 
-    /// Coalesces a burst of filesystem events into one scan, and gives a file
-    /// that is still being copied a couple of seconds to finish.
     private func scheduleFolderScan() {
         debouncedScan?.cancel()
         debouncedScan = Task { [weak self] in
@@ -237,7 +237,6 @@ final class LibraryStore: ObservableObject {
                 let relative = Self.relativePath(of: file, from: root)
                 if items.contains(where: { $0.folderID == folder.id && $0.relativePath == relative }) { continue }
 
-                // A file whose bytes landed a moment ago is probably still copying.
                 if let modified = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
                    Date().timeIntervalSince(modified) < 3 {
                     sawUnsettledFile = true
@@ -331,8 +330,6 @@ final class LibraryStore: ObservableObject {
             item.metadata = meta
         }
 
-        // AVFoundation cannot open mkv, avi, webm or ts, and answers with a
-        // zero duration rather than an error. VLC reads all of them.
         if item.isEngineSupported {
             let asset = AVURLAsset(url: fileURL)
             if let d = try? await asset.load(.duration), d.seconds.isFinite, d.seconds > 0 { item.duration = d.seconds }
@@ -389,8 +386,6 @@ final class LibraryStore: ObservableObject {
         if changed || items.count != before { save() }
     }
 
-    /// Drops items whose file is gone. An item belonging to an unreachable
-    /// folder is left alone, because "unreachable" is not "deleted".
     private func pruneMissing() {
         items.removeAll { item in
             if item.folderID != nil && isOffline(item) { return false }
@@ -398,15 +393,6 @@ final class LibraryStore: ObservableObject {
         }
     }
 
-    /// Re-queries TMDB for every item and rewrites its metadata in place.
-    ///
-    /// This used to run one file at a time, each doing its own search and detail
-    /// call, so sixty episodes of one show meant sixty identical searches and
-    /// sixty identical detail fetches, in series. TMDBCache collapses the
-    /// duplicates; the task group stops them queueing behind each other.
-    ///
-    /// Four at a time, not forty. TMDB rate limits, and a refresh has no business
-    /// saturating someone's connection while they are watching something.
     func refreshMetadata() async {
         guard refreshProgress == nil else { return }
 
@@ -437,7 +423,6 @@ final class LibraryStore: ObservableObject {
 
             for _ in 0..<concurrency { enqueue() }
 
-            // Results land here on the main actor, so mutating items is safe.
             while let (id, meta) = await group.next() {
                 done += 1
                 refreshProgress = (done, snapshot.count)
@@ -465,10 +450,6 @@ final class LibraryStore: ObservableObject {
         resetProgress([item])
     }
 
-    /// One disk write for the whole batch. save() re-encodes every item in the
-    /// library, so calling the single-item version in a loop meant one full
-    /// encode and one write per episode: sixty of each for a sixty episode show,
-    /// on the main actor, while the screen sat frozen.
     func resetProgress(_ batch: [MediaItem]) {
         var touched = false
         for item in batch {
@@ -501,23 +482,28 @@ final class LibraryStore: ObservableObject {
         items[i].title = trimmed; save()
     }
 
-    /// Deletes the file, whether it is a copy in Media or the original inside a
-    /// watched folder. Removing it from the library alone would not stick: the
-    /// next scan would find the file and add it straight back.
     func delete(_ item: MediaItem) {
-        if !isOffline(item) {
-            let target = url(for: item)
-            try? fm.removeItem(at: target)
-            // Only ever a sidecar we put in Media ourselves. A media source lives
-            // on the user's drive and we do not write .srt files there.
-            if !item.isExternal {
-                try? fm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt"))
-            }
-        }
-        try? fm.removeItem(at: thumbURL(for: item))
-        try? fm.removeItem(at: savedSubtitleURL(for: item))
+        let target = url(for: item)
+        let thumb = thumbURL(for: item)
+        let sub = savedSubtitleURL(for: item)
+        let isExt = item.isExternal
+        let offline = isOffline(item)
+
         items.removeAll { $0.id == item.id }
         save()
+
+        // Hand the heavy unlinking to the file system in the background
+        Task.detached(priority: .userInitiated) {
+            let localFm = FileManager.default
+            if !offline {
+                try? localFm.removeItem(at: target)
+                if !isExt {
+                    try? localFm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt"))
+                }
+            }
+            try? localFm.removeItem(at: thumb)
+            try? localFm.removeItem(at: sub)
+        }
     }
 
     func clearProgress() {
@@ -525,8 +511,6 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
-    /// Wipes imported copies and forgets every watched folder. Files inside a
-    /// watched folder are left on disk.
     func deleteAll() {
         for item in items {
             if item.folderID == nil { try? fm.removeItem(at: url(for: item)) }
@@ -542,19 +526,30 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
+    // MARK: - Asynchronous Storage Calculator
     func storageString() -> String {
-        var total: Int64 = 0
-        if let enumerator = fm.enumerator(at: mediaDir, includingPropertiesForKeys: [.fileSizeKey]) {
-            for case let f as URL in enumerator {
-                if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += Int64(size) }
+        return "Calculating…" 
+    }
+
+    func calculateStorageAsync() async -> String {
+        let path = mediaDir
+        let totalBytes = await Task.detached(priority: .utility) {
+            var total: Int64 = 0
+            let localFm = FileManager.default
+            if let enumerator = localFm.enumerator(at: path, includingPropertiesForKeys: [.fileSizeKey]) {
+                for case let f as URL in enumerator {
+                    if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += Int64(size) }
+                }
             }
-        }
-        return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
+            return total
+        }.value
+        return ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
     }
 
     // MARK: - Helpers
 
-    static func prettyTitle(from raw: String) -> String {
+    // NOTE: Safely marked nonisolated to allow calling from background TaskGroup
+    nonisolated static func prettyTitle(from raw: String) -> String {
         var s = raw.replacingOccurrences(of: "_", with: " ")
         if !s.contains(" ") { s = s.replacingOccurrences(of: ".", with: " ") }
         let lower = s.lowercased()
