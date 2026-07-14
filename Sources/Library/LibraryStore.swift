@@ -1,5 +1,5 @@
 // ==========================================================
-//  BUG 7 + CONCURRENCY FIXES (Combined)
+//  BUG 8 + BUG 7 + CONCURRENCY & COMPILER FIXES
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -20,8 +20,6 @@ final class LibraryStore: ObservableObject {
     /// done and total while a metadata refresh runs, nil when idle.
     @Published private(set) var refreshProgress: (done: Int, total: Int)?
 
-    /// The library, collapsed into movies and shows. Rebuilt once whenever items
-    /// changes, not on every read.
     @Published private(set) var entries: [LibraryEntry] = []
     private var seriesIndex: [String: Series] = [:]
 
@@ -35,11 +33,10 @@ final class LibraryStore: ObservableObject {
     private let indexURL: URL
     private let foldersURL: URL
 
-    /// Resolved, access-started URL for each watched folder.
     private var folderURLs: [UUID: URL] = [:]
     private let watcher = FolderWatcher()
     private var debouncedScan: Task<Void, Never>?
-    
+
     // MARK: - Concurrency Queue
     private var importQueue: [URL] = []
     private var isProcessingQueue = false
@@ -58,7 +55,7 @@ final class LibraryStore: ObservableObject {
         loadFolders()
         activateFolders()
     }
-
+    
     // MARK: - Sequential Import Queue
     
     func enqueueImport(url: URL) {
@@ -213,6 +210,7 @@ final class LibraryStore: ObservableObject {
             try? fm.removeItem(at: savedSubtitleURL(for: item))
         }
         items.removeAll { $0.folderID == folder.id }
+        folders.removeAll { $0.id == folder.id }
         saveFolders()
         save()
     }
@@ -380,6 +378,7 @@ final class LibraryStore: ObservableObject {
         }
 
         await scanFolders()
+        await backfillDurations()
 
         let before = items.count
         pruneMissing()
@@ -446,6 +445,22 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
+    func backfillDurations() async {
+        let pending = items.filter { $0.duration <= 0 }
+        guard !pending.isEmpty else { return }
+
+        for item in pending {
+            guard !isOffline(item) else { continue }
+            let fileURL = url(for: item)
+            guard fm.fileExists(atPath: fileURL.path) else { continue }
+
+            let seconds = await Task.detached(priority: .utility) { VLCProbe.duration(of: fileURL) }.value
+            guard seconds > 0, let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
+            items[index].duration = seconds
+        }
+        save()
+    }
+
     func resetProgress(_ item: MediaItem) {
         resetProgress([item])
     }
@@ -497,6 +512,7 @@ final class LibraryStore: ObservableObject {
             let localFm = FileManager.default
             if !offline {
                 try? localFm.removeItem(at: target)
+                // BUG 8 FIX: Do not wipe sidecar SRT files from external drives
                 if !isExt {
                     try? localFm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt"))
                 }
@@ -548,7 +564,7 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - Helpers
 
-    // NOTE: Safely marked nonisolated to allow calling from background TaskGroup
+    // NOTE: Safely marked nonisolated to clear the Swift 6 GitHub Actions error
     nonisolated static func prettyTitle(from raw: String) -> String {
         var s = raw.replacingOccurrences(of: "_", with: " ")
         if !s.contains(" ") { s = s.replacingOccurrences(of: ".", with: " ") }
