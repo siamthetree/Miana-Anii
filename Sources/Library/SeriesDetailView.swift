@@ -1,3 +1,13 @@
+// ==========================================================
+//  BUG 3  -  GROUP ONCE, NOT EIGHT TIMES A FRAME  (3 of 4)
+//
+//  File:  Sources/Library/SeriesDetailView.swift
+//  Replace the entire file. Supersedes FIX-4c.
+//
+//  `current` is read about eight times per body. It was regrouping the
+//  entire library each time. It is a dictionary lookup now.
+// ==========================================================
+
 import Foundation
 import SwiftUI
 
@@ -8,8 +18,9 @@ struct SeriesDetailView: View {
     @EnvironmentObject private var store: LibraryStore
     @Environment(\.dismiss) private var dismiss
 
-    /// Live copy pulled from the store, so edits reflect immediately.
-    private var current: Series { store.items.series(withID: series.id) ?? series }
+    /// Live copy pulled from the store, so edits reflect immediately. A dictionary
+    /// lookup now, not a regrouping of the whole library on every read.
+    private var current: Series { store.series(withID: series.id) ?? series }
     private var seasons: [Season] { current.seasons }
 
     var body: some View {
