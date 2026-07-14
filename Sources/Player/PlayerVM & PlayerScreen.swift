@@ -1,3 +1,10 @@
+// ==========================================================
+//  REFACTORED: FONTWEIGHT SCOPE FIX
+//
+//  File:  Sources/Player/PlayerVM & PlayerScreen.swift
+//  Replace the entire file.
+// ==========================================================
+
 import Foundation
 import SwiftUI
 import AVFoundation
@@ -7,7 +14,6 @@ import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
 import MobileVLCKit
-import CoreMedia
 
 // MARK: - System Media Coordinator
 
@@ -254,7 +260,9 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if media.isEngineSupported {
             let item = AVPlayerItem(url: url)
             
-            if let rule = AVTextStyleRule(textMarkupAttributes: [kCMTextMarkupAttribute_FontWeight as String: "normal"]) {
+            // APPLE TV/IOS 17 EMBEDDED SUBTITLE FIX:
+            // Use the raw "FontWeight" string instead of the CoreMedia constant to fix scope errors
+            if let rule = AVTextStyleRule(textMarkupAttributes: ["FontWeight": "normal"]) {
                 item.textStyleRules = [rule]
             }
             
