@@ -1,5 +1,5 @@
 // ==========================================================
-//  BUG 5 + SWIFTDATA INTEGRATION
+//  BUG 5 + SWIFTDATA INTEGRATION + STRUCT INIT FIX
 //
 //  File:  Sources/App.swift
 //  Replace the entire file.
@@ -35,13 +35,18 @@ struct MinaAniiApp: App {
                                    
         // SwiftData Setup: Create the database for our two models
         do {
-            container = try ModelContainer(for: MediaItem.self, WatchedFolder.self)
+            // 1. Create a local container so we don't capture `self` in the StateObject closure
+            let localContainer = try ModelContainer(for: MediaItem.self, WatchedFolder.self)
+            let localContext = localContainer.mainContext
+            
+            // 2. Initialize the StateObject using the local context
+            _store = StateObject(wrappedValue: LibraryStore(context: localContext))
+            
+            // 3. Assign the container to self to fulfill the struct requirement
+            self.container = localContainer
         } catch {
             fatalError("Failed to initialize SwiftData container: \(error)")
         }
-        
-        // Pass the SwiftData context into our LibraryStore
-        _store = StateObject(wrappedValue: LibraryStore(context: container.mainContext))
     }
 
     var body: some Scene {
