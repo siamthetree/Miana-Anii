@@ -1,5 +1,5 @@
 // ==========================================================
-//  LIQUID GLASS + CONCURRENCY + VLC CRASH PROTECTIONS + SWIFT 6 SENDABLE FIX
+//  LIQUID GLASS + MODERN TASKS + SWIFT 6 SENDABLE FIX
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -23,7 +23,11 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var vlcSubtitleTracks: [PlayerTrack] = []; @Published var vlcAudioTracks: [PlayerTrack] = []
     @Published var vlcSubtitleIndex: Int32 = -1; @Published var vlcAudioIndex: Int32 = -1
 
-    private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var hideTask: DispatchWorkItem?; private var flashTask: DispatchWorkItem?; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
+    private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
+
+    // SWIFT 6 ARCHITECTURE: Replaced legacy DispatchWorkItems with Tasks
+    private var hideTask: Task<Void, Never>?
+    private var flashTask: Task<Void, Never>?
 
     private var remoteTargets: [(MPRemoteCommand, Any)] = []
     private var audioObservers: [NSObjectProtocol] = []
@@ -222,15 +226,23 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         let intervalObject = UserDefaults.standard.object(forKey: "autoHideInterval")
         let interval = intervalObject != nil ? UserDefaults.standard.double(forKey: "autoHideInterval") : 10.0
         guard interval > 0 else { return }
-        let work = DispatchWorkItem { [weak self] in 
-            guard let self, self.isPlaying, !self.isScrubbing else { return }
+        
+        hideTask = Task { @MainActor [weak self] in 
+            try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            guard !Task.isCancelled, let self, self.isPlaying, !self.isScrubbing else { return }
             withAnimation(.easeOut(duration: 0.25)) { self.showControls = false } 
         }
-        hideTask = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + interval, execute: work) 
     }
 
-    func flash(_ text: String) { flashText = text; flashTask?.cancel(); let work = DispatchWorkItem { [weak self] in self?.flashText = nil }; flashTask = work; DispatchQueue.main.asyncAfter(deadline: .now() + 0.9, execute: work) }
+    func flash(_ text: String) { 
+        flashText = text
+        flashTask?.cancel()
+        flashTask = Task { @MainActor [weak self] in 
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard !Task.isCancelled else { return }
+            self?.flashText = nil 
+        }
+    }
 
     private func updateCue(at time: Double) {
         guard subtitlesOn, hasExternalCues, !cues.isEmpty else {
@@ -316,7 +328,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private func setupRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
 
-        // SWIFT 6 FIX: Added @Sendable to all remote command closures so they don't trip MainActor assertions
         addCommand(center.playCommand) { @Sendable [weak self] _ in
             guard let self else { return .commandFailed }
             Task { @MainActor in self.play() }
@@ -462,7 +473,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         }
         guard let image else { return }
 
-        // SWIFT 6 FIX: @Sendable prevents MainActor checking inside this system-called background closure
         nowPlayingArtwork = MPMediaItemArtwork(boundsSize: image.size) { @Sendable _ in image }
         updateNowPlaying()
     }
