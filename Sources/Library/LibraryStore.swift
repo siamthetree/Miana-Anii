@@ -1,5 +1,5 @@
 // ==========================================================
-//  BUG 8 + BUG 7 + CONCURRENCY & COMPILER FIXES
+//  BUG 10 + CONCURRENCY + SWIFT 6 COMPILER FIXES
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -16,6 +16,11 @@ final class LibraryStore: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     @Published private(set) var folders: [WatchedFolder] = []
     @Published private(set) var isScanning = false
+
+    /// Sources that resolved but whose files cannot be reached: an unmounted drive,
+    /// an iCloud folder that has not come back. Their items are kept, not pruned,
+    /// so this is the only way the interface can admit something is wrong.
+    @Published private(set) var unreachableFolders: Set<UUID> = []
 
     /// done and total while a metadata refresh runs, nil when idle.
     @Published private(set) var refreshProgress: (done: Int, total: Int)?
@@ -37,6 +42,9 @@ final class LibraryStore: ObservableObject {
     private let watcher = FolderWatcher()
     private var debouncedScan: Task<Void, Never>?
 
+    private var scanRequested = false
+    private var watchedDirectories: [UUID: [URL]] = [:]
+    
     // MARK: - Concurrency Queue
     private var importQueue: [URL] = []
     private var isProcessingQueue = false
@@ -91,7 +99,7 @@ final class LibraryStore: ObservableObject {
         guard let data = try? JSONEncoder().encode(items) else { return }
         let targetURL = indexURL
         
-        // Push the disk-write off the main UI thread
+        // CONCURRENCY FIX: Push the disk-write off the main UI thread
         Task.detached(priority: .background) {
             try? data.write(to: targetURL, options: .atomic)
         }
@@ -145,6 +153,10 @@ final class LibraryStore: ObservableObject {
         items.filter { $0.folderID == folder.id }.count
     }
 
+    func isUnreachable(_ folder: WatchedFolder) -> Bool {
+        unreachableFolders.contains(folder.id)
+    }
+
     private func uniqueDestination(for fileName: String) -> URL {
         let base = (fileName as NSString).deletingPathExtension
         let ext = (fileName as NSString).pathExtension
@@ -177,7 +189,15 @@ final class LibraryStore: ObservableObject {
             saveFolders()
         }
 
-        watcher.watch(folderID: folder.id, directories: directories(under: url)) { [weak self] in
+        rewatchIfNeeded(folder.id, root: url)
+    }
+
+    private func rewatchIfNeeded(_ folderID: UUID, root: URL) {
+        let current = directories(under: root)
+        guard watchedDirectories[folderID] != current else { return }
+        watchedDirectories[folderID] = current
+
+        watcher.watch(folderID: folderID, directories: current) { [weak self] in
             guard let self else { return }
             Task { @MainActor in self.scheduleFolderScan() }
         }
@@ -202,6 +222,7 @@ final class LibraryStore: ObservableObject {
 
     func removeFolder(_ folder: WatchedFolder) {
         watcher.stop(folderID: folder.id)
+        watchedDirectories[folder.id] = nil
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
         folderURLs[folder.id] = nil
 
@@ -225,13 +246,32 @@ final class LibraryStore: ObservableObject {
     }
 
     func scanFolders() async {
-        guard !folders.isEmpty, !isScanning else { return }
+        guard !folders.isEmpty else { return }
+        guard !isScanning else { scanRequested = true; return }
+
         isScanning = true
+        defer { isScanning = false }
+
+        repeat {
+            scanRequested = false
+            let sawUnsettledFile = await scanFoldersOnce()
+            pruneMissing()
+            save()
+            if sawUnsettledFile { scheduleFolderScan() }
+        } while scanRequested
+    }
+
+    private func scanFoldersOnce() async -> Bool {
         var sawUnsettledFile = false
 
         for folder in folders {
             guard let root = folderURLs[folder.id] else { continue }
-            for file in mediaFiles(under: root) {
+
+            let files = mediaFiles(under: root)
+
+            if files.isEmpty && items.contains(where: { $0.folderID == folder.id }) { continue }
+
+            for file in files {
                 let relative = Self.relativePath(of: file, from: root)
                 if items.contains(where: { $0.folderID == folder.id && $0.relativePath == relative }) { continue }
 
@@ -242,16 +282,11 @@ final class LibraryStore: ObservableObject {
                 }
                 await ingest(fileURL: file, folderID: folder.id, relativePath: relative)
             }
-            watcher.watch(folderID: folder.id, directories: directories(under: root)) { [weak self] in
-                guard let self else { return }
-                Task { @MainActor in self.scheduleFolderScan() }
-            }
+
+            rewatchIfNeeded(folder.id, root: root)
         }
 
-        pruneMissing()
-        save()
-        isScanning = false
-        if sawUnsettledFile { scheduleFolderScan() }
+        return sawUnsettledFile
     }
 
     private func mediaFiles(under root: URL) -> [URL] {
@@ -386,8 +421,28 @@ final class LibraryStore: ObservableObject {
     }
 
     private func pruneMissing() {
+        var missing: [UUID: (gone: Int, total: Int)] = [:]
+
+        for item in items {
+            guard let folderID = item.folderID, !isOffline(item) else { continue }
+            var tally = missing[folderID] ?? (0, 0)
+            tally.total += 1
+            if !fm.fileExists(atPath: url(for: item).path) { tally.gone += 1 }
+            missing[folderID] = tally
+        }
+
+        let unreachable = Set(missing.compactMap { id, tally in
+            (tally.total > 1 && tally.gone == tally.total) ? id : nil
+        })
+
+        let failedToResolve = folders.map(\.id).filter { folderURLs[$0] == nil }
+        let combined = unreachable.union(failedToResolve)
+        if combined != unreachableFolders { unreachableFolders = combined }
+
         items.removeAll { item in
-            if item.folderID != nil && isOffline(item) { return false }
+            if let folderID = item.folderID {
+                if isOffline(item) || unreachable.contains(folderID) { return false }
+            }
             return !fm.fileExists(atPath: url(for: item).path)
         }
     }
@@ -507,12 +562,11 @@ final class LibraryStore: ObservableObject {
         items.removeAll { $0.id == item.id }
         save()
 
-        // Hand the heavy unlinking to the file system in the background
+        // CONCURRENCY FIX: Hand the heavy unlinking to the file system in the background
         Task.detached(priority: .userInitiated) {
             let localFm = FileManager.default
             if !offline {
                 try? localFm.removeItem(at: target)
-                // BUG 8 FIX: Do not wipe sidecar SRT files from external drives
                 if !isExt {
                     try? localFm.removeItem(at: target.deletingPathExtension().appendingPathExtension("srt"))
                 }
@@ -534,6 +588,7 @@ final class LibraryStore: ObservableObject {
             try? fm.removeItem(at: savedSubtitleURL(for: item))
         }
         watcher.stopAll()
+        watchedDirectories.removeAll()
         for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }
         folderURLs.removeAll()
         folders.removeAll()
@@ -542,7 +597,7 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
-    // MARK: - Asynchronous Storage Calculator
+    // CONCURRENCY FIX: Asynchronous Storage Calculator
     func storageString() -> String {
         return "Calculating…" 
     }
@@ -564,7 +619,7 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - Helpers
 
-    // NOTE: Safely marked nonisolated to clear the Swift 6 GitHub Actions error
+    // SWIFT 6 FIX: Safely marked nonisolated to clear the Swift 6 GitHub Actions error
     nonisolated static func prettyTitle(from raw: String) -> String {
         var s = raw.replacingOccurrences(of: "_", with: " ")
         if !s.contains(" ") { s = s.replacingOccurrences(of: ".", with: " ") }
