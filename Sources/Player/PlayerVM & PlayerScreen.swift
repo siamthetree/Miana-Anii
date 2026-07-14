@@ -1,5 +1,5 @@
 // ==========================================================
-//  LIQUID GLASS + SUBTITLE CONCURRENCY FIX
+//  LIQUID GLASS + CONCURRENCY + SWIFT 6 TUPLE FIX
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -445,9 +445,394 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         return media.fileExtension.uppercased()
     }
 
+    // SWIFT 6 COMPILER FIX: Do not use tuple unwrapping `let (data, _)` with Optionals
     private func loadArtwork() async {
         let path = store.thumbURL(for: media).path
         var image: UIImage? = await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
 
         if image == nil, let poster = media.metadata?.posterURL,
-           let (data, _)
+           let response = try? await URLSession.shared.data(from: poster) {
+            image = UIImage(data: response.0)
+        }
+        guard let image else { return }
+
+        nowPlayingArtwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+        updateNowPlaying()
+    }
+
+    // MARK: - VLC tracks
+
+    var usesVLC: Bool { !media.isEngineSupported }
+
+    private func refreshVLCTracks() {
+        guard usesVLC else { return }
+
+        vlcSubtitleTracks = Self.trackList(indexes: vlcPlayer.videoSubTitlesIndexes, names: vlcPlayer.videoSubTitlesNames)
+        vlcAudioTracks = Self.trackList(indexes: vlcPlayer.audioTrackIndexes, names: vlcPlayer.audioTrackNames)
+        vlcSubtitleIndex = vlcPlayer.currentVideoSubTitleIndex
+        vlcAudioIndex = vlcPlayer.currentAudioTrackIndex
+
+        if !didAutoSelectSubtitle, vlcSubtitleIndex < 0, let first = vlcSubtitleTracks.first {
+            didAutoSelectSubtitle = true
+            selectVLCSubtitle(first)
+        }
+    }
+
+    private static func trackList(indexes: [Any]?, names: [Any]?) -> [PlayerTrack] {
+        let numbers = (indexes as? [NSNumber]) ?? []
+        let titles = (names as? [String]) ?? []
+        var result: [PlayerTrack] = []
+        for (offset, number) in numbers.enumerated() {
+            let index = number.int32Value
+            guard index >= 0 else { continue }
+            let name = offset < titles.count ? titles[offset] : "Track \(index)"
+            result.append(PlayerTrack(index: index, name: name))
+        }
+        return result
+    }
+
+    func selectVLCSubtitle(_ track: PlayerTrack?) {
+        vlcPlayer.currentVideoSubTitleIndex = track?.index ?? -1
+        vlcSubtitleIndex = vlcPlayer.currentVideoSubTitleIndex
+        didAutoSelectSubtitle = true
+        flash(track?.name ?? "Subtitles off")
+    }
+
+    func selectVLCAudio(_ track: PlayerTrack) {
+        vlcPlayer.currentAudioTrackIndex = track.index
+        vlcAudioIndex = vlcPlayer.currentAudioTrackIndex
+        flash(track.name)
+    }
+
+    func selectAudio(_ option: AVMediaSelectionOption) { guard let group = audioGroup else { return }; player.currentItem?.select(option, in: group); flash(option.displayName) }
+    func selectLegible(_ option: AVMediaSelectionOption?) { guard let group = legibleGroup else { return }; player.currentItem?.select(option, in: group); if let option { flash(option.displayName) } }
+    func togglePiP() { guard media.isEngineSupported else { flash("PiP unavailable for this format"); return }; if pip == nil, AVPictureInPictureController.isPictureInPictureSupported(), let layer = layerHolder.playerLayer { pip = AVPictureInPictureController(playerLayer: layer) }; guard let pip else { flash("PiP unavailable"); return }; if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() } }
+    private func periodicSave() { guard Date().timeIntervalSince(lastSave) > 4 else { return }; saveNow() }
+    private func saveNow() { guard current > 0 || duration > 0 else { return }; lastSave = Date(); store.updateProgress(id: media.id, position: current, duration: duration) }
+}
+
+struct PlayerScreen: View {
+    @Environment(\.dismiss) private var dismiss
+    @StateObject private var vm: PlayerVM
+    @State private var scrubValue: Double = 0
+    @State private var showSubImporter = false
+    @State private var dragMode: DragMode = .none
+    @State private var dragStartValue: Double = 0
+    @State private var seekTarget: Double = 0
+    @State private var isWindowed = false
+
+    @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
+    @AppStorage("subtitleBold") private var subtitleBold = true
+    @AppStorage("subtitleBackground") private var subtitleBackground = 0.55
+    private enum DragMode { case none, seek, volume, brightness }
+
+    init(item: MediaItem, store: LibraryStore) { _vm = StateObject(wrappedValue: PlayerVM(media: item, store: store)) }
+
+    private var subtitleTypes: [UTType] {
+        var types: [UTType] = [.plainText, .text]
+        for ext in ["srt", "vtt"] { if let t = UTType(filenameExtension: ext) { types.append(t) } }
+        return types
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack {
+                Color.black.ignoresSafeArea()
+
+                if vm.media.isEngineSupported { 
+                    PlayerLayerView(player: vm.player, holder: vm.layerHolder, gravity: vm.fillScreen ? .resizeAspectFill : .resizeAspect).ignoresSafeArea() 
+                } else { 
+                    VLCPlayerLayerView(player: vm.vlcPlayer).ignoresSafeArea() 
+                }
+
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .ignoresSafeArea()
+                    .onTapGesture(count: 2, coordinateSpace: .local) { point in 
+                        if point.x < geo.size.width / 2 { vm.skip(-10) } else { vm.skip(10) } 
+                    }
+                    .onTapGesture(count: 1) { 
+                        vm.toggleControls() 
+                    }
+                    .gesture(panGesture(geo: geo))
+
+                subtitleOverlay
+                if let flash = vm.flashText { OSDBadge(text: flash) }
+
+                controls
+                    .opacity(vm.showControls ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.25), value: vm.showControls)
+                    .allowsHitTesting(vm.showControls)
+            }
+        }
+        .background(WindowChromeProbe(isWindowed: $isWindowed))
+        .statusBarHidden(true).persistentSystemOverlays(.hidden)
+        .onAppear { vm.start(); UIApplication.shared.isIdleTimerDisabled = true }
+        .onDisappear { vm.stop(); UIApplication.shared.isIdleTimerDisabled = false }
+        .alert("Playback Error", isPresented: Binding(get: { vm.errorMessage != nil }, set: { if !$0 { vm.errorMessage = nil } })) { Button("OK") { dismiss() } } message: { Text(vm.errorMessage ?? "") }
+        .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) } }
+        .preferredColorScheme(.dark)
+    }
+
+    private var subtitleOverlay: some View {
+        VStack {
+            Spacer()
+            if vm.subtitlesOn, let cue = vm.cueText {
+                Text(cue)
+                    .font(.system(size: subtitleFontSize, weight: subtitleBold ? .semibold : .regular))
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.white)
+                    .shadow(color: .black.opacity(subtitleBackground < 0.05 ? 0.9 : 0), radius: 3, y: 1)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.black.opacity(subtitleBackground), in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.horizontal, 24)
+            }
+        }
+        .padding(.bottom, vm.showControls ? 140 : 44)
+        .animation(.easeInOut(duration: 0.2), value: vm.showControls)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private var controls: some View {
+        VStack(spacing: 0) { topBar; Spacer(); centerButtons; Spacer(); bottomBar }
+            .background(scrim)
+    }
+
+    private var scrim: some View {
+        VStack(spacing: 0) {
+            LinearGradient(colors: [.black.opacity(0.28), .clear], startPoint: .top, endPoint: .bottom).frame(height: 120)
+            Spacer()
+            LinearGradient(colors: [.clear, .black.opacity(0.35)], startPoint: .top, endPoint: .bottom).frame(height: 170)
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 12) {
+            Button { dismiss() } label: {
+                Image(systemName: "xmark").font(.title3.weight(.semibold)).frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Close player")
+            .glassControl(in: Circle())
+
+            Text(vm.media.title)
+                .font(.headline)
+                .lineLimit(1)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .glassPanel(in: Capsule())
+
+            Spacer(minLength: 8)
+
+            HStack(spacing: 8) {
+                RoutePickerView().frame(width: 44, height: 44)
+                    .accessibilityLabel("AirPlay")
+                    .glassControl(in: Circle())
+
+                Button { vm.togglePiP() } label: {
+                    Image(systemName: "pip.enter").font(.title3).frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Picture in Picture")
+                .glassControl(in: Circle())
+
+                trackMenu
+            }
+            .glassGroup(spacing: 10)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+        .padding(.leading, isWindowed ? 96 : 0)
+        .animation(.easeInOut(duration: 0.2), value: isWindowed)
+    }
+
+    private var trackMenu: some View {
+        Menu {
+            if vm.usesVLC { vlcTrackSections } else { engineTrackSections }
+        } label: { Image(systemName: "captions.bubble").font(.title3).frame(width: 44, height: 44) }
+        .accessibilityLabel("Audio and subtitle tracks")
+        .glassControl(in: Circle())
+    }
+
+    @ViewBuilder
+    private var engineTrackSections: some View {
+        if !vm.audioOptions.isEmpty {
+            Section("Audio") { ForEach(vm.audioOptions, id: \.self) { o in Button(o.displayName) { vm.selectAudio(o) } } }
+        }
+        Section("Subtitles") {
+            Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
+            ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
+            subtitleFileControls
+        }
+    }
+
+    @ViewBuilder
+    private var vlcTrackSections: some View {
+        if !vm.vlcAudioTracks.isEmpty {
+            Section("Audio") {
+                ForEach(vm.vlcAudioTracks) { track in
+                    Button { vm.selectVLCAudio(track) } label: { trackLabel(track.name, selected: track.index == vm.vlcAudioIndex) }
+                }
+            }
+        }
+        Section("Subtitles") {
+            Button { vm.selectVLCSubtitle(nil) } label: { trackLabel("Off", selected: vm.vlcSubtitleIndex < 0) }
+            ForEach(vm.vlcSubtitleTracks) { track in
+                Button { vm.selectVLCSubtitle(track) } label: { trackLabel(track.name, selected: track.index == vm.vlcSubtitleIndex) }
+            }
+            subtitleFileControls
+        }
+    }
+
+    @ViewBuilder
+    private func trackLabel(_ name: String, selected: Bool) -> some View {
+        if selected { Label(name, systemImage: "checkmark") } else { Text(name) }
+    }
+
+    @ViewBuilder
+    private var subtitleFileControls: some View {
+        Button("Load .srt file…") { showSubImporter = true }
+        if vm.hasExternalCues { Toggle("External subtitles", isOn: $vm.subtitlesOn) }
+    }
+
+    private var centerButtons: some View {
+        HStack(spacing: 22) {
+            Button { vm.skip(-10) } label: {
+                Image(systemName: "gobackward.10").font(.system(size: 30)).frame(width: 68, height: 68)
+            }
+            .accessibilityLabel("Skip back 10 seconds")
+            .glassControl(in: Circle())
+
+            Button { vm.isPlaying ? vm.pause() : vm.play() } label: {
+                Image(systemName: vm.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 44))
+                    .frame(width: 92, height: 92)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .accessibilityLabel(vm.isPlaying ? "Pause" : "Play")
+            .glassControl(in: Circle(), tint: .purple)
+
+            Button { vm.skip(10) } label: {
+                Image(systemName: "goforward.10").font(.system(size: 30)).frame(width: 68, height: 68)
+            }
+            .accessibilityLabel("Skip forward 10 seconds")
+            .glassControl(in: Circle())
+        }
+        .foregroundStyle(.white)
+        .glassGroup(spacing: 24)
+    }
+
+    private var bottomBar: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 12) {
+                Text(formatTime(vm.isScrubbing ? scrubValue : vm.current)).monospacedDigit()
+                Slider(value: Binding(get: { vm.isScrubbing ? scrubValue : vm.current }, set: { scrubValue = $0 }), in: 0...max(vm.duration, 1),
+                       onEditingChanged: { e in if e { scrubValue = vm.current; vm.isScrubbing = true } else { vm.isScrubbing = false; vm.seek(to: scrubValue) } }).tint(.purple)
+                    .accessibilityLabel("Playback position")
+                    .accessibilityValue("\(formatTime(vm.current)) of \(formatTime(vm.duration))")
+                Text(formatTime(vm.duration)).monospacedDigit()
+            }.font(.footnote).foregroundStyle(.white)
+
+            HStack(spacing: 26) {
+                Menu { ForEach([0.5, 0.75, 1.0, 1.25, 1.5, 2.0], id: \.self) { r in Button(String(format: "%.2gx", r)) { vm.setRate(r) } } } label: { Label(String(format: "%.2gx", vm.rate), systemImage: "speedometer") }
+                    .accessibilityLabel("Playback speed")
+                    .accessibilityValue(String(format: "%.2gx", vm.rate))
+
+                Button { vm.fillScreen.toggle() } label: { Image(systemName: vm.fillScreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right") }
+                    .accessibilityLabel(vm.fillScreen ? "Fit video to screen" : "Fill screen with video")
+
+                Spacer()
+            }.font(.subheadline).foregroundStyle(.white)
+        }
+        .padding(.horizontal, 18)
+        .padding(.top, 12)
+        .padding(.bottom, 14)
+        .glassPanel(in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .padding(.horizontal, 16)
+        .padding(.bottom, 12)
+    }
+
+    private func panGesture(geo: GeometryProxy) -> some Gesture {
+        DragGesture(minimumDistance: 15)
+            .onChanged { value in
+                if dragMode == .none {
+                    if abs(value.translation.width) > abs(value.translation.height) { dragMode = .seek; dragStartValue = vm.current; seekTarget = vm.current } 
+                    else if value.startLocation.x < geo.size.width / 2 { dragMode = .brightness; dragStartValue = Double(UIScreen.main.brightness) } 
+                    else { dragMode = .volume; dragStartValue = vm.volumeLevel }
+                }
+                switch dragMode {
+                case .seek: let span = max(120, vm.duration * 0.3); let delta = Double(value.translation.width / geo.size.width) * span; seekTarget = min(max(dragStartValue + delta, 0), max(vm.duration - 1, 0)); vm.flash("\(formatTime(seekTarget))  (\(delta >= 0 ? "+" : "-")\(formatTime(abs(delta))))")
+                case .volume: vm.setVolume(dragStartValue - Double(value.translation.height / 300))
+                case .brightness: let level = min(max(dragStartValue - Double(value.translation.height / 300), 0), 1); UIScreen.main.brightness = CGFloat(level); vm.flash("Brightness \(Int(level * 100))%")
+                case .none: break
+                }
+            }
+            .onEnded { _ in 
+                if dragMode == .seek { vm.seek(to: seekTarget) }
+                dragMode = .none 
+                vm.scheduleAutoHide()
+            }
+    }
+}
+
+struct OSDBadge: View {
+    let text: String
+    var body: some View { Text(text).font(.headline.monospacedDigit()).padding(.horizontal, 16).padding(.vertical, 10).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white) }
+}
+
+// -----------------------------------------------------------
+// SUBTITLE PARSING LOGIC
+// -----------------------------------------------------------
+
+struct PlayerTrack: Identifiable, Hashable {
+    let index: Int32
+    let name: String
+    var id: Int32 { index }
+}
+
+struct SubtitleCue: Hashable {
+    let start: Double
+    let end: Double
+    let text: String
+}
+
+enum SRTParser {
+    static func parse(_ text: String) -> [SubtitleCue] {
+        var cues: [SubtitleCue] = []
+        let standardized = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let blocks = standardized.components(separatedBy: "\n\n")
+        
+        for block in blocks {
+            let lines = block.components(separatedBy: .newlines).filter { !$0.isEmpty }
+            guard lines.count >= 3 else { continue }
+            
+            let timeString = lines[1]
+            let textLines = lines.dropFirst(2).joined(separator: "\n")
+            
+            let times = timeString.components(separatedBy: " --> ")
+            guard times.count == 2,
+                  let start = parseTime(times[0]),
+                  let end = parseTime(times[1]) else { continue }
+            
+            let cleanText = textLines.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression, range: nil)
+            cues.append(SubtitleCue(start: start, end: end, text: cleanText))
+        }
+        return cues
+    }
+
+    static func cue(at time: Double, in cues: [SubtitleCue]) -> String? {
+        return cues.first(where: { time >= $0.start && time <= $0.end })?.text
+    }
+
+    private static func parseTime(_ timeStr: String) -> Double? {
+        let parts = timeStr.replacingOccurrences(of: ",", with: ".").components(separatedBy: ":")
+        guard parts.count == 3,
+              let h = Double(parts[0]),
+              let m = Double(parts[1]),
+              let s = Double(parts[2]) else { return nil }
+        return (h * 3600) + (m * 60) + s
+    }
+}
