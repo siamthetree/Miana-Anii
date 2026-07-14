@@ -1,5 +1,5 @@
 // ==========================================================
-//  FINAL STABILIZED: DISK WRITER FIX + SWIFT 6 COMPILER
+//  FINAL STABILIZED: DISK WRITER + SWIFT 6 SENDABLE FIX
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -100,8 +100,6 @@ final class LibraryStore: ObservableObject {
         regroup()
         guard let data = try? JSONEncoder().encode(items) else { return }
         let targetURL = self.indexURL
-        
-        // CRASH FIX: Route through the DiskWriter actor
         Task { await DiskWriter.shared.write(data, to: targetURL) }
     }
 
@@ -121,8 +119,6 @@ final class LibraryStore: ObservableObject {
     private func saveFolders() {
         guard let data = try? JSONEncoder().encode(folders) else { return }
         let targetURL = self.foldersURL
-        
-        // CRASH FIX: Route folders JSON through the DiskWriter actor too
         Task { await DiskWriter.shared.write(data, to: targetURL) }
     }
 
@@ -173,7 +169,10 @@ final class LibraryStore: ObservableObject {
         let current = directories(under: root)
         guard watchedDirectories[folderID] != current else { return }
         watchedDirectories[folderID] = current
-        watcher.watch(folderID: folderID, directories: current) { [weak self] in
+        
+        // CRASH FIX: Added @Sendable to prevent Swift 6 from injecting a MainActor assertion check
+        // into this background-fired FolderWatcher closure.
+        watcher.watch(folderID: folderID, directories: current) { @Sendable [weak self] in
             Task { @MainActor in self?.scheduleFolderScan() }
         }
     }
@@ -303,7 +302,7 @@ final class LibraryStore: ObservableObject {
             if let d = try? await asset.load(.duration), d.seconds > 0 { item.duration = d.seconds }
         }
         
-        // COMPILER FIX: Directly call duration on MainActor, not inside Task.detached
+        // COMPILER FIX: Directly call duration on MainActor
         if item.duration <= 0 { item.duration = await VLCProbe.duration(of: fileURL) }
 
         if !item.isAudio {
@@ -393,7 +392,7 @@ final class LibraryStore: ObservableObject {
             guard !isOffline(item), let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
             let targetURL = url(for: item)
             
-            // COMPILER FIX: Directly call duration on MainActor, not inside Task.detached
+            // COMPILER FIX: Directly call duration on MainActor
             items[index].duration = await VLCProbe.duration(of: targetURL)
         }
         save()
