@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: FONTWEIGHT SCOPE FIX
+//  REFACTORED: OSD TEXT PLACEMENT & ANIMATION FIX
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -14,6 +14,7 @@ import MediaPlayer
 import UIKit
 import UniformTypeIdentifiers
 import MobileVLCKit
+import CoreMedia
 
 // MARK: - System Media Coordinator
 
@@ -260,8 +261,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if media.isEngineSupported {
             let item = AVPlayerItem(url: url)
             
-            // APPLE TV/IOS 17 EMBEDDED SUBTITLE FIX:
-            // Use the raw "FontWeight" string instead of the CoreMedia constant to fix scope errors
             if let rule = AVTextStyleRule(textMarkupAttributes: ["FontWeight": "normal"]) {
                 item.textStyleRules = [rule]
             }
@@ -475,12 +474,13 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     }
 
     func flash(_ text: String) { 
-        flashText = text
+        // Smooth fade out for previous text if spamming
+        withAnimation(.easeInOut(duration: 0.15)) { flashText = text }
         flashTask?.cancel()
         flashTask = Task { @MainActor [weak self] in 
-            try? await Task.sleep(nanoseconds: 900_000_000)
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
             guard !Task.isCancelled else { return }
-            self?.flashText = nil 
+            withAnimation(.easeInOut(duration: 0.3)) { self?.flashText = nil }
         }
     }
 
@@ -695,12 +695,23 @@ struct PlayerScreen: View {
                     .gesture(panGesture(geo: geo))
 
                 subtitleOverlay
-                if let flash = vm.flashText { OSDBadge(text: flash) }
-
+                
+                // Moved controls above the OSDBadge in the ZStack
+                // This ensures OSD (volume, skipping text) is NEVER hidden behind buttons!
                 controls
                     .opacity(vm.showControls ? 1 : 0)
                     .animation(.easeInOut(duration: 0.25), value: vm.showControls)
                     .allowsHitTesting(vm.showControls)
+
+                if let flash = vm.flashText { 
+                    VStack {
+                        OSDBadge(text: flash)
+                            .padding(.top, 96) // Push perfectly under the top bar
+                        Spacer()
+                    }
+                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+                    .allowsHitTesting(false)
+                }
             }
         }
         .background(WindowChromeProbe(isWindowed: $isWindowed))
@@ -1055,7 +1066,15 @@ struct PlayerSettingsSheet: View {
 
 struct OSDBadge: View {
     let text: String
-    var body: some View { Text(text).font(.headline.monospacedDigit()).padding(.horizontal, 16).padding(.vertical, 10).background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12)).foregroundStyle(.white) }
+    var body: some View { 
+        Text(text)
+            .font(.headline.monospacedDigit())
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(.ultraThinMaterial, in: Capsule())
+            .colorScheme(.dark)
+            .foregroundStyle(.white) 
+    }
 }
 
 // -----------------------------------------------------------
