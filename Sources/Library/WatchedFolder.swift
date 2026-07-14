@@ -1,14 +1,43 @@
 import Foundation
+import SwiftData
 
-struct WatchedFolder: Identifiable, Codable, Hashable {
-    var id: UUID = UUID()
+@Model
+final class WatchedFolder: Identifiable, Hashable, Codable {
+    @Attribute(.unique) var id: UUID
     var name: String
     var bookmark: Data
-    var dateAdded: Date = Date()
+    var dateAdded: Date
+
+    init(id: UUID = UUID(), name: String, bookmark: Data, dateAdded: Date = Date()) {
+        self.id = id
+        self.name = name
+        self.bookmark = bookmark
+        self.dateAdded = dateAdded
+    }
+
+    // MARK: - Legacy JSON Migration Support
+    enum CodingKeys: String, CodingKey {
+        case id, name, bookmark, dateAdded
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(UUID.self, forKey: .id)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.bookmark = try container.decode(Data.self, forKey: .bookmark)
+        self.dateAdded = try container.decodeIfPresent(Date.self, forKey: .dateAdded) ?? Date()
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(bookmark, forKey: .bookmark)
+        try container.encode(dateAdded, forKey: .dateAdded)
+    }
 }
 
-/// A fully Swift 6 compliant background actor that monitors the file system 
-/// and yields events cleanly using modern AsyncStreams.
+// MARK: - Folder Watcher Actor
 actor FolderWatcher {
     static let maxDirectories = 64
 
@@ -55,7 +84,6 @@ actor FolderWatcher {
 
         activeHandles[folderID] = created
 
-        // When the stream is cancelled by the observer, clean up the handles safely
         continuation.onTermination = { [weak self] _ in
             Task { await self?.stop(folderID: folderID) }
         }
@@ -64,7 +92,6 @@ actor FolderWatcher {
     }
 
     func stop(folderID: UUID) {
-        // Removing the array triggers deinit on all Handles, automatically cancelling sources and closing descriptors.
         activeHandles.removeValue(forKey: folderID)
     }
 
