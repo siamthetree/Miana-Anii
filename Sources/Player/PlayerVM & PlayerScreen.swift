@@ -1,10 +1,3 @@
-// ==========================================================
-//  REFACTORED: COREMEDIA IMPORT ADDED
-//
-//  File:  Sources/Player/PlayerVM & PlayerScreen.swift
-//  Replace the entire file.
-// ==========================================================
-
 import Foundation
 import SwiftUI
 import AVFoundation
