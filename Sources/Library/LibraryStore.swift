@@ -1,5 +1,5 @@
 // ==========================================================
-//  BUG 10 + CONCURRENCY + SWIFT 6 COMPILER FIXES
+//  FINAL MERGED: BUG 10 + CONCURRENCY + SWIFT 6 COMPILER FIXES
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -57,43 +57,30 @@ final class LibraryStore: ObservableObject {
         activateFolders()
     }
     
-    // MARK: - Sequential Import Queue
-    
+    // MARK: - Import Queue
     func enqueueImport(url: URL) {
         importQueue.append(url)
         if !isProcessingQueue { processNextQueueItem() }
     }
 
     private func processNextQueueItem() {
-        guard !importQueue.isEmpty else {
-            isProcessingQueue = false
-            save()
-            return
-        }
+        guard !importQueue.isEmpty else { isProcessingQueue = false; save(); return }
         isProcessingQueue = true
         let nextURL = importQueue.removeFirst()
-        Task {
-            await importFile(nextURL)
-            processNextQueueItem()
-        }
+        Task { await importFile(nextURL); processNextQueueItem() }
     }
 
     // MARK: - Persistence
-
     private func load() {
         guard let data = try? Data(contentsOf: indexURL),
               let decoded = try? JSONDecoder().decode([MediaItem].self, from: data) else { return }
-        items = decoded
-        regroup()
+        items = decoded; regroup()
     }
 
     func save() {
         regroup()
         guard let data = try? JSONEncoder().encode(items) else { return }
-        let targetURL = indexURL
-        Task.detached(priority: .background) {
-            try? data.write(to: targetURL, options: .atomic)
-        }
+        Task.detached(priority: .background) { try? data.write(to: self.indexURL, options: .atomic) }
     }
 
     private func regroup() {
@@ -115,64 +102,30 @@ final class LibraryStore: ObservableObject {
     }
 
     // MARK: - Paths
-
     func url(for item: MediaItem) -> URL {
         if let folderID = item.folderID, let relative = item.relativePath, let root = folderURLs[folderID] {
             return root.appendingPathComponent(relative)
         }
         return mediaDir.appendingPathComponent(item.fileName)
     }
-
-    func thumbURL(for item: MediaItem) -> URL {
-        thumbsDir.appendingPathComponent(item.id.uuidString + ".jpg")
-    }
-
-    func savedSubtitleURL(for item: MediaItem) -> URL {
-        subsDir.appendingPathComponent(item.id.uuidString + ".srt")
-    }
-
+    func thumbURL(for item: MediaItem) -> URL { thumbsDir.appendingPathComponent(item.id.uuidString + ".jpg") }
+    func savedSubtitleURL(for item: MediaItem) -> URL { subsDir.appendingPathComponent(item.id.uuidString + ".srt") }
     func isOffline(_ item: MediaItem) -> Bool {
         guard let folderID = item.folderID else { return false }
         return folderURLs[folderID] == nil
     }
+    func itemCount(in folder: WatchedFolder) -> Int { items.filter { $0.folderID == folder.id }.count }
+    func isUnreachable(_ folder: WatchedFolder) -> Bool { unreachableFolders.contains(folder.id) }
 
-    func itemCount(in folder: WatchedFolder) -> Int {
-        items.filter { $0.folderID == folder.id }.count
-    }
-
-    func isUnreachable(_ folder: WatchedFolder) -> Bool {
-        unreachableFolders.contains(folder.id)
-    }
-
-    private func uniqueDestination(for fileName: String) -> URL {
-        let base = (fileName as NSString).deletingPathExtension
-        let ext = (fileName as NSString).pathExtension
-        var dest = mediaDir.appendingPathComponent(fileName)
-        var counter = 1
-        while fm.fileExists(atPath: dest.path) {
-            let name = ext.isEmpty ? "\(base)-\(counter)" : "\(base)-\(counter).\(ext)"
-            dest = mediaDir.appendingPathComponent(name)
-            counter += 1
-        }
-        return dest
-    }
-
-    // MARK: - Watched folders
-
-    private func activateFolders() {
-        for folder in folders { activate(folder) }
-    }
-
+    // MARK: - Folders
+    private func activateFolders() { for folder in folders { activate(folder) } }
     private func activate(_ folder: WatchedFolder) {
         var stale = false
         guard let url = try? URL(resolvingBookmarkData: folder.bookmark, bookmarkDataIsStale: &stale),
               url.startAccessingSecurityScopedResource() else { return }
-
         folderURLs[folder.id] = url
-        if stale, let refreshed = try? url.bookmarkData(),
-           let index = folders.firstIndex(where: { $0.id == folder.id }) {
-            folders[index].bookmark = refreshed
-            saveFolders()
+        if stale, let refreshed = try? url.bookmarkData(), let index = folders.firstIndex(where: { $0.id == folder.id }) {
+            folders[index].bookmark = refreshed; saveFolders()
         }
         rewatchIfNeeded(folder.id, root: url)
     }
@@ -181,28 +134,17 @@ final class LibraryStore: ObservableObject {
         let current = directories(under: root)
         guard watchedDirectories[folderID] != current else { return }
         watchedDirectories[folderID] = current
-
         watcher.watch(folderID: folderID, directories: current) { [weak self] in
-            guard let self else { return }
-            Task { @MainActor in self.scheduleFolderScan() }
+            Task { @MainActor in self?.scheduleFolderScan() }
         }
     }
 
     func addFolder(_ pickedURL: URL) async {
         let scoped = pickedURL.startAccessingSecurityScopedResource()
         defer { if scoped { pickedURL.stopAccessingSecurityScopedResource() } }
-
         guard let bookmark = try? pickedURL.bookmarkData() else { return }
-        let alreadyWatching = folders.contains { folder in
-            folderURLs[folder.id]?.standardizedFileURL == pickedURL.standardizedFileURL
-        }
-        guard !alreadyWatching else { return }
-
         let folder = WatchedFolder(name: pickedURL.lastPathComponent, bookmark: bookmark)
-        folders.append(folder)
-        saveFolders()
-        activate(folder)
-        await scanFolders()
+        folders.append(folder); saveFolders(); activate(folder); await scanFolders()
     }
 
     func removeFolder(_ folder: WatchedFolder) {
@@ -210,23 +152,14 @@ final class LibraryStore: ObservableObject {
         watchedDirectories[folder.id] = nil
         folderURLs[folder.id]?.stopAccessingSecurityScopedResource()
         folderURLs[folder.id] = nil
-        for item in items where item.folderID == folder.id {
-            try? fm.removeItem(at: thumbURL(for: item))
-            try? fm.removeItem(at: savedSubtitleURL(for: item))
-        }
         items.removeAll { $0.folderID == folder.id }
         folders.removeAll { $0.id == folder.id }
-        saveFolders()
-        save()
+        saveFolders(); save()
     }
 
     private func scheduleFolderScan() {
         debouncedScan?.cancel()
-        debouncedScan = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 2_000_000_000)
-            guard !Task.isCancelled, let self else { return }
-            await self.scanFolders()
-        }
+        debouncedScan = Task { try? await Task.sleep(nanoseconds: 2_000_000_000); await self.scanFolders() }
     }
 
     func scanFolders() async {
@@ -234,13 +167,11 @@ final class LibraryStore: ObservableObject {
         guard !isScanning else { scanRequested = true; return }
         isScanning = true
         defer { isScanning = false }
-
         repeat {
             scanRequested = false
-            let sawUnsettledFile = await scanFoldersOnce()
-            pruneMissing()
-            save()
-            if sawUnsettledFile { scheduleFolderScan() }
+            let unsettled = await scanFoldersOnce()
+            pruneMissing(); save()
+            if unsettled { scheduleFolderScan() }
         } while scanRequested
     }
 
@@ -263,25 +194,17 @@ final class LibraryStore: ObservableObject {
     }
 
     private func mediaFiles(under root: URL) -> [URL] {
-        guard let enumerator = fm.enumerator(at: root,
-                                             includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
-                                             options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return [] }
+        let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles, .skipsPackageDescendants])
         var found: [URL] = []
-        for case let url as URL in enumerator {
-            guard MediaKinds.media.contains(url.pathExtension.lowercased()) else { continue }
-            found.append(url)
-        }
+        while let url = enumerator?.nextObject() as? URL { if MediaKinds.media.contains(url.pathExtension.lowercased()) { found.append(url) } }
         return found
     }
 
     private func directories(under root: URL) -> [URL] {
         var result = [root]
-        guard let enumerator = fm.enumerator(at: root,
-                                             includingPropertiesForKeys: [.isDirectoryKey],
-                                             options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return result }
-        for case let url as URL in enumerator {
-            guard result.count < FolderWatcher.maxDirectories else { break }
-            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { result.append(url) }
+        let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: [.isDirectoryKey], options: [.skipsHiddenFiles, .skipsPackageDescendants])
+        while let url = enumerator?.nextObject() as? URL {
+            if result.count < FolderWatcher.maxDirectories, (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { result.append(url) }
         }
         return result
     }
@@ -289,57 +212,47 @@ final class LibraryStore: ObservableObject {
     static func relativePath(of file: URL, from root: URL) -> String {
         let rootPath = root.standardizedFileURL.path
         let filePath = file.standardizedFileURL.path
-        guard filePath.hasPrefix(rootPath) else { return file.lastPathComponent }
-        return String(filePath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return filePath.hasPrefix(rootPath) ? String(filePath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/")) : file.lastPathComponent
     }
 
     func ingest(fileURL: URL, folderID: UUID? = nil, relativePath: String? = nil) async {
-        let rawTitle = (fileURL.lastPathComponent as NSString).deletingPathExtension
-        let prettyTitle = Self.prettyTitle(from: rawTitle)
-        var item = MediaItem(title: prettyTitle, fileName: fileURL.lastPathComponent)
-        item.folderID = folderID
-        item.relativePath = relativePath
-
-        if let meta = await MetadataService.fetchMetadata(for: fileURL.lastPathComponent, cleanTitle: prettyTitle) {
-            item.metadata = meta
-        }
-
+        let pretty = Self.prettyTitle(from: (fileURL.lastPathComponent as NSString).deletingPathExtension)
+        var item = MediaItem(title: pretty, fileName: fileURL.lastPathComponent)
+        item.folderID = folderID; item.relativePath = relativePath
+        if let meta = await MetadataService.fetchMetadata(for: fileURL.lastPathComponent, cleanTitle: pretty) { item.metadata = meta }
         if item.isEngineSupported {
             let asset = AVURLAsset(url: fileURL)
-            if let d = try? await asset.load(.duration), d.seconds.isFinite, d.seconds > 0 { item.duration = d.seconds }
+            if let d = try? await asset.load(.duration), d.seconds > 0 { item.duration = d.seconds }
         }
-        if item.duration <= 0 {
-            let probeURL = fileURL
-            item.duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: probeURL) }.value
-        }
-
+        if item.duration <= 0 { item.duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: fileURL) }.value }
         if !item.isAudio {
-            let destination = thumbURL(for: item)
-            if item.isEngineSupported {
-                let seconds = item.duration > 0 ? max(1.0, item.duration * 0.12) : 3.0
-                await Self.writeThumbnail(assetURL: fileURL, at: seconds, to: destination)
-            } else {
-                await VLCProbe.writeThumbnail(for: fileURL, position: 0.12, to: destination)
-            }
+            let dest = thumbURL(for: item)
+            if item.isEngineSupported { await Self.writeThumbnail(assetURL: fileURL, at: max(1.0, item.duration * 0.12), to: dest) }
+            else { await VLCProbe.writeThumbnail(for: fileURL, position: 0.12, to: dest) }
         }
         items.insert(item, at: 0)
+    }
+
+    func rescan() async {
+        if let files = try? fm.contentsOfDirectory(at: mediaDir, includingPropertiesForKeys: nil) {
+            for f in files where MediaKinds.media.contains(f.pathExtension.lowercased()) {
+                if !items.contains(where: { $0.folderID == nil && $0.fileName == f.lastPathComponent }) { await ingest(fileURL: f) }
+            }
+        }
+        await scanFolders(); await backfillDurations(); pruneMissing(); save()
     }
 
     func pruneMissing() {
         var missing: [UUID: (gone: Int, total: Int)] = [:]
         for item in items {
             guard let folderID = item.folderID, !isOffline(item) else { continue }
-            var tally = missing[folderID] ?? (0, 0)
-            tally.total += 1
+            var tally = missing[folderID] ?? (0, 0); tally.total += 1
             if !fm.fileExists(atPath: url(for: item).path) { tally.gone += 1 }
             missing[folderID] = tally
         }
-
-        let unreachable = Set(missing.compactMap { id, tally in (tally.total > 1 && tally.gone == tally.total) ? id : nil })
+        let unreachable = Set(missing.compactMap { (id, tally) in (tally.total > 1 && tally.gone == tally.total) ? id : nil })
         let failedToResolve = folders.map(\.id).filter { folderURLs[$0] == nil }
-        let combined = unreachable.union(failedToResolve)
-        if combined != unreachableFolders { unreachableFolders = combined }
-
+        unreachableFolders = unreachable.union(failedToResolve)
         items.removeAll { item in
             if let folderID = item.folderID { if isOffline(item) || unreachable.contains(folderID) { return false } }
             return !fm.fileExists(atPath: url(for: item).path)
@@ -353,25 +266,14 @@ final class LibraryStore: ObservableObject {
         guard !snapshot.isEmpty else { return }
         refreshProgress = (0, snapshot.count)
         defer { refreshProgress = nil }
-
-        let concurrency = 4
-        var next = 0
-        var done = 0
-
         await withTaskGroup(of: (UUID, MediaMetadata?).self) { group in
+            var next = 0, done = 0
             func enqueue() {
-                guard next < snapshot.count else { return }
-                let item = snapshot[next]
-                next += 1
-                let fileName = item.fileName
-                let clean = Self.prettyTitle(from: (fileName as NSString).deletingPathExtension)
-                let id = item.id
-                group.addTask { (id, await MetadataService.fetchMetadata(for: fileName, cleanTitle: clean)) }
+                if next < snapshot.count { let item = snapshot[next]; next += 1; group.addTask { (item.id, await MetadataService.fetchMetadata(for: item.fileName, cleanTitle: Self.prettyTitle(from: (item.fileName as NSString).deletingPathExtension))) } }
             }
-            for _ in 0..<concurrency { enqueue() }
+            for _ in 0..<4 { enqueue() }
             while let (id, meta) = await group.next() {
-                done += 1
-                refreshProgress = (done, snapshot.count)
+                done += 1; refreshProgress = (done, snapshot.count)
                 if let meta, let index = items.firstIndex(where: { $0.id == id }) { items[index].metadata = meta }
                 enqueue()
             }
@@ -379,9 +281,23 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
-    func delete(_ item: MediaItem) {
-        items.removeAll { $0.id == item.id }
+    func updateProgress(id: UUID, position: Double, duration: Double) {
+        if let i = items.firstIndex(where: { $0.id == id }) { items[i].lastPosition = max(0, position); if duration > 0 { items[i].duration = duration }; items[i].lastPlayed = Date(); save() }
+    }
+
+    func backfillDurations() async {
+        for item in items.filter({ $0.duration <= 0 }) {
+            guard !isOffline(item), let index = items.firstIndex(where: { $0.id == item.id }) else { continue }
+            items[index].duration = await Task.detached(priority: .utility) { VLCProbe.duration(of: self.url(for: item)) }.value
+        }
         save()
+    }
+
+    func resetProgress(_ batch: [MediaItem]) { for item in batch { if let i = items.firstIndex(where: { $0.id == item.id }) { items[i].lastPosition = 0 } }; save() }
+    func markWatched(_ batch: [MediaItem]) { for item in batch { if let i = items.firstIndex(where: { $0.id == item.id }), items[i].duration > 0 { items[i].lastPosition = items[i].duration; items[i].lastPlayed = Date() } }; save() }
+    func rename(_ item: MediaItem, to newTitle: String) { if let i = items.firstIndex(where: { $0.id == item.id }) { items[i].title = newTitle; save() } }
+    func delete(_ item: MediaItem) {
+        items.removeAll { $0.id == item.id }; save()
         let target = url(for: item), thumb = thumbURL(for: item), sub = savedSubtitleURL(for: item), isExt = item.isExternal
         Task.detached(priority: .userInitiated) {
             let localFm = FileManager.default
@@ -389,32 +305,20 @@ final class LibraryStore: ObservableObject {
             try? localFm.removeItem(at: thumb); try? localFm.removeItem(at: sub)
         }
     }
-
+    func clearProgress() { for i in items.indices { items[i].lastPosition = 0; items[i].lastPlayed = nil }; save() }
     func deleteAll() {
-        for item in items {
-            if item.folderID == nil { try? fm.removeItem(at: url(for: item)) }
-            try? fm.removeItem(at: thumbURL(for: item)); try? fm.removeItem(at: savedSubtitleURL(for: item))
-        }
-        watcher.stopAll(); watchedDirectories.removeAll()
-        for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }
-        folderURLs.removeAll(); folders.removeAll(); items.removeAll(); saveFolders(); save()
+        for item in items { if item.folderID == nil { try? fm.removeItem(at: url(for: item)) }; try? fm.removeItem(at: thumbURL(for: item)); try? fm.removeItem(at: savedSubtitleURL(for: item)) }
+        watcher.stopAll(); watchedDirectories.removeAll(); for url in folderURLs.values { url.stopAccessingSecurityScopedResource() }; folderURLs.removeAll(); folders.removeAll(); items.removeAll(); saveFolders(); save()
     }
 
-    func storageString() -> String { "Calculating…" }
-
     func calculateStorageAsync() async -> String {
-        let path = mediaDir
-        let totalBytes = await Task.detached(priority: .utility) {
-            var total: Int64 = 0
-            let localFm = FileManager.default
-            if let enumerator = localFm.enumerator(at: path, includingPropertiesForKeys: [.fileSizeKey]) {
-                while let f = enumerator.nextObject() as? URL {
-                    if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += Int64(size) }
-                }
-            }
-            return total
+        let total = await Task.detached(priority: .utility) {
+            var t: Int64 = 0
+            let enumerator = FileManager.default.enumerator(at: self.mediaDir, includingPropertiesForKeys: [.fileSizeKey])
+            while let f = enumerator?.nextObject() as? URL { if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { t += Int64(size) } }
+            return t
         }.value
-        return ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
+        return ByteCountFormatter.string(fromByteCount: total, countStyle: .file)
     }
 
     nonisolated static func prettyTitle(from raw: String) -> String {
@@ -426,9 +330,7 @@ final class LibraryStore: ObservableObject {
         for m in markers { if let r = lower.range(of: m) { cut = min(cut, lower.distance(from: lower.startIndex, to: r.lowerBound)) } }
         if cut < s.count { s = String(s.prefix(cut)) }
         s = s.trimmingCharacters(in: CharacterSet(charactersIn: " -._[]()"))
-        if let regex = try? NSRegularExpression(pattern: "(?i)s\\d{1,2}e\\d{1,2}.*") {
-            s = regex.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "").trimmingCharacters(in: .whitespacesAndNewlines)
-        }
+        if let regex = try? NSRegularExpression(pattern: "(?i)s\\d{1,2}e\\d{1,2}.*") { s = regex.stringByReplacingMatches(in: s, range: NSRange(s.startIndex..., in: s), withTemplate: "").trimmingCharacters(in: .whitespacesAndNewlines) }
         return s.isEmpty ? raw : s
     }
 
@@ -446,4 +348,11 @@ final class LibraryStore: ObservableObject {
             try? data.write(to: dest, options: .atomic)
         }.value
     }
+}
+
+func formatTime(_ t: Double) -> String {
+    guard t.isFinite, t >= 0 else { return "0:00" }
+    let total = Int(t.rounded())
+    let h = total / 3600, m = (total % 3600) / 60, s = total % 60
+    return h > 0 ? String(format: "%d:%02d:%02d", h, m, s) : String(format: "%d:%02d", m, s)
 }
