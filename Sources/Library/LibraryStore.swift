@@ -597,7 +597,7 @@ final class LibraryStore: ObservableObject {
         save()
     }
 
-    // CONCURRENCY FIX: Asynchronous Storage Calculator
+    
     func storageString() -> String {
         return "Calculating…" 
     }
@@ -608,14 +608,20 @@ final class LibraryStore: ObservableObject {
             var total: Int64 = 0
             let localFm = FileManager.default
             if let enumerator = localFm.enumerator(at: path, includingPropertiesForKeys: [.fileSizeKey]) {
-                for case let f as URL in enumerator {
-                    if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { total += Int64(size) }
+                
+                // SWIFT 6 FIX: Use while-let instead of for-in to safely iterate in an async context
+                while let f = enumerator.nextObject() as? URL {
+                    if let size = (try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize { 
+                        total += Int64(size) 
+                    }
                 }
+                
             }
             return total
         }.value
         return ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
     }
+
 
     // MARK: - Helpers
 
