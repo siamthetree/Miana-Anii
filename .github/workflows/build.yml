@@ -5,10 +5,20 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Select newest Xcode
+        run: |
+          LATEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$LATEST" ]; then LATEST=/Applications/Xcode.app; fi
+          echo "Selecting $LATEST"
+          sudo xcode-select -s "$LATEST/Contents/Developer"
+          xcodebuild -version
+          swift --version
+          xcodebuild -showsdks | grep -i ios
 
       - name: Generate app icon and asset catalog
         run: |
@@ -97,7 +107,7 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
-      - name: Downgrade project format for this Xcode
+      - name: Pin project format
         run: |
           /usr/bin/sed -i '' \
             -e 's/objectVersion = [0-9][0-9]*;/objectVersion = 56;/' \
