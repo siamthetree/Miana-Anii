@@ -1,4 +1,19 @@
-
+// ==========================================================
+//  BUG 7  -  SIXTY IDENTICAL TMDB CALLS  (file 1 of 3)
+//
+//  File:  Sources/Models/Metadata.swift
+//  Replace the entire file. Supersedes FIX-4a.
+//
+//  Adds TMDBCache in front of search and detail.
+//
+//  It caches the in-flight Task, not the finished result. That is the
+//  whole trick. Caching results would not help here: sixty episodes
+//  refreshing at once all start before any of them finishes, so they
+//  would all miss the cache and all hit the network. Handing every
+//  latecomer the same Task means one call and fifty-nine awaits.
+//
+//  Per-episode data is not cached. Those answers really are different.
+// ==========================================================
 
 import Foundation
 
@@ -72,6 +87,47 @@ struct TMDBEpisodeResponse: Codable {
     let overview: String?
     let still_path: String?
     let air_date: String?
+}
+
+// MARK: - Cache
+
+/// Sixty episodes of one show ask TMDB the same two questions sixty times: what
+/// is this show, and what are its details. The answers are identical every time.
+///
+/// This caches both, and also caches the in-flight Task rather than the result,
+/// so sixty episodes refreshing at once produce one network call and fifty-nine
+/// awaits on it. Caching only the finished result would not help: they all start
+/// before any of them finishes.
+///
+/// Per-episode data is deliberately not cached. Those answers really are different.
+actor TMDBCache {
+    static let shared = TMDBCache()
+
+    private var searches: [String: Task<TMDBResult?, Never>] = [:]
+    private var details: [String: Task<TMDBDetailResponse?, Never>] = [:]
+
+    func search(type: String, query: String, year: Int?, fetch: @escaping @Sendable () async -> TMDBResult?) async -> TMDBResult? {
+        let key = "\(type)|\(query.lowercased())|\(year.map(String.init) ?? "-")"
+        if let existing = searches[key] { return await existing.value }
+        let task = Task { await fetch() }
+        searches[key] = task
+        return await task.value
+    }
+
+    func detail(type: String, id: Int, fetch: @escaping @Sendable () async -> TMDBDetailResponse?) async -> TMDBDetailResponse? {
+        let key = "\(type)|\(id)"
+        if let existing = details[key] { return await existing.value }
+        let task = Task { await fetch() }
+        details[key] = task
+        return await task.value
+    }
+
+    /// Called at the start of a refresh, so a title that failed last time, or one
+    /// whose TMDB entry has since been corrected, is asked about again.
+    func clear() {
+        searches.removeAll()
+        details.removeAll()
+    }
 }
 
 // MARK: - Service
@@ -160,6 +216,12 @@ final class MetadataService {
     // MARK: Requests
 
     private static func search(type: String, query: String, year: Int?) async -> TMDBResult? {
+        await TMDBCache.shared.search(type: type, query: query, year: year) {
+            await performSearch(type: type, query: query, year: year)
+        }
+    }
+
+    private static func performSearch(type: String, query: String, year: Int?) async -> TMDBResult? {
         guard var components = URLComponents(string: "\(baseURL)/search/\(type)") else { return nil }
         var items: [URLQueryItem] = [
             URLQueryItem(name: "api_key", value: apiKey),
@@ -185,6 +247,12 @@ final class MetadataService {
     }
 
     private static func fetchDetail(type: String, id: Int) async -> TMDBDetailResponse? {
+        await TMDBCache.shared.detail(type: type, id: id) {
+            await performDetail(type: type, id: id)
+        }
+    }
+
+    private static func performDetail(type: String, id: Int) async -> TMDBDetailResponse? {
         guard let url = URL(string: "\(baseURL)/\(type)/\(id)?api_key=\(apiKey)&language=en-US&append_to_response=credits"),
               let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
         return try? JSONDecoder().decode(TMDBDetailResponse.self, from: data)
@@ -254,4 +322,3 @@ final class MetadataService {
         return values.isEmpty ? nil : values
     }
 }
-
