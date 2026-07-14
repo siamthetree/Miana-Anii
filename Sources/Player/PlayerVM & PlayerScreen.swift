@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: COMPACT TRACK MENUS & SUBMENU FIX
+//  REFACTORED: SUBTITLE SIZE & BANGLA FONT CONTROLS
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -599,6 +599,7 @@ struct PlayerScreen: View {
 
     @AppStorage("subtitleYOffset") private var subtitleYOffset: Double = 0.0
     @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
+    @AppStorage("subtitleFontName") private var subtitleFontName = "System"
     @AppStorage("subtitleBold") private var subtitleBold = true
     @AppStorage("subtitleBackground") private var subtitleBackground = 0.55
     
@@ -657,7 +658,8 @@ struct PlayerScreen: View {
             Spacer()
             if vm.subtitlesOn, let cue = vm.cueText {
                 Text(cue)
-                    .font(.system(size: subtitleFontSize, weight: subtitleBold ? .semibold : .regular))
+                    .font(subtitleFontName == "System" ? .system(size: subtitleFontSize) : .custom(subtitleFontName, size: subtitleFontSize))
+                    .fontWeight(subtitleBold ? .semibold : .regular)
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.white)
                     .shadow(color: .black.opacity(subtitleBackground < 0.05 ? 0.9 : 0), radius: 3, y: 1)
@@ -804,6 +806,20 @@ struct PlayerScreen: View {
                     subtitleYOffset -= 20; vm.flash("Subtitles Down") 
                 }
                 Button("Reset Position") { subtitleYOffset = 0; vm.flash("Position Reset") }
+            }
+            Menu("Size (\(Int(subtitleFontSize)))") {
+                Button("Increase (+2)") { subtitleFontSize += 2; vm.flash("Size: \(Int(subtitleFontSize))") }
+                Button("Decrease (-2)") { subtitleFontSize = max(10, subtitleFontSize - 2); vm.flash("Size: \(Int(subtitleFontSize))") }
+                Button("Reset (22)") { subtitleFontSize = 22.0; vm.flash("Size Reset") }
+            }
+            Menu("Font (\(subtitleFontName))") {
+                Toggle("Bold Text", isOn: $subtitleBold)
+                Divider()
+                Button("System Default") { subtitleFontName = "System"; vm.flash("Font: System") }
+                Button("Kohinoor Bangla") { subtitleFontName = "Kohinoor Bangla"; vm.flash("Font: Kohinoor") }
+                Button("Bangla Sangam MN") { subtitleFontName = "Bangla Sangam MN"; vm.flash("Font: Sangam MN") }
+                Button("Avenir") { subtitleFontName = "Avenir"; vm.flash("Font: Avenir") }
+                Button("Helvetica") { subtitleFontName = "Helvetica"; vm.flash("Font: Helvetica") }
             }
         }
     }
