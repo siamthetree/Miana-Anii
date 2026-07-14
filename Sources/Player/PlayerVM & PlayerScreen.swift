@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: FLICKER FIX + SETTINGS SHEET + BANGLA FONTS
+//  REFACTORED: INSTANT SEEK (KEYFRAME JUMP) FIX
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -272,7 +272,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             }
             loadSelectionGroups(for: item)
 
-            // FLICKER FIX: Accelerated subtitle refresh rate from 0.5s down to 0.1s
             timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] time in 
                 Task { @MainActor [weak self] in
                     guard let self, !self.isScrubbing else { return }
@@ -425,7 +424,23 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if showControls { scheduleAutoHide() } else { hideTask?.cancel() } 
     }
 
-    func seek(to target: Double) { let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target); if media.isEngineSupported { player.seek(to: CMTime(seconds: clamped, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) } else { vlcPlayer.time = VLCTime(int: Int32(clamped * 1000)) }; current = clamped; scheduleAutoHide(); syncSystemState() }
+    func seek(to target: Double) {
+        let clamped = min(max(target, 0), duration > 0 ? max(duration - 0.5, 0) : target)
+        
+        if media.isEngineSupported {
+            // INSTANT SEEK FIX: .positiveInfinity tells AVPlayer to jump straight to the nearest keyframe
+            // instead of freezing the thread to decode precise non-keyframes.
+            let time = CMTime(seconds: clamped, preferredTimescale: 600)
+            player.seek(to: time, toleranceBefore: .positiveInfinity, toleranceAfter: .positiveInfinity)
+        } else {
+            vlcPlayer.time = VLCTime(int: Int32(clamped * 1000))
+        }
+        
+        current = clamped
+        scheduleAutoHide()
+        syncSystemState()
+    }
+    
     func skip(_ seconds: Double) { seek(to: current + seconds); flash(seconds >= 0 ? "+\(Int(seconds))s" : "\(Int(seconds))s") }
     func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)); syncSystemState() }
     func setVolume(_ value: Double) { volumeLevel = min(max(value, 0), 1); if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }; flash("Volume \(Int(volumeLevel * 100))%") }
@@ -543,16 +558,19 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     
     private func applyPendingVLCSeek() {
         guard let target = pendingVLCSeek else { return }
+
         if pendingSeekAttempts > 0, abs(current - target) < 2 {
             pendingVLCSeek = nil
             pendingSeekAttempts = 0
             return
         }
+
         guard pendingSeekAttempts < 3 else {
             pendingVLCSeek = nil
             pendingSeekAttempts = 0
             return
         }
+
         pendingSeekAttempts += 1
         vlcPlayer.time = VLCTime(int: Int32(target * 1000))
         current = target
@@ -706,12 +724,12 @@ struct PlayerScreen: View {
                     .padding(.vertical, 8)
                     .background(.black.opacity(subtitleBackground), in: RoundedRectangle(cornerRadius: 8))
                     .padding(.horizontal, 24)
-                    .id(cue) // FLICKER FIX: Forces SwiftUI to instantly swap text instead of interpolating geometry
+                    .id(cue)
             }
         }
         .padding(.bottom, max(0, (vm.showControls ? 140 : 44) + subtitleYOffset))
         .animation(.easeInOut(duration: 0.2), value: vm.showControls)
-        .animation(nil, value: vm.cueText) // FLICKER FIX: Prevents text updates from catching the control animation
+        .animation(nil, value: vm.cueText)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
@@ -877,7 +895,7 @@ struct PlayerScreen: View {
     }
 }
 
-// MARK: - Native Settings Sheet (Fixes Scroll Bug)
+// MARK: - Native Settings Sheet
 
 struct PlayerSettingsSheet: View {
     @ObservedObject var vm: PlayerVM
@@ -992,7 +1010,6 @@ struct PlayerSettingsSheet: View {
         }
     }
 }
-
 
 struct OSDBadge: View {
     let text: String
