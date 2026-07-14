@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: UNIFIED SYSTEM MEDIA COORDINATOR + BRIGHTNESS FIX
+//  REFACTORED: SUBTITLE SYNC & PLACEMENT CONTROLS
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -217,6 +217,9 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var fillScreen = false; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var audioOptions: [AVMediaSelectionOption] = []; @Published var legibleOptions: [AVMediaSelectionOption] = []; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
     @Published var vlcSubtitleTracks: [PlayerTrack] = []; @Published var vlcAudioTracks: [PlayerTrack] = []
     @Published var vlcSubtitleIndex: Int32 = -1; @Published var vlcAudioIndex: Int32 = -1
+    
+    // NEW: Subtitle Delay
+    @Published var subtitleDelay: Double = 0.0
 
     private var audioGroup: AVMediaSelectionGroup?; private var legibleGroup: AVMediaSelectionGroup?; private var cues: [SubtitleCue] = []; private var timeObserver: Any?; private var statusCancellable: AnyCancellable?; private var endObserver: NSObjectProtocol?; private var lastSave = Date.distantPast; private var pip: AVPictureInPictureController?; private var pendingVLCSeek: Double?
 
@@ -421,6 +424,19 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     func skip(_ seconds: Double) { seek(to: current + seconds); flash(seconds >= 0 ? "+\(Int(seconds))s" : "\(Int(seconds))s") }
     func setRate(_ newRate: Double) { rate = newRate; UserDefaults.standard.set(newRate, forKey: "defaultRate"); if isPlaying { if media.isEngineSupported { player.rate = Float(newRate) } else { vlcPlayer.rate = Float(newRate) } }; flash(String(format: "%.2gx", newRate)); syncSystemState() }
     func setVolume(_ value: Double) { volumeLevel = min(max(value, 0), 1); if media.isEngineSupported { player.volume = Float(volumeLevel) } else { vlcPlayer.audio?.volume = Int32(volumeLevel * 100) }; flash("Volume \(Int(volumeLevel * 100))%") }
+    
+    // NEW: Subtitle Delay Adjustment
+    func adjustSubtitleDelay(by seconds: Double) {
+        subtitleDelay = ((subtitleDelay + seconds) * 10).rounded() / 10
+        
+        // Pass to VLC natively if we are using its internal subtitles
+        if usesVLC && !hasExternalCues {
+            vlcPlayer.currentVideoSubTitleDelay = NSInteger(subtitleDelay * 1_000_000)
+        }
+        
+        flash("Sync: \(String(format: "%+.1fs", subtitleDelay))")
+        updateCue(at: current)
+    }
 
     func scheduleAutoHide() { 
         hideTask?.cancel()
@@ -452,15 +468,23 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
             return
         }
 
-        while cueCursor > 0 && time < cues[cueCursor].start {
+        // Apply dynamic subtitle delay
+        let adjustedTime = time - subtitleDelay
+
+        // Reset cursor if time drops backwards aggressively
+        if cueCursor > 0 && adjustedTime < cues[0].start {
+            cueCursor = 0
+        }
+
+        while cueCursor > 0 && adjustedTime < cues[cueCursor].start {
             cueCursor -= 1
         }
-        while cueCursor < cues.count - 1 && time > cues[cueCursor].end {
+        while cueCursor < cues.count - 1 && adjustedTime > cues[cueCursor].end {
             cueCursor += 1
         }
 
         let cue = cues[cueCursor]
-        let text = (time >= cue.start && time <= cue.end) ? cue.text : nil
+        let text = (adjustedTime >= cue.start && adjustedTime <= cue.end) ? cue.text : nil
         if text != cueText { cueText = text }
     }
 
@@ -586,9 +610,12 @@ struct PlayerScreen: View {
     @State private var seekTarget: Double = 0
     @State private var isWindowed = false
 
+    // NEW: Subtitle Placement Offset
+    @AppStorage("subtitleYOffset") private var subtitleYOffset: Double = 0.0
     @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
     @AppStorage("subtitleBold") private var subtitleBold = true
     @AppStorage("subtitleBackground") private var subtitleBackground = 0.55
+    
     private enum DragMode { case none, seek, volume, brightness }
 
     init(item: MediaItem, store: LibraryStore) { _vm = StateObject(wrappedValue: PlayerVM(media: item, store: store)) }
@@ -654,7 +681,8 @@ struct PlayerScreen: View {
                     .padding(.horizontal, 24)
             }
         }
-        .padding(.bottom, vm.showControls ? 140 : 44)
+        // Subtitle Placement Injection
+        .padding(.bottom, max(0, (vm.showControls ? 140 : 44) + subtitleYOffset))
         .animation(.easeInOut(duration: 0.2), value: vm.showControls)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -732,6 +760,7 @@ struct PlayerScreen: View {
             ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
             subtitleFileControls
         }
+        subtitleSettingsSection
     }
 
     @ViewBuilder
@@ -750,6 +779,7 @@ struct PlayerScreen: View {
             }
             subtitleFileControls
         }
+        subtitleSettingsSection
     }
 
     @ViewBuilder
@@ -761,6 +791,25 @@ struct PlayerScreen: View {
     private var subtitleFileControls: some View {
         Button("Load .srt file…") { showSubImporter = true }
         if vm.hasExternalCues { Toggle("External subtitles", isOn: $vm.subtitlesOn) }
+    }
+    
+    // NEW: Subtitles Settings Menu
+    @ViewBuilder
+    private var subtitleSettingsSection: some View {
+        Section("Settings") {
+            Menu("Sync Delay (\(String(format: "%+.1fs", vm.subtitleDelay)))") {
+                Button("+0.5s") { vm.adjustSubtitleDelay(by: 0.5) }
+                Button("+0.1s") { vm.adjustSubtitleDelay(by: 0.1) }
+                Button("Reset (0.0s)") { vm.adjustSubtitleDelay(by: -vm.subtitleDelay) }
+                Button("-0.1s") { vm.adjustSubtitleDelay(by: -0.1) }
+                Button("-0.5s") { vm.adjustSubtitleDelay(by: -0.5) }
+            }
+            Menu("Placement") {
+                Button("Move Up") { subtitleYOffset += 20; vm.flash("Subtitles Up") }
+                Button("Move Down") { subtitleYOffset -= 20; vm.flash("Subtitles Down") }
+                Button("Reset Position") { subtitleYOffset = 0; vm.flash("Position Reset") }
+            }
+        }
     }
 
     private var centerButtons: some View {
@@ -830,7 +879,6 @@ struct PlayerScreen: View {
                         seekTarget = vm.current 
                     } else if value.startLocation.x < geo.size.width / 2 { 
                         dragMode = .brightness
-                        // SWIFT 6 iOS 26 COMPATIBILITY: UIScreen.main deprecated, use UIWindowScene
                         let currentBrightness = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.brightness ?? 0.5
                         dragStartValue = Double(currentBrightness) 
                     } else { 
