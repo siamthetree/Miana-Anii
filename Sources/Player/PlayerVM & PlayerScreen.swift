@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: SYSTEM MEDIA COORDINATOR EXTRACTED
+//  REFACTORED: UNIFIED SYSTEM MEDIA COORDINATOR + BRIGHTNESS FIX
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -15,6 +15,195 @@ import UIKit
 import UniformTypeIdentifiers
 import MobileVLCKit
 
+// MARK: - System Media Coordinator
+
+@MainActor
+final class SystemMediaCoordinator {
+    
+    // Callbacks to let the System control the PlayerVM
+    var onPlay: (() -> Void)?
+    var onPause: (() -> Void)?
+    var onTogglePlayPause: (() -> Void)?
+    var onSkip: ((Double) -> Void)?
+    var onSeek: ((Double) -> Void)?
+    
+    // Internal State
+    private var media: MediaItem?
+    private var current: Double = 0
+    private var duration: Double = 0
+    private var rate: Double = 1.0
+    private var isPlaying: Bool = false
+    
+    private var remoteTargets: [(MPRemoteCommand, Any)] = []
+    private var audioObservers: [NSObjectProtocol] = []
+    private var nowPlayingArtwork: MPMediaItemArtwork?
+    private var resumeAfterInterruption = false
+    
+    func start(media: MediaItem, store: LibraryStore) {
+        self.media = media
+        configureAudioSession()
+        setupRemoteCommands()
+        observeAudioSession()
+        Task { await loadArtwork(store: store) }
+    }
+    
+    func stop() {
+        teardownRemoteControl()
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        media = nil
+    }
+    
+    func updateState(current: Double, duration: Double, rate: Double, isPlaying: Bool) {
+        self.current = current
+        self.duration = duration
+        self.rate = rate
+        self.isPlaying = isPlaying
+        publishNowPlaying()
+    }
+    
+    private func publishNowPlaying() {
+        guard let media else { return }
+
+        var info: [String: Any] = [:]
+        info[MPMediaItemPropertyTitle] = nowPlayingTitle(for: media)
+        info[MPMediaItemPropertyArtist] = nowPlayingSubtitle(for: media)
+        info[MPNowPlayingInfoPropertyMediaType] = (media.isAudio ? MPNowPlayingInfoMediaType.audio : MPNowPlayingInfoMediaType.video).rawValue
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = current
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlaying ? rate : 0.0
+        info[MPNowPlayingInfoPropertyDefaultPlaybackRate] = 1.0
+        if duration > 0 { info[MPMediaItemPropertyPlaybackDuration] = duration }
+        if let nowPlayingArtwork { info[MPMediaItemPropertyArtwork] = nowPlayingArtwork }
+
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+    
+    private func nowPlayingTitle(for media: MediaItem) -> String {
+        media.isEpisode ? media.displayEpisodeTitle : (media.metadata?.title ?? media.title)
+    }
+
+    private func nowPlayingSubtitle(for media: MediaItem) -> String {
+        if media.isEpisode, let show = media.metadata?.title, !show.isEmpty {
+            return media.episodeNumber > 0 ? "\(show) • \(media.episodeCode)" : show
+        }
+        if let year = media.metadata?.releaseYear, !year.isEmpty { return year }
+        return media.fileExtension.uppercased()
+    }
+    
+    private func loadArtwork(store: LibraryStore) async {
+        guard let media else { return }
+        let path = store.thumbURL(for: media).path
+        var image: UIImage? = await Task.detached(priority: .utility) { UIImage(contentsOfFile: path) }.value
+
+        if image == nil, let poster = media.metadata?.posterURL,
+           let response = try? await URLSession.shared.data(from: poster) {
+            image = UIImage(data: response.0)
+        }
+        guard let image else { return }
+
+        nowPlayingArtwork = MPMediaItemArtwork(boundsSize: image.size) { @Sendable _ in image }
+        publishNowPlaying()
+    }
+
+    private func setupRemoteCommands() {
+        let center = MPRemoteCommandCenter.shared()
+
+        addCommand(center.playCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onPlay?() }
+            return .success
+        }
+        addCommand(center.pauseCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onPause?() }
+            return .success
+        }
+        addCommand(center.togglePlayPauseCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onTogglePlayPause?() }
+            return .success
+        }
+
+        center.skipForwardCommand.preferredIntervals = [15]
+        addCommand(center.skipForwardCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onSkip?(15) }
+            return .success
+        }
+
+        center.skipBackwardCommand.preferredIntervals = [15]
+        addCommand(center.skipBackwardCommand) { @Sendable [weak self] _ in
+            Task { @MainActor in self?.onSkip?(-15) }
+            return .success
+        }
+
+        addCommand(center.changePlaybackPositionCommand) { @Sendable [weak self] event in
+            guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            let position = event.positionTime
+            Task { @MainActor in self?.onSeek?(position) }
+            return .success
+        }
+    }
+
+    private func addCommand(_ command: MPRemoteCommand, _ handler: @escaping @Sendable (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus) {
+        command.isEnabled = true
+        remoteTargets.append((command, command.addTarget(handler: handler)))
+    }
+
+    private func teardownRemoteControl() {
+        for (command, token) in remoteTargets { command.removeTarget(token) }
+        remoteTargets.removeAll()
+        for observer in audioObservers { NotificationCenter.default.removeObserver(observer) }
+        audioObservers.removeAll()
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+    }
+
+    private func configureAudioSession() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .moviePlayback)
+        try? session.setSupportsMultichannelContent(true)
+        try? session.setActive(true)
+        applyPreferredChannels()
+    }
+
+    private func applyPreferredChannels() {
+        let session = AVAudioSession.sharedInstance()
+        try? session.setPreferredOutputNumberOfChannels(session.maximumOutputNumberOfChannels)
+    }
+
+    private func observeAudioSession() {
+        let notifications = NotificationCenter.default
+
+        audioObservers.append(notifications.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self, let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt, let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+
+            switch type {
+            case .began:
+                Task { @MainActor in
+                    self.resumeAfterInterruption = self.isPlaying
+                    if self.isPlaying { self.onPause?() }
+                }
+            case .ended:
+                let options = (note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt).map { AVAudioSession.InterruptionOptions(rawValue: $0) } ?? []
+                Task { @MainActor in
+                    guard self.resumeAfterInterruption, options.contains(.shouldResume) else { return }
+                    self.resumeAfterInterruption = false
+                    try? AVAudioSession.sharedInstance().setActive(true)
+                    self.onPlay?()
+                }
+            @unknown default: break
+            }
+        })
+
+        audioObservers.append(notifications.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self else { return }
+            let reason = (note.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt).flatMap { AVAudioSession.RouteChangeReason(rawValue: $0) }
+
+            Task { @MainActor in
+                self.applyPreferredChannels()
+                if reason == .oldDeviceUnavailable, self.isPlaying { self.onPause?() }
+            }
+        })
+    }
+}
+
+// MARK: - Player ViewModel
+
 @MainActor
 final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let store: LibraryStore
@@ -23,7 +212,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     let layerHolder = PlayerLayerHolder()
     let vlcPlayer = VLCMediaPlayer()
     
-    // NEW: The dedicated system hardware & lock screen coordinator
     private let systemMedia = SystemMediaCoordinator()
 
     @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var fillScreen = false; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var audioOptions: [AVMediaSelectionOption] = []; @Published var legibleOptions: [AVMediaSelectionOption] = []; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
@@ -47,7 +235,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     init(media: MediaItem, store: LibraryStore) { self.media = media; self.store = store; super.init() }
 
     func start() {
-        // Wire up System Coordinator
         systemMedia.onPlay = { [weak self] in self?.play() }
         systemMedia.onPause = { [weak self] in self?.pause() }
         systemMedia.onTogglePlayPause = { [weak self] in self?.isPlaying == true ? self?.pause() : self?.play() }
@@ -338,8 +525,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         current = target
     }
 
-    // MARK: - VLC tracks
-
     var usesVLC: Bool { !media.isEngineSupported }
 
     private func refreshVLCTracks() {
@@ -388,6 +573,8 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private func periodicSave() { guard Date().timeIntervalSince(lastSave) > 4 else { return }; saveNow() }
     private func saveNow() { guard current > 0 || duration > 0 else { return }; lastSave = Date(); store.updateProgress(id: media.id, position: current, duration: duration) }
 }
+
+// MARK: - Player Screen
 
 struct PlayerScreen: View {
     @Environment(\.dismiss) private var dismiss
@@ -637,14 +824,38 @@ struct PlayerScreen: View {
         DragGesture(minimumDistance: 15)
             .onChanged { value in
                 if dragMode == .none {
-                    if abs(value.translation.width) > abs(value.translation.height) { dragMode = .seek; dragStartValue = vm.current; seekTarget = vm.current } 
-                    else if value.startLocation.x < geo.size.width / 2 { dragMode = .brightness; dragStartValue = Double(UIScreen.main.brightness) } 
-                    else { dragMode = .volume; dragStartValue = vm.volumeLevel }
+                    if abs(value.translation.width) > abs(value.translation.height) { 
+                        dragMode = .seek
+                        dragStartValue = vm.current
+                        seekTarget = vm.current 
+                    } else if value.startLocation.x < geo.size.width / 2 { 
+                        dragMode = .brightness
+                        // SWIFT 6 iOS 26 COMPATIBILITY: UIScreen.main deprecated, use UIWindowScene
+                        let currentBrightness = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.screen.brightness ?? 0.5
+                        dragStartValue = Double(currentBrightness) 
+                    } else { 
+                        dragMode = .volume
+                        dragStartValue = vm.volumeLevel 
+                    }
                 }
+                
                 switch dragMode {
-                case .seek: let span = max(120, vm.duration * 0.3); let delta = Double(value.translation.width / geo.size.width) * span; seekTarget = min(max(dragStartValue + delta, 0), max(vm.duration - 1, 0)); vm.flash("\(formatTime(seekTarget))  (\(delta >= 0 ? "+" : "-")\(formatTime(abs(delta))))")
-                case .volume: vm.setVolume(dragStartValue - Double(value.translation.height / 300))
-                case .brightness: let level = min(max(dragStartValue - Double(value.translation.height / 300), 0), 1); UIScreen.main.brightness = CGFloat(level); vm.flash("Brightness \(Int(level * 100))%")
+                case .seek: 
+                    let span = max(120, vm.duration * 0.3)
+                    let delta = Double(value.translation.width / geo.size.width) * span
+                    seekTarget = min(max(dragStartValue + delta, 0), max(vm.duration - 1, 0))
+                    vm.flash("\(formatTime(seekTarget))  (\(delta >= 0 ? "+" : "-")\(formatTime(abs(delta))))")
+                    
+                case .volume: 
+                    vm.setVolume(dragStartValue - Double(value.translation.height / 300))
+                    
+                case .brightness: 
+                    let level = min(max(dragStartValue - Double(value.translation.height / 300), 0), 1)
+                    if let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
+                        scene.screen.brightness = CGFloat(level)
+                    }
+                    vm.flash("Brightness \(Int(level * 100))%")
+                    
                 case .none: break
                 }
             }
