@@ -36,8 +36,18 @@ final class FolderWatcher {
                 eventMask: [.write, .delete, .rename, .revoke],
                 queue: queue
             )
-            source.setEventHandler { onChange() }
-            source.setCancelHandler { close(descriptor) }
+            
+            // SWIFT 6 FIX: Explicitly mark closures as @Sendable to strip them of
+            // their @MainActor isolation. This stops the app from crashing when GCD
+            // fires these events on the background queue.
+            source.setEventHandler { @Sendable in 
+                onChange() 
+            }
+            
+            source.setCancelHandler { @Sendable [descriptor] in 
+                close(descriptor) 
+            }
+            
             source.resume()
             created.append(Handle(source: source))
         }
