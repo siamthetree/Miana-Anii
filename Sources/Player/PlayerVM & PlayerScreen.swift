@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: SLEEK SETTINGS UI & NORMAL WEIGHT SUBTITLES
+//  REFACTORED: HIGH-PRECISION GESTURE SCRUBBING
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -260,7 +260,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         if media.isEngineSupported {
             let item = AVPlayerItem(url: url)
             
-            // APPLE TV/IOS 17 EMBEDDED SUBTITLE FIX: Force embedded native tracks to Normal Weight
             if let rule = AVTextStyleRule(textMarkupAttributes: [kCMTextMarkupAttribute_FontWeight as String: "normal"]) {
                 item.textStyleRules = [rule]
             }
@@ -658,7 +657,7 @@ struct PlayerScreen: View {
     @AppStorage("subtitleYOffset") private var subtitleYOffset: Double = 0.0
     @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
     @AppStorage("subtitleFontName") private var subtitleFontName = "System"
-    @AppStorage("subtitleBold") private var subtitleBold = false // Default to regular text now!
+    @AppStorage("subtitleBold") private var subtitleBold = false 
     @AppStorage("subtitleBackground") private var subtitleBackground = 0.55
     
     private enum DragMode { case none, seek, volume, brightness }
@@ -876,7 +875,7 @@ struct PlayerScreen: View {
                 
                 switch dragMode {
                 case .seek: 
-                    let span = max(120, vm.duration * 0.3)
+                    let span = min(vm.duration, 90.0) 
                     let delta = Double(value.translation.width / geo.size.width) * span
                     seekTarget = min(max(dragStartValue + delta, 0), max(vm.duration - 1, 0))
                     vm.flash("\(formatTime(seekTarget))  (\(delta >= 0 ? "+" : "-")\(formatTime(abs(delta))))")
