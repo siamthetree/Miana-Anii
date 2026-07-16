@@ -1,5 +1,5 @@
 // ==========================================================
-//  FINAL STABILIZED: SWIFTDATA + NATIVE ASYNC THUMBNAILS
+//  FINAL MERGED: DEDUPLICATION & EXTERNAL OPEN FIXES
 //
 //  File:  Sources/Library/LibraryStore.swift
 //  Replace the entire file.
@@ -62,7 +62,6 @@ final class LibraryStore: ObservableObject {
     
     // MARK: - SwiftData Integration
     
-    /// Checks for legacy JSON files. If found, decodes them, injects them into SwiftData, and deletes the JSON.
     private func performMigrationIfNeeded() {
         let indexURL = documentsURL.appendingPathComponent("library.json")
         let foldersURL = documentsURL.appendingPathComponent("folders.json")
@@ -87,7 +86,6 @@ final class LibraryStore: ObservableObject {
         if migrated { try? context.save() }
     }
     
-    /// Pulls the entire database into memory for blazing fast SwiftUI rendering.
     private func fetchData() {
         let itemDesc = FetchDescriptor<MediaItem>(sortBy: [SortDescriptor(\.dateAdded, order: .reverse)])
         items = (try? context.fetch(itemDesc)) ?? []
@@ -98,7 +96,6 @@ final class LibraryStore: ObservableObject {
         regroup()
     }
 
-    /// Persists changes instantly to the underlying SQLite database
     func save() {
         try? context.save()
         regroup()
@@ -286,30 +283,49 @@ final class LibraryStore: ObservableObject {
         return filePath.hasPrefix(rootPath) ? String(filePath.dropFirst(rootPath.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/")) : file.lastPathComponent
     }
 
-    private func performImport(_ src: URL) async {
-        let secured = src.startAccessingSecurityScopedResource()
-        defer { if secured { src.stopAccessingSecurityScopedResource() } }
+    // MARK: - Import & Ingestion
+    
+    /// DEDUPLICATION FIX: Handles incoming files securely, checks for duplicates, and returns instantly for Auto-Play.
+    func handleExternalOpen(url: URL) async -> MediaItem? {
+        let secured = url.startAccessingSecurityScopedResource()
+        defer { if secured { url.stopAccessingSecurityScopedResource() } }
 
-        let ext = src.pathExtension.lowercased()
+        let ext = url.pathExtension.lowercased()
         if MediaKinds.subtitles.contains(ext) {
-            let dest = mediaDir.appendingPathComponent(src.lastPathComponent)
-            try? fm.removeItem(at: dest); try? fm.copyItem(at: src, to: dest)
-            return
+            let dest = mediaDir.appendingPathComponent(url.lastPathComponent)
+            try? fm.removeItem(at: dest); try? fm.copyItem(at: url, to: dest)
+            return nil
         }
-        guard MediaKinds.media.contains(ext) else { return }
+        guard MediaKinds.media.contains(ext) else { return nil }
 
-        let dest = uniqueDestination(for: src.lastPathComponent)
+        // DEDUPLICATION: If we already have a file with this exact name, don't duplicate it.
+        // Just return the existing item so the player can instantly launch it.
+        if let existing = items.first(where: { $0.fileName == url.lastPathComponent }) {
+            // Clean up the inbox copy if it was cloned by iOS
+            if url.path.contains("/Inbox/") { try? fm.removeItem(at: url) }
+            return existing
+        }
+
+        // Copy file to our media directory safely
+        let dest = uniqueDestination(for: url.lastPathComponent)
         do {
-            let from = src, to = dest
+            let from = url, to = dest
             try await Task.detached(priority: .userInitiated) { try FileManager.default.copyItem(at: from, to: to) }.value
-        } catch { return }
+        } catch { return nil }
 
-        if src.path.contains("/Inbox/") { try? fm.removeItem(at: src) }
-        await ingest(fileURL: dest)
+        if url.path.contains("/Inbox/") { try? fm.removeItem(at: url) }
+        
+        let item = await ingest(fileURL: dest)
         save()
+        return item
     }
 
-    func ingest(fileURL: URL, folderID: UUID? = nil, relativePath: String? = nil) async {
+    private func performImport(_ src: URL) async {
+        _ = await handleExternalOpen(url: src)
+    }
+
+    @discardableResult
+    func ingest(fileURL: URL, folderID: UUID? = nil, relativePath: String? = nil) async -> MediaItem {
         let pretty = Self.prettyTitle(from: (fileURL.lastPathComponent as NSString).deletingPathExtension)
         let item = MediaItem(title: pretty, fileName: fileURL.lastPathComponent, folderID: folderID, relativePath: relativePath)
 
@@ -330,6 +346,7 @@ final class LibraryStore: ObservableObject {
         context.insert(item)
         items.insert(item, at: 0)
         save()
+        return item
     }
 
     func rescan() async {
@@ -377,7 +394,6 @@ final class LibraryStore: ObservableObject {
         if !doomed.isEmpty { save() }
     }
 
-    /// Extracted properties to pass into TaskGroup to prevent crossing SwiftData Actor Isolation boundaries
     private struct MetadataSnapshot: Sendable { let id: UUID; let fileName: String }
 
     func refreshMetadata() async {
@@ -415,7 +431,6 @@ final class LibraryStore: ObservableObject {
 
     // MARK: - Mutations
     
-    // Changing properties directly on SwiftData @Models will automatically flag them as modified
     func updateProgress(id: UUID, position: Double, duration: Double) {
         if let i = items.firstIndex(where: { $0.id == id }) { items[i].lastPosition = max(0, position); if duration > 0 { items[i].duration = duration }; items[i].lastPlayed = Date(); save() }
     }
@@ -516,7 +531,6 @@ final class LibraryStore: ObservableObject {
         return s.isEmpty ? raw : s
     }
 
-    // SWIFT 6 ARCHITECTURE: Replaced legacy Objective-C CGImage copy with Native Async Framework
     nonisolated static func writeThumbnail(assetURL: URL, at seconds: Double, to dest: URL) async {
         let generator = AVAssetImageGenerator(asset: AVURLAsset(url: assetURL))
         generator.appliesPreferredTrackTransform = true
@@ -530,9 +544,7 @@ final class LibraryStore: ObservableObject {
             let image = UIImage(cgImage: cgImage)
             guard let data = image.jpegData(compressionQuality: 0.75) else { return }
             try? data.write(to: dest, options: .atomic)
-        } catch {
-            // Silently fail if AVFoundation cannot decode the frame
-        }
+        } catch { }
     }
 }
 
