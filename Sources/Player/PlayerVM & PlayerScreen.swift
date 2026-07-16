@@ -1,9 +1,4 @@
-// ==========================================================
-//  REFACTORED: EXTERNAL SUBTITLE TOGGLE & AUTO-MUTE
-//
-//  File:  Sources/Player/PlayerVM & PlayerScreen.swift
-//  Replace the entire file.
-// ==========================================================
+
 
 import Foundation
 import SwiftUI
@@ -772,6 +767,7 @@ struct PlayerScreen: View {
     @State private var dragStartValue: Double = 0
     @State private var seekTarget: Double = 0
     @State private var isWindowed = false
+    @State private var preMuteVolume: Double = 1.0
 
     @AppStorage("subtitleYOffset") private var subtitleYOffset: Double = 0.0
     @AppStorage("subtitleFontSize") private var subtitleFontSize = 22.0
@@ -810,6 +806,8 @@ struct PlayerScreen: View {
                         vm.toggleControls() 
                     }
                     .gesture(panGesture(geo: geo))
+
+                keyboardShortcuts
 
                 subtitleOverlay
                 
@@ -853,6 +851,56 @@ struct PlayerScreen: View {
                 .presentationCornerRadius(32)
         }
         .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Keyboard Shortcuts
+    
+    private var keyboardShortcuts: some View {
+        Group {
+            Button(action: { vm.isPlaying ? vm.pause() : vm.play() }) { EmptyView() }
+                .keyboardShortcut(.space, modifiers: [])
+            
+            Button(action: { vm.skip(10) }) { EmptyView() }
+                .keyboardShortcut(.rightArrow, modifiers: [])
+            
+            Button(action: { vm.skip(-10) }) { EmptyView() }
+                .keyboardShortcut(.leftArrow, modifiers: [])
+            
+            Button(action: { vm.setVolume(vm.volumeLevel + 0.1) }) { EmptyView() }
+                .keyboardShortcut(.upArrow, modifiers: [])
+            
+            Button(action: { vm.setVolume(vm.volumeLevel - 0.1) }) { EmptyView() }
+                .keyboardShortcut(.downArrow, modifiers: [])
+            
+            Button(action: { vm.cycleScaleMode() }) { EmptyView() }
+                .keyboardShortcut("f", modifiers: [])
+            
+            Button(action: { vm.toggleControls() }) { EmptyView() }
+                .keyboardShortcut("c", modifiers: [])
+                
+            Button(action: { dismiss() }) { EmptyView() }
+                .keyboardShortcut(.escape, modifiers: [])
+                
+            Button(action: { 
+                if vm.volumeLevel > 0 {
+                    preMuteVolume = vm.volumeLevel
+                    vm.setVolume(0)
+                } else {
+                    vm.setVolume(preMuteVolume > 0 ? preMuteVolume : 1.0)
+                }
+            }) { EmptyView() }
+            .keyboardShortcut("m", modifiers: [])
+            
+            Button(action: { 
+                vm.subtitlesOn.toggle()
+                vm.flash(vm.subtitlesOn ? "Subtitles On" : "Subtitles Off")
+            }) { EmptyView() }
+            .keyboardShortcut("s", modifiers: [])
+        }
+        .frame(width: 0, height: 0)
+        .opacity(0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     // MARK: - Up Next Binge UI
