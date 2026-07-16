@@ -37,9 +37,9 @@ targets:
         CFBundleVersion: "1"
         UILaunchScreen: {}
         
-        # SECURITY FIX: Lock down the iOS sandbox so files cannot be pulled via USB/Finder
-        UIFileSharingEnabled: false
-        LSSupportsOpeningDocumentsInPlace: false
+        # Enables the app to open files directly from the iOS Files app
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
         
         ITSAppUsesNonExemptEncryption: false
         UIBackgroundModes:
@@ -59,10 +59,29 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+          
         CFBundleDocumentTypes:
-          - CFBundleTypeName: Media
-            LSHandlerRank: Alternate
+          - CFBundleTypeName: "Video Files"
+            LSHandlerRank: "Alternate"
             LSItemContentTypes:
-              - public.movie
-              - public.audio
-              - public.audiovisual-content
+              - "public.movie"
+              - "public.video"
+              - "public.avi"
+              - "org.matroska.mkv"
+              - "public.mpeg-4"
+              - "com.apple.quicktime-movie"
+          - CFBundleTypeName: "Audio Files"
+            LSHandlerRank: "Alternate"
+            LSItemContentTypes:
+              - "public.audio"
+              - "public.mp3"
+              - "public.mpeg-4-audio"
+              - "org.xiph.flac"
+              - "public.aifc-audio"
+              - "com.microsoft.waveform-audio"
+          - CFBundleTypeName: "Subtitle Files"
+            LSHandlerRank: "Alternate"
+            LSItemContentTypes:
+              - "public.plain-text"
+              - "public.text"
+              - "public.subrip"
