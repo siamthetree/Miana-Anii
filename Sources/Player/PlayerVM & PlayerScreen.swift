@@ -1,5 +1,5 @@
 // ==========================================================
-//  REFACTORED: FLICKER FIX, GESTURE ZONES & BOTTOM BAR UI
+//  REFACTORED: EXTERNAL SUBTITLE TOGGLE & AUTO-MUTE
 //
 //  File:  Sources/Player/PlayerVM & PlayerScreen.swift
 //  Replace the entire file.
@@ -243,7 +243,13 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var nextMedia: MediaItem?
     @Published var showUpNext: Bool = false
 
-    @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var scaleMode: VideoScaleMode = .fit; @Published var cueText: String?; @Published var subtitlesOn = true; @Published var hasExternalCues = false; @Published var errorMessage: String?; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
+    @Published var isPlaying = false; @Published var current: Double = 0; @Published var duration: Double = 0; @Published var rate: Double = 1.0; @Published var showControls = true; @Published var isScrubbing = false; @Published var scaleMode: VideoScaleMode = .fit; @Published var cueText: String?; @Published var errorMessage: String?; @Published var volumeLevel: Double = 1.0; @Published var flashText: String?
+    
+    // External Subtitles State
+    @Published var subtitlesOn = true
+    @Published var hasExternalCues = false
+    @Published var externalSubtitleName: String? = nil
+    @Published var subtitleDelay: Double = 0.0
     
     @Published var audioOptions: [AVMediaSelectionOption] = []
     @Published var legibleOptions: [AVMediaSelectionOption] = []
@@ -254,10 +260,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     @Published var vlcAudioTracks: [PlayerTrack] = []
     @Published var vlcSubtitleIndex: Int32 = -1
     @Published var vlcAudioIndex: Int32 = -1
-    
-    @Published var subtitleDelay: Double = 0.0
 
-    // Exposed so onHover can manage the timer
     var hideTask: Task<Void, Never>?
     var isWindowHovered: Bool = false
     
@@ -303,6 +306,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         self.cueText = nil
         self.cues = []
         self.hasExternalCues = false
+        self.externalSubtitleName = nil
         self.pendingVLCSeek = nil
         self.hasScrobbledWatched = false
         self.isScrobbling = false
@@ -565,8 +569,6 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
 
     func scheduleAutoHide() { 
         hideTask?.cancel()
-        
-        // Window Hover Protection: If the mouse is hovering over the window, DO NOT auto-hide.
         guard isPlaying, !isWindowHovered else { return }
         
         let intervalObject = UserDefaults.standard.object(forKey: "autoHideInterval")
@@ -610,21 +612,22 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
     private func loadSidecarSubtitles(for mediaURL: URL) {
         let saved = store.savedSubtitleURL(for: media)
         if FileManager.default.fileExists(atPath: saved.path) {
-            loadSubtitleFile(saved, persist: false)
+            loadSubtitleFile(saved, persist: false, customName: "Imported Subtitle.srt")
             return
         }
         let sidecar = mediaURL.deletingPathExtension().appendingPathExtension("srt")
         if FileManager.default.fileExists(atPath: sidecar.path) {
-            loadSubtitleFile(sidecar, persist: false)
+            loadSubtitleFile(sidecar, persist: false, customName: sidecar.lastPathComponent)
         }
     }
     
-    func loadSubtitleFile(_ url: URL, persist: Bool = true) {
+    func loadSubtitleFile(_ url: URL, persist: Bool = true, customName: String? = nil) {
         let secured = url.startAccessingSecurityScopedResource()
         defer { if secured { url.stopAccessingSecurityScopedResource() } }
 
         guard let data = try? Data(contentsOf: url) else { flash("Couldn't read subtitles"); return }
         let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+        let fileName = customName ?? url.lastPathComponent
         
         Task.detached(priority: .userInitiated) {
             let parsed = SRTParser.parse(text)
@@ -634,7 +637,15 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
                 self.cueCursor = 0
                 self.hasExternalCues = true
                 self.subtitlesOn = true
-                self.flash("Subtitles loaded")
+                self.externalSubtitleName = fileName
+                self.flash("Loaded: \(fileName)")
+                
+                // AUTO-MUTE EMBEDDED OVERLAP
+                if self.usesVLC {
+                    self.selectVLCSubtitle(nil)
+                } else {
+                    self.selectLegible(nil)
+                }
             }
         }
 
@@ -721,7 +732,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         vlcPlayer.currentVideoSubTitleIndex = track?.index ?? -1
         vlcSubtitleIndex = vlcPlayer.currentVideoSubTitleIndex
         didAutoSelectSubtitle = true
-        flash(track?.name ?? "Subtitles off")
+        if let t = track { flash(t.name) }
     }
 
     func selectVLCAudio(_ track: PlayerTrack) {
@@ -741,7 +752,7 @@ final class PlayerVM: NSObject, ObservableObject, VLCMediaPlayerDelegate {
         guard let group = legibleGroup else { return }
         player.currentItem?.select(option, in: group)
         currentLegibleOption = option
-        if let option { flash(option.displayName) } else { flash("Subtitles off") }
+        if let option { flash(option.displayName) }
     }
     
     func togglePiP() { guard media.isEngineSupported else { flash("PiP unavailable for this format"); return }; if pip == nil, AVPictureInPictureController.isPictureInPictureSupported(), let layer = layerHolder.playerLayer { pip = AVPictureInPictureController(playerLayer: layer) }; guard let pip else { flash("PiP unavailable"); return }; if pip.isPictureInPictureActive { pip.stopPictureInPicture() } else { pip.startPictureInPicture() } }
@@ -820,7 +831,6 @@ struct PlayerScreen: View {
                 }
             }
             .onHover { isHovering in
-                // Native Window tracking. Re-shows controls gracefully and halts auto-hide while hovering.
                 vm.isWindowHovered = isHovering
                 if isHovering {
                     vm.showControls = true
@@ -838,7 +848,7 @@ struct PlayerScreen: View {
         .fileImporter(isPresented: $showSubImporter, allowedContentTypes: subtitleTypes, allowsMultipleSelection: false) { result in if case .success(let urls) = result, let url = urls.first { vm.loadSubtitleFile(url) } }
         .sheet(isPresented: $showSubtitleSheet) {
             SubtitleSettingsSheet(vm: vm, showSubImporter: $showSubImporter)
-                .presentationDetents([.height(450), .large])
+                .presentationDetents([.height(480), .large])
                 .presentationBackground(.ultraThinMaterial)
                 .presentationCornerRadius(32)
         }
@@ -897,8 +907,8 @@ struct PlayerScreen: View {
                     .padding(.vertical, 8)
                     .background(.black.opacity(subtitleBackground), in: RoundedRectangle(cornerRadius: 8))
                     .padding(.horizontal, 24)
-                    .drawingGroup() // FLICKER FIX: Hardware accelerates text box rendering
-                    .animation(.none, value: cue) // FLICKER FIX: Stops automatic geometry interpolation
+                    .drawingGroup() 
+                    .animation(.none, value: cue) 
             }
         }
         .padding(.bottom, max(0, (vm.showControls ? 140 : 44) + subtitleYOffset))
@@ -1043,7 +1053,7 @@ struct PlayerScreen: View {
 
                 Spacer()
                 
-                // 4. Subtitles Button (Bottom Right)
+                // 4. Subtitles Settings (Bottom Right)
                 Button {
                     showSubtitleSheet = true
                 } label: {
@@ -1068,7 +1078,7 @@ struct PlayerScreen: View {
         DragGesture(minimumDistance: 15)
             .onChanged { value in
                 
-                // GESTURE FIX: Restrict drags exactly to the video center. Ignores top/bottom bars completely!
+                // Strictly ignores swipes that start on the top bar or bottom bar
                 guard value.startLocation.y > 120 && value.startLocation.y < (geo.size.height - 150) else { return }
                 
                 if dragMode == .none {
@@ -1149,15 +1159,23 @@ struct SubtitleSettingsSheet: View {
                         if !vm.legibleOptions.isEmpty {
                             settingRow(title: "Embedded Tracks", systemImage: "captions.bubble") {
                                 Menu(vm.currentLegibleOption?.displayName ?? "Off") {
-                                    Button("Off") { vm.selectLegible(nil); vm.subtitlesOn = false }
-                                    ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o); vm.subtitlesOn = true } }
+                                    Button("Off") { vm.selectLegible(nil) }
+                                    ForEach(vm.legibleOptions, id: \.self) { o in Button(o.displayName) { vm.selectLegible(o) } }
                                 }
                             }
                         }
                     }
                     
-                    settingRow(title: "External File", systemImage: "doc.text") {
-                        Button("Load .srt...") { dismiss(); showSubImporter = true }.foregroundStyle(.white)
+                    Divider().background(Color.white.opacity(0.1))
+                    
+                    if vm.hasExternalCues {
+                        settingRow(title: vm.externalSubtitleName ?? "External File", systemImage: "checkmark.circle.fill") {
+                            Toggle("", isOn: $vm.subtitlesOn).labelsHidden().tint(.purple)
+                        }
+                    }
+                    
+                    settingRow(title: vm.hasExternalCues ? "Replace .srt File" : "Load .srt File", systemImage: "doc.badge.plus") {
+                        Button("Browse...") { dismiss(); showSubImporter = true }.foregroundStyle(.white)
                     }
                 }
                 
@@ -1165,7 +1183,7 @@ struct SubtitleSettingsSheet: View {
                 
                 // MARK: Sync & Layout Formatting
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("Subtitles Formatting").font(.headline).foregroundStyle(.secondary)
+                    Text("External Formatting").font(.headline).foregroundStyle(.secondary)
                     
                     settingRow(title: "Sync Delay", systemImage: "clock.arrow.2.circlepath") {
                         stepperControls(
@@ -1202,7 +1220,7 @@ struct SubtitleSettingsSheet: View {
                     }
                     
                     settingRow(title: "Bold Text", systemImage: "bold") {
-                        Toggle("", isOn: $subtitleBold).labelsHidden()
+                        Toggle("", isOn: $subtitleBold).labelsHidden().tint(.purple)
                     }
                 }
             }
