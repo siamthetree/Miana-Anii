@@ -114,15 +114,14 @@ final class TraktService: ObservableObject {
     }
 
     private let redirectURI = "minaanii://oauth/trakt"
+    private let credentials: (clientID: String, clientSecret: String)
 
     private var clientID: String {
-        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"), let dict = NSDictionary(contentsOfFile: path) as? [String: Any], let key = dict["TraktClientID"] as? String else { return "" }
-        return key
+        credentials.clientID
     }
     
     private var clientSecret: String {
-        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"), let dict = NSDictionary(contentsOfFile: path) as? [String: Any], let key = dict["TraktClientSecret"] as? String else { return "" }
-        return key
+        credentials.clientSecret
     }
 
     @Published private(set) var accessToken: String
@@ -134,14 +133,33 @@ final class TraktService: ObservableObject {
     
     var authorizationURL: URL? {
         guard !clientID.isEmpty else { return nil }
-        let urlString = "https://trakt.tv/oauth/authorize?response_type=code&client_id=\(clientID)&redirect_uri=\(redirectURI)"
-        return URL(string: urlString)
+        var components = URLComponents(string: "https://trakt.tv/oauth/authorize")
+        components?.queryItems = [
+            URLQueryItem(name: "response_type", value: "code"),
+            URLQueryItem(name: "client_id", value: clientID),
+            URLQueryItem(name: "redirect_uri", value: redirectURI)
+        ]
+        return components?.url
     }
 
     private init() {
+        credentials = TraktService.loadCredentials()
         accessToken = Keychain.get(Key.access) ?? ""
         refreshToken = Keychain.get(Key.refresh)
         if let raw = Keychain.get(Key.expiry), let ts = Double(raw) { expiresAt = Date(timeIntervalSince1970: ts) }
+    }
+
+    private static func loadCredentials() -> (clientID: String, clientSecret: String) {
+        guard let path = Bundle.main.path(forResource: "Secrets", ofType: "plist"),
+              let dict = NSDictionary(contentsOfFile: path) as? [String: Any] else {
+            return ("", "")
+        }
+
+        let clientID = (dict["TraktClientID"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let clientSecret = (dict["TraktClientSecret"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return (clientID, clientSecret)
     }
 
     private func persistTokens(_ token: TraktTokenResponse) {
@@ -158,6 +176,9 @@ final class TraktService: ObservableObject {
     func handleAuthRedirect(url: URL) async {
         guard url.scheme == "minaanii", url.host == "oauth", url.path == "/trakt" else { return }
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false), let code = components.queryItems?.first(where: { $0.name == "code" })?.value else {
+            isAuthenticating = false; return
+        }
+        guard !clientID.isEmpty, !clientSecret.isEmpty else {
             isAuthenticating = false; return
         }
         
@@ -178,6 +199,7 @@ final class TraktService: ObservableObject {
 
     func refreshIfNeeded() async {
         guard !accessToken.isEmpty, let refreshToken, let expiresAt else { return }
+        guard !clientID.isEmpty, !clientSecret.isEmpty else { return }
         guard Date() > expiresAt.addingTimeInterval(-7 * 24 * 3600) else { return }
         guard let url = URL(string: "https://api.trakt.tv/oauth/token") else { return }
 
@@ -198,7 +220,7 @@ final class TraktService: ObservableObject {
     enum ScrobbleAction: String { case start = "start", pause = "pause", stop = "stop" }
     
     func scrobble(item: MediaItem, progress: Double, action: ScrobbleAction) {
-        guard isAuthenticated, let metadata = item.metadata, metadata.tmdbID > 0 else { return }
+        guard isAuthenticated, !clientID.isEmpty, let metadata = item.metadata, metadata.tmdbID > 0 else { return }
         
         let url = URL(string: "https://api.trakt.tv/scrobble/\(action.rawValue)")!
         var request = URLRequest(url: url); request.httpMethod = "POST"
